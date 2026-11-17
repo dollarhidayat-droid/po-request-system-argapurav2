@@ -167,39 +167,11 @@ const ymd = (d: Date) =>
 const dayOf = (x: string) =>
   /^\d{4}-\d{2}-\d{2}$/.test(x) ? x : ymd(new Date(x));
 const MON_ID: Record<string, number> = {
-  jan: 1,
-  feb: 2,
-  mar: 3,
-  apr: 4,
-  may: 5,
-  mei: 5,
-  jun: 6,
-  jul: 7,
-  aug: 8,
-  agu: 8,
-  agt: 8,
-  sep: 9,
-  oct: 10,
-  okt: 10,
-  nov: 11,
-  nop: 11,
-  dec: 12,
-  des: 12,
+  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, mei: 5, jun: 6, jul: 7,
+  aug: 8, agu: 8, agt: 8, sep: 9, oct: 10, okt: 10, nov: 11, nop: 11,
+  dec: 12, des: 12,
 };
-const MON_EN = [
-  'Jan',
-  'Feb',
-  'Mar',
-  'Apr',
-  'May',
-  'Jun',
-  'Jul',
-  'Aug',
-  'Sep',
-  'Oct',
-  'Nov',
-  'Dec',
-];
+const MON_EN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const okYMD = (y: number, m: number, d: number) => {
   const t = new Date(y, m - 1, d);
   return t.getFullYear() === y && t.getMonth() === m - 1 && t.getDate() === d
@@ -348,31 +320,12 @@ const EMPTY: Vendor = {
 const PW_ITER = 150000;
 const PW_WEAK = ['admin123', 'demo123', '123456', 'password', '12345678'];
 const hex_ = (b: ArrayBuffer | Uint8Array) =>
-  Array.from(new Uint8Array(b as ArrayBuffer), (x) =>
-    x.toString(16).padStart(2, '0')
-  ).join('');
+  Array.from(new Uint8Array(b as ArrayBuffer), (x) => x.toString(16).padStart(2, '0')).join('');
 const unhex_ = (h: string) =>
   new Uint8Array((h.match(/.{2}/g) ?? []).map((x) => parseInt(x, 16)));
 const pbkdf2_ = async (pw: string, salt: Uint8Array, iter: number) => {
-  const key = await crypto.subtle.importKey(
-    'raw',
-    new TextEncoder().encode(pw),
-    'PBKDF2',
-    false,
-    ['deriveBits']
-  );
-  return hex_(
-    await crypto.subtle.deriveBits(
-      {
-        name: 'PBKDF2',
-        hash: 'SHA-256',
-        salt: salt as BufferSource,
-        iterations: iter,
-      },
-      key,
-      256
-    )
-  );
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveBits']);
+  return hex_(await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: salt as BufferSource, iterations: iter }, key, 256));
 };
 const isHashed = (p: string) => /^pbkdf2\$\d+\$[0-9a-f]+\$[0-9a-f]+$/.test(p);
 async function hashPw(pw: string) {
@@ -381,8 +334,7 @@ async function hashPw(pw: string) {
 }
 const sameStr = (a: string, b: string) => {
   let d = a.length ^ b.length;
-  for (let i = 0; i < Math.max(a.length, b.length); i++)
-    d |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  for (let i = 0; i < Math.max(a.length, b.length); i++) d |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
   return d === 0;
 };
 async function verifyPw(pw: string, stored: string) {
@@ -394,13 +346,7 @@ async function verifyPw(pw: string, stored: string) {
 /** password sementara acak (kriptografis), tanpa karakter yang mudah tertukar */
 const tmpPw = () => {
   const A = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
-  return (
-    'Agp' +
-    Array.from(
-      crypto.getRandomValues(new Uint8Array(9)),
-      (x) => A[x % A.length]
-    ).join('')
-  );
+  return 'Agp' + Array.from(crypto.getRandomValues(new Uint8Array(9)), (x) => A[x % A.length]).join('');
 };
 /** pembatas percobaan login (sisi browser): 5x salah -> kunci 5 menit per username */
 const FAIL_KEY = 'po_fail';
@@ -420,11 +366,7 @@ const noteFail = (un: string, ok: boolean) => {
     const m = failMap();
     const r = m[un];
     if (ok) delete m[un];
-    else
-      m[un] = {
-        n: r && Date.now() - r.t < 5 * 60000 ? r.n + 1 : 1,
-        t: Date.now(),
-      };
+    else m[un] = { n: r && Date.now() - r.t < 5 * 60000 ? r.n + 1 : 1, t: Date.now() };
     localStorage.setItem(FAIL_KEY, JSON.stringify(m));
   } catch {
     /* abaikan */
@@ -1163,6 +1105,7 @@ function LoginLogo({ src, leaving }: { src: string; leaving: boolean }) {
 }
 
 /** Logo login beranimasi (autoplay berulang, tanpa emas): 1) Terangkai cepat — 4 pita atap meluncur bergantian dari kiri/kanan, pilar naik, teks menyusul dari kanan, 2) Shimmer putih kebiruan, 3) Beacon Glow biru neon, 4) Pulse & Flash saat login berhasil (class "burst"). */
+// @ts-ignore tidak dipakai (dibiarkan agar tidak mengubah kode lama)
 function AnimLogo({ src, burst }: { src: string; burst: boolean }) {
   const custom = !!src; // logo unggahan admin: efek per-bagian (pilar/atap) dimatikan, efek keseluruhan tetap jalan
   const img = src || LOGO_WIDE;
@@ -1223,7 +1166,9 @@ function Auth({
   brand,
   depts,
   tint,
+  sync,
 }: {
+  sync: SyncStatus;
   tint: boolean;
   depts: string[];
   users: User[];
@@ -1288,9 +1233,7 @@ function Auth({
         if (left > 0) {
           setBusy('');
           return setMsg(
-            `Terlalu banyak percobaan gagal. Coba lagi ${Math.ceil(
-              left / 60000
-            )} menit lagi.`
+            `Terlalu banyak percobaan gagal. Coba lagi ${Math.ceil(left / 60000)} menit lagi.`
           );
         }
         const cand = users.find((x) => uname(x) === un);
@@ -1299,23 +1242,23 @@ function Auth({
           okPw = !!cand && (await verifyPw(f.pass, cand.pass));
         } catch {
           setBusy('');
-          return setMsg(
-            'Browser tidak mendukung enkripsi (gunakan HTTPS / browser terbaru).'
-          );
+          return setMsg('Browser tidak mendukung enkripsi (gunakan HTTPS / browser terbaru).');
         }
         noteFail(un, okPw);
         const u = okPw ? cand : undefined;
         if (!u) {
           setBusy('');
-          return setMsg('Username atau password salah.');
+          return setMsg(
+            sync === 'offline' || sync === 'loading'
+              ? 'Belum terhubung ke Google Sheet, jadi data akun belum bisa dibaca. Periksa internet atau pengaturan Apps Script, lalu coba lagi.'
+              : 'Username atau password salah.'
+          );
         }
         if (u.status === 'approved') {
           WEAK_LOGIN = PW_WEAK.includes(f.pass.toLowerCase());
           if (!isHashed(u.pass)) {
             const h = await hashPw(f.pass); // upgrade password lama -> hash
-            setUsers((l) =>
-              l.map((x) => (x.id === u.id ? { ...x, pass: h } : x))
-            );
+            setUsers((l) => l.map((x) => (x.id === u.id ? { ...x, pass: h } : x)));
           }
         }
         if (u.status === 'pending') {
@@ -1348,6 +1291,12 @@ function Auth({
       return setMsg('Username sudah dipakai. Pilih username lain.');
     if (users.some((x) => x.email.trim().toLowerCase() === email))
       return setMsg('Email sudah terdaftar.');
+    if (sync === 'offline' || sync === 'loading')
+      return setMsg(
+        sync === 'loading'
+          ? 'Sedang menghubungkan ke Google Sheet. Tunggu beberapa detik lalu coba lagi.'
+          : 'Belum terhubung ke Google Sheet, jadi data akun belum bisa dibaca/dikirim. Periksa internet atau pengaturan Apps Script, lalu coba lagi.'
+      );
     setMsg('');
     setBusy('daftar');
     setProg(0);
@@ -1396,45 +1345,45 @@ function Auth({
     const on = busy === kind;
     return (
       <div className="btntray">
-        <button
-          type="button"
-          className={
-            'pri wide sbtn' + (on ? ' loading' : '') + (on && done ? ' ok' : '')
-          }
-          disabled={!!busy}
-          aria-busy={on}
-          onClick={submit}
-        >
-          {kind === 'daftar' && on && (
-            <span
-              className="pbfill"
-              style={{ width: prog + '%' }}
-              aria-hidden="true"
-            />
+      <button
+        type="button"
+        className={
+          'pri wide sbtn' + (on ? ' loading' : '') + (on && done ? ' ok' : '')
+        }
+        disabled={!!busy}
+        aria-busy={on}
+        onClick={submit}
+      >
+        {kind === 'daftar' && on && (
+          <span
+            className="pbfill"
+            style={{ width: prog + '%' }}
+            aria-hidden="true"
+          />
+        )}
+        <span className="sbl">
+          {on && done ? (
+            <>
+              <span className="chk" aria-hidden="true">
+                ✓
+              </span>
+              Berhasil!
+            </>
+          ) : on ? (
+            <>
+              <span className="spin" aria-hidden="true" />
+              Memproses...{kind === 'daftar' ? ` ${Math.round(prog)}%` : ''}
+            </>
+          ) : (
+            label
           )}
-          <span className="sbl">
-            {on && done ? (
-              <>
-                <span className="chk" aria-hidden="true">
-                  ✓
-                </span>
-                Berhasil!
-              </>
-            ) : on ? (
-              <>
-                <span className="spin" aria-hidden="true" />
-                Memproses...{kind === 'daftar' ? ` ${Math.round(prog)}%` : ''}
-              </>
-            ) : (
-              label
-            )}
+        </span>
+        {kind === 'login' && !on && (
+          <span className="sarrow" aria-hidden="true">
+            <Ic n="right" s={18} />
           </span>
-          {kind === 'login' && !on && (
-            <span className="sarrow" aria-hidden="true">
-              <Ic n="right" s={18} />
-            </span>
-          )}
-        </button>
+        )}
+      </button>
       </div>
     );
   };
@@ -1695,6 +1644,7 @@ function Auth({
 
 /* ================= DOKUMEN PO (A4 portrait, siap cetak) ================= */
 // Data tetap di dokumen PO. Ubah di sini jika alamat pengiriman / nomor form berubah.
+// @ts-ignore tidak dipakai
 const LOGO =
   'data:image/png;base64,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';
 const LOGO_WIDE =
@@ -2340,12 +2290,7 @@ function PoViewer({
   };
   // membuka tab baru = bisa dicetak dari sana, jadi dihitung sebagai cetak juga
   const newTab = () => {
-    if (
-      admin &&
-      pn > 0 &&
-      !window.confirm(`PO ini sudah dicetak ${pn}×. Buka & cetak lagi?`)
-    )
-      return;
+    if (admin && pn > 0 && !window.confirm(`PO ini sudah dicetak ${pn}×. Buka & cetak lagi?`)) return;
     window.open(
       URL.createObjectURL(new Blob([html], { type: 'text/html' })),
       '_blank'
@@ -2949,84 +2894,84 @@ function Form({
           disabled={readOnly}
           style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}
         >
-          <Card ic="fileList" title="A. General Information">
-            <div className="body gi">
-              <Field label="1. Nama Vendor" req>
-                <IF ic="building">
-                  <input
-                    list="bp-list"
-                    value={v.nama}
-                    onChange={(e) => sv('nama', e.target.value)}
-                    placeholder="Masukkan nama vendor"
-                  />
-                </IF>
-                <datalist id="bp-list">
-                  {bps.map((b) => (
-                    <option key={b.id} value={b.nama}>
-                      {b.kode}
-                    </option>
-                  ))}
-                </datalist>
-                {bpWarn}
-              </Field>
-              <Field label="2. Alamat Vendor" req>
-                <IF ic="pin">
-                  <textarea
-                    rows={1}
-                    value={v.alamat}
-                    onChange={(e) => sv('alamat', e.target.value)}
-                    placeholder="Masukkan alamat vendor lengkap"
-                  />
-                </IF>
-              </Field>
-              <Field label="3. Email Vendor" req>
-                <IF ic="mail">
-                  <input
-                    type="email"
-                    value={v.email}
-                    onChange={(e) => sv('email', e.target.value)}
-                    placeholder="contoh@supplier.com"
-                  />
-                </IF>
-              </Field>
-              <Field label="4. NPWP" req>
-                <IF ic="file">
-                  <input
-                    value={v.npwp}
-                    onChange={(e) => sv('npwp', e.target.value)}
-                    placeholder="Masukkan NPWP vendor"
-                  />
-                </IF>
-              </Field>
-              <Field label="5. No. Fax (jika ada)">
-                <IF ic="printer">
-                  <input
-                    value={v.fax}
-                    onChange={(e) => sv('fax', e.target.value)}
-                    placeholder="Masukkan nomor fax"
-                  />
-                </IF>
-              </Field>
-              <Field label="6. Nama PIC Vendor" req>
-                <IF ic="user">
-                  <input
-                    value={v.pic}
-                    onChange={(e) => sv('pic', e.target.value)}
-                    placeholder="Masukkan nama PIC vendor"
-                  />
-                </IF>
-              </Field>
-              <Field label="7. No. Telepon Vendor" req>
-                <IF ic="phone">
-                  <input
-                    value={v.telp}
-                    onChange={(e) => sv('telp', e.target.value)}
-                    placeholder="021-12345678"
-                  />
-                </IF>
-              </Field>
-            </div>
-          </Card>
+        <Card ic="fileList" title="A. General Information">
+          <div className="body gi">
+            <Field label="1. Nama Vendor" req>
+              <IF ic="building">
+                <input
+                  list="bp-list"
+                  value={v.nama}
+                  onChange={(e) => sv('nama', e.target.value)}
+                  placeholder="Masukkan nama vendor"
+                />
+              </IF>
+              <datalist id="bp-list">
+                {bps.map((b) => (
+                  <option key={b.id} value={b.nama}>
+                    {b.kode}
+                  </option>
+                ))}
+              </datalist>
+              {bpWarn}
+            </Field>
+            <Field label="2. Alamat Vendor" req>
+              <IF ic="pin">
+                <textarea
+                  rows={1}
+                  value={v.alamat}
+                  onChange={(e) => sv('alamat', e.target.value)}
+                  placeholder="Masukkan alamat vendor lengkap"
+                />
+              </IF>
+            </Field>
+            <Field label="3. Email Vendor" req>
+              <IF ic="mail">
+                <input
+                  type="email"
+                  value={v.email}
+                  onChange={(e) => sv('email', e.target.value)}
+                  placeholder="contoh@supplier.com"
+                />
+              </IF>
+            </Field>
+            <Field label="4. NPWP" req>
+              <IF ic="file">
+                <input
+                  value={v.npwp}
+                  onChange={(e) => sv('npwp', e.target.value)}
+                  placeholder="Masukkan NPWP vendor"
+                />
+              </IF>
+            </Field>
+            <Field label="5. No. Fax (jika ada)">
+              <IF ic="printer">
+                <input
+                  value={v.fax}
+                  onChange={(e) => sv('fax', e.target.value)}
+                  placeholder="Masukkan nomor fax"
+                />
+              </IF>
+            </Field>
+            <Field label="6. Nama PIC Vendor" req>
+              <IF ic="user">
+                <input
+                  value={v.pic}
+                  onChange={(e) => sv('pic', e.target.value)}
+                  placeholder="Masukkan nama PIC vendor"
+                />
+              </IF>
+            </Field>
+            <Field label="7. No. Telepon Vendor" req>
+              <IF ic="phone">
+                <input
+                  value={v.telp}
+                  onChange={(e) => sv('telp', e.target.value)}
+                  placeholder="021-12345678"
+                />
+              </IF>
+            </Field>
+          </div>
+        </Card>
         </fieldset>
       </div>
       <div className="cr">
@@ -3034,38 +2979,38 @@ function Form({
           disabled={readOnly}
           style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}
         >
-          <Card title="C. Pajak & Discount">
-            <div className="body grid3">
-              <Field label="1. Pajak" req>
-                <select value={tax} onChange={(e) => setTax(e.target.value)}>
-                  <option value="">Pilih Pajak</option>
-                  <option value="0.11">PPN 11%</option>
-                  <option value="0.12">PPN 12%</option>
-                </select>
-              </Field>
-              <Field label="2. Discount (Nominal)">
-                <input
-                  type="number"
-                  min="0"
-                  value={disc}
-                  onChange={(e) => setDisc(e.target.value)}
-                  placeholder="Rp 0"
-                />
-              </Field>
-              <Field label="3. Ongkir (Nominal)">
-                <input
-                  type="number"
-                  min="0"
-                  value={ong}
-                  onChange={(e) => setOng(e.target.value)}
-                  placeholder="Rp 0"
-                />
-              </Field>
-              <Field label="4. Grand Total (Otomatis)">
-                <input readOnly value={rp(grand)} />
-              </Field>
-            </div>
-          </Card>
+        <Card title="C. Pajak & Discount">
+          <div className="body grid3">
+            <Field label="1. Pajak" req>
+              <select value={tax} onChange={(e) => setTax(e.target.value)}>
+                <option value="">Pilih Pajak</option>
+                <option value="0.11">PPN 11%</option>
+                <option value="0.12">PPN 12%</option>
+              </select>
+            </Field>
+            <Field label="2. Discount (Nominal)">
+              <input
+                type="number"
+                min="0"
+                value={disc}
+                onChange={(e) => setDisc(e.target.value)}
+                placeholder="Rp 0"
+              />
+            </Field>
+            <Field label="3. Ongkir (Nominal)">
+              <input
+                type="number"
+                min="0"
+                value={ong}
+                onChange={(e) => setOng(e.target.value)}
+                placeholder="Rp 0"
+              />
+            </Field>
+            <Field label="4. Grand Total (Otomatis)">
+              <input readOnly value={rp(grand)} />
+            </Field>
+          </div>
+        </Card>
         </fieldset>
       </div>
       <div className="cl">
@@ -3073,164 +3018,164 @@ function Form({
           disabled={readOnly}
           style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}
         >
-          <Card ic="box" title="B. Detail Barang / Jasa">
-            <div className="body">
-              <div style={{ marginBottom: 12 }}>
-                <Field
-                  label="Kategori Barang / Jasa (cukup dipilih sekali untuk semua item)"
-                  req
-                >
-                  <select value={cat} onChange={(e) => pickCat(e.target.value)}>
-                    <option value="">Pilih kategori</option>
-                    {cat && !activeCats.some((c) => c.name === cat) && (
-                      <option value={cat} disabled>
-                        {cat} (nonaktif)
-                      </option>
-                    )}
-                    {(['Barang', 'Jasa'] as CatType[]).map(
-                      (t) =>
-                        activeCats.some((c) => c.type === t) && (
-                          <optgroup key={t} label={t}>
-                            {activeCats
-                              .filter((c) => c.type === t)
-                              .map((c) => (
-                                <option key={c.name} value={c.name}>
-                                  {c.name}
-                                </option>
-                              ))}
-                          </optgroup>
-                        )
-                    )}
-                  </select>
-                  <button
-                    type="button"
-                    className="lnk small"
-                    style={{ marginTop: 4 }}
-                    onClick={() => setGuide(true)}
-                  >
-                    Bingung pilih kategori? Lihat panduan &amp; contoh
-                  </button>
-                  {catObj?.desc && (
-                    <div className="mute small" style={{ marginTop: 4 }}>
-                      {catObj.desc}. Kebutuhan dengan kategori lain diajukan di
-                      PO terpisah.
-                    </div>
+        <Card ic="box" title="B. Detail Barang / Jasa">
+          <div className="body">
+            <div style={{ marginBottom: 12 }}>
+              <Field
+                label="Kategori Barang / Jasa (cukup dipilih sekali untuk semua item)"
+                req
+              >
+                <select value={cat} onChange={(e) => pickCat(e.target.value)}>
+                  <option value="">Pilih kategori</option>
+                  {cat && !activeCats.some((c) => c.name === cat) && (
+                    <option value={cat} disabled>
+                      {cat} (nonaktif)
+                    </option>
                   )}
-                </Field>
-              </div>
-              {items.map((i, n) => (
-                <div className="item" key={i.id}>
-                  <div className="ihead">
-                    <b>Item {n + 1}</b>
-                    <button
-                      aria-label="Hapus item"
-                      title="Hapus item"
-                      onClick={() =>
-                        items.length > 1
-                          ? setItems((l) => l.filter((x) => x.id !== i.id))
-                          : notify('Minimal 1 item')
-                      }
-                    >
-                      <Ic n="trash" s={16} />
-                    </button>
-                  </div>
-                  {(() => {
-                    const exs = (catObj?.ex ?? '')
-                      .split(',')
-                      .map((x) => x.trim())
-                      .filter(Boolean)
-                      .map((x) => x.charAt(0).toUpperCase() + x.slice(1));
-                    return exs.length ? (
-                      <div className="exs">
-                        <small>Pilih barang/jasa untuk kategori ini:</small>
-                        {exs.map((x) => (
-                          <button
-                            type="button"
-                            key={x}
-                            onClick={() => si(i.id, 'd', x)}
-                          >
-                            {x}
-                          </button>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="exs">
-                        <small>
-                          {cat
-                            ? 'Ketik deskripsi barang/jasa di bawah.'
-                            : 'Pilih kategori di atas dulu untuk melihat contoh barang/jasa.'}
-                        </small>
-                      </div>
-                    );
-                  })()}
-                  <div className="r1">
-                    <Field label="1. Description Barang / Jasa" req>
-                      <input
-                        value={i.d}
-                        onChange={(e) => si(i.id, 'd', e.target.value)}
-                        placeholder="Masukkan deskripsi barang/jasa"
-                      />
-                    </Field>
-                    <Field label="2. Qty" req>
-                      <input
-                        type="number"
-                        min="0"
-                        value={i.q}
-                        onChange={(e) => si(i.id, 'q', e.target.value)}
-                        placeholder="0"
-                      />
-                    </Field>
-                    <Field label="3. Satuan" req>
-                      <select
-                        value={i.s}
-                        onChange={(e) => si(i.id, 's', e.target.value)}
-                      >
-                        <option value="">Pilih</option>
-                        {UNITS.map((u) => (
-                          <option key={u}>{u}</option>
-                        ))}
-                      </select>
-                    </Field>
-                  </div>
-                  <div
-                    className="r2"
-                    style={{ gridTemplateColumns: 'repeat(2,minmax(0,1fr))' }}
-                  >
-                    <Field label="4. Unit Price / Harga Satuan (Rp)" req>
-                      <input
-                        type="number"
-                        min="0"
-                        value={i.p}
-                        onChange={(e) => si(i.id, 'p', e.target.value)}
-                        placeholder="0"
-                      />
-                    </Field>
-                    <Field label="5. Total / Jumlah (Rp)">
-                      <input
-                        readOnly
-                        value={rp((Number(i.q) || 0) * (Number(i.p) || 0))}
-                      />
-                    </Field>
-                  </div>
-                </div>
-              ))}
-              <p>
+                  {(['Barang', 'Jasa'] as CatType[]).map(
+                    (t) =>
+                      activeCats.some((c) => c.type === t) && (
+                        <optgroup key={t} label={t}>
+                          {activeCats
+                            .filter((c) => c.type === t)
+                            .map((c) => (
+                              <option key={c.name} value={c.name}>
+                                {c.name}
+                              </option>
+                            ))}
+                        </optgroup>
+                      )
+                  )}
+                </select>
                 <button
-                  className="pri"
-                  onClick={() =>
-                    setItems((l) => [
-                      ...l,
-                      newItem(
-                        catObj?.type === 'Jasa' ? { s: 'Jasa' } : undefined
-                      ),
-                    ])
-                  }
+                  type="button"
+                  className="lnk small"
+                  style={{ marginTop: 4 }}
+                  onClick={() => setGuide(true)}
                 >
-                  <Ic n="plus" s={16} /> Tambah Item
+                  Bingung pilih kategori? Lihat panduan &amp; contoh
                 </button>
-              </p>
+                {catObj?.desc && (
+                  <div className="mute small" style={{ marginTop: 4 }}>
+                    {catObj.desc}. Kebutuhan dengan kategori lain diajukan di PO
+                    terpisah.
+                  </div>
+                )}
+              </Field>
             </div>
-          </Card>
+            {items.map((i, n) => (
+              <div className="item" key={i.id}>
+                <div className="ihead">
+                  <b>Item {n + 1}</b>
+                  <button
+                    aria-label="Hapus item"
+                    title="Hapus item"
+                    onClick={() =>
+                      items.length > 1
+                        ? setItems((l) => l.filter((x) => x.id !== i.id))
+                        : notify('Minimal 1 item')
+                    }
+                  >
+                    <Ic n="trash" s={16} />
+                  </button>
+                </div>
+                {(() => {
+                  const exs = (catObj?.ex ?? '')
+                    .split(',')
+                    .map((x) => x.trim())
+                    .filter(Boolean)
+                    .map((x) => x.charAt(0).toUpperCase() + x.slice(1));
+                  return exs.length ? (
+                    <div className="exs">
+                      <small>Pilih barang/jasa untuk kategori ini:</small>
+                      {exs.map((x) => (
+                        <button
+                          type="button"
+                          key={x}
+                          onClick={() => si(i.id, 'd', x)}
+                        >
+                          {x}
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="exs">
+                      <small>
+                        {cat
+                          ? 'Ketik deskripsi barang/jasa di bawah.'
+                          : 'Pilih kategori di atas dulu untuk melihat contoh barang/jasa.'}
+                      </small>
+                    </div>
+                  );
+                })()}
+                <div className="r1">
+                  <Field label="1. Description Barang / Jasa" req>
+                    <input
+                      value={i.d}
+                      onChange={(e) => si(i.id, 'd', e.target.value)}
+                      placeholder="Masukkan deskripsi barang/jasa"
+                    />
+                  </Field>
+                  <Field label="2. Qty" req>
+                    <input
+                      type="number"
+                      min="0"
+                      value={i.q}
+                      onChange={(e) => si(i.id, 'q', e.target.value)}
+                      placeholder="0"
+                    />
+                  </Field>
+                  <Field label="3. Satuan" req>
+                    <select
+                      value={i.s}
+                      onChange={(e) => si(i.id, 's', e.target.value)}
+                    >
+                      <option value="">Pilih</option>
+                      {UNITS.map((u) => (
+                        <option key={u}>{u}</option>
+                      ))}
+                    </select>
+                  </Field>
+                </div>
+                <div
+                  className="r2"
+                  style={{ gridTemplateColumns: 'repeat(2,minmax(0,1fr))' }}
+                >
+                  <Field label="4. Unit Price / Harga Satuan (Rp)" req>
+                    <input
+                      type="number"
+                      min="0"
+                      value={i.p}
+                      onChange={(e) => si(i.id, 'p', e.target.value)}
+                      placeholder="0"
+                    />
+                  </Field>
+                  <Field label="5. Total / Jumlah (Rp)">
+                    <input
+                      readOnly
+                      value={rp((Number(i.q) || 0) * (Number(i.p) || 0))}
+                    />
+                  </Field>
+                </div>
+              </div>
+            ))}
+            <p>
+              <button
+                className="pri"
+                onClick={() =>
+                  setItems((l) => [
+                    ...l,
+                    newItem(
+                      catObj?.type === 'Jasa' ? { s: 'Jasa' } : undefined
+                    ),
+                  ])
+                }
+              >
+                <Ic n="plus" s={16} /> Tambah Item
+              </button>
+            </p>
+          </div>
+        </Card>
         </fieldset>
       </div>
       <div className="cr">
@@ -3238,90 +3183,91 @@ function Form({
           disabled={readOnly}
           style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}
         >
-          <Card ic="card" title="D. Informasi Pembayaran">
-            <div className="body grid">
-              <Field label="1. No. Rekening" req>
-                <input
-                  value={pay.rek}
-                  onChange={(e) => sp('rek', e.target.value)}
-                  placeholder="Masukkan nomor rekening"
-                  inputMode="numeric"
-                />
-              </Field>
-              <Field label="2. Nama Bank" req>
-                <input
-                  value={pay.bank}
-                  onChange={(e) => sp('bank', e.target.value)}
-                  placeholder="Contoh: BCA, Mandiri, BNI"
-                />
-              </Field>
-              <Field label="3. Kantor Cabang" req>
-                <input
-                  value={pay.cabang}
-                  onChange={(e) => sp('cabang', e.target.value)}
-                  placeholder="Masukkan kantor cabang"
-                />
-              </Field>
-              <Field label="4. Atas Nama" req>
-                <input
-                  value={pay.an}
-                  onChange={(e) => sp('an', e.target.value)}
-                  placeholder="Masukkan nama pemilik rekening"
-                />
-              </Field>
-            </div>
-          </Card>
-
-          <div className="card fold">
-            <button
-              type="button"
-              className="fhead"
-              onClick={() => setInfoOpen((x) => !x)}
-              aria-expanded={infoOpen}
-            >
-              <Ic n="info" s={20} />
-              <b>Informasi Tambahan</b>
-              <span className="sp" />
-              <Ic n={infoOpen ? 'up' : 'down'} s={18} />
-            </button>
-            {infoOpen && (
-              <div className="body">
-                <textarea
-                  rows={3}
-                  maxLength={250}
-                  value={note}
-                  onChange={(e) => setNote(e.target.value)}
-                  placeholder="Masukkan catatan atau informasi tambahan jika diperlukan..."
-                />
-              </div>
-            )}
+        <Card ic="card" title="D. Informasi Pembayaran">
+          <div className="body grid">
+            <Field label="1. No. Rekening" req>
+              <input
+                value={pay.rek}
+                onChange={(e) => sp('rek', e.target.value)}
+                placeholder="Masukkan nomor rekening"
+                inputMode="numeric"
+              />
+            </Field>
+            <Field label="2. Nama Bank" req>
+              <input
+                value={pay.bank}
+                onChange={(e) => sp('bank', e.target.value)}
+                placeholder="Contoh: BCA, Mandiri, BNI"
+              />
+            </Field>
+            <Field label="3. Kantor Cabang" req>
+              <input
+                value={pay.cabang}
+                onChange={(e) => sp('cabang', e.target.value)}
+                placeholder="Masukkan kantor cabang"
+              />
+            </Field>
+            <Field label="4. Atas Nama" req>
+              <input
+                value={pay.an}
+                onChange={(e) => sp('an', e.target.value)}
+                placeholder="Masukkan nama pemilik rekening"
+              />
+            </Field>
           </div>
+        </Card>
+
+        <div className="card fold">
+          <button
+            type="button"
+            className="fhead"
+            onClick={() => setInfoOpen((x) => !x)}
+            aria-expanded={infoOpen}
+          >
+            <Ic n="info" s={20} />
+            <b>Informasi Tambahan</b>
+            <span className="sp" />
+            <Ic n={infoOpen ? 'up' : 'down'} s={18} />
+          </button>
+          {infoOpen && (
+            <div className="body">
+              <textarea
+                rows={3}
+                maxLength={250}
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                placeholder="Masukkan catatan atau informasi tambahan jika diperlukan..."
+              />
+            </div>
+          )}
+        </div>
+
         </fieldset>
         {!readOnly && (
-          <div className="actions">
-            <button
-              className="l"
-              onClick={() => {
-                setV(EMPTY);
-                setPay(EMPTY_PAY);
-                setItems([newItem()]);
-                setTax('');
-                setDisc('');
-                setOng('');
-                setNote('');
-              }}
-            >
-              Reset Form
+        <div className="actions">
+          <button
+            className="l"
+            onClick={() => {
+              setV(EMPTY);
+              setPay(EMPTY_PAY);
+              setItems([newItem()]);
+              setTax('');
+              setDisc('');
+              setOng('');
+              setNote('');
+            }}
+          >
+            Reset Form
+          </button>
+          {onBack && (
+            <button className="ghost" onClick={onBack}>
+              Batal
             </button>
-            {onBack && (
-              <button className="ghost" onClick={onBack}>
-                Batal
-              </button>
-            )}
-            <button className="pri" onClick={send}>
-              Kirim Request
-            </button>
-          </div>
+          )}
+          <button className="pri" onClick={send}>
+            Kirim Request
+          </button>
+        </div>
         )}
       </div>
     </div>
@@ -3457,10 +3403,7 @@ function PoTable({
                           <>
                             <br />
                             <span className="prnote">
-                              🖨 Dicetak {pn}×
-                              {p.printAt
-                                ? ` · terakhir ${fmtDT(p.printAt)}`
-                                : ''}
+                              🖨 Dicetak {pn}×{p.printAt ? ` · terakhir ${fmtDT(p.printAt)}` : ''}
                               {p.printOk ? ' · cetak ulang diizinkan' : ''}
                             </span>
                           </>
@@ -3541,11 +3484,7 @@ function PoTable({
                         <button
                           className={
                             'ghost ' +
-                            (done
-                              ? printLocked
-                                ? 'prred adm'
-                                : 'prgreen'
-                              : '')
+                            (done ? (printLocked ? 'prred adm' : 'prgreen') : '')
                           }
                           title={
                             done && printLocked
@@ -4134,11 +4073,7 @@ function BPPage({
                         </span>
                       </td>
                       <td>{fmtD(b.exp)}</td>
-                      <td
-                        className={
-                          i.expired || i.bad ? 'bad' : i.soon ? 'warnt' : ''
-                        }
-                      >
+                      <td className={i.expired || i.bad ? 'bad' : i.soon ? 'warnt' : ''}>
                         {i.bad
                           ? 'Format tanggal tidak terbaca'
                           : i.expired
@@ -4769,38 +4704,18 @@ function usePager<T>(rows: T[], per: number) {
   const [page, setPage] = useState(1);
   const pages = Math.max(1, Math.ceil(rows.length / per));
   const safe = Math.min(page, pages);
-  return {
-    page: safe,
-    pages,
-    view: rows.slice((safe - 1) * per, safe * per),
-    setPage,
-  };
+  return { page: safe, pages, view: rows.slice((safe - 1) * per, safe * per), setPage };
 }
 
 /** Tombol halaman: Sebelumnya / nomor (jendela di sekitar halaman aktif) / Berikutnya. */
-function Pager({
-  page,
-  pages,
-  onPage,
-}: {
-  page: number;
-  pages: number;
-  onPage: (p: number) => void;
-}) {
+function Pager({ page, pages, onPage }: { page: number; pages: number; onPage: (p: number) => void }) {
   if (pages <= 1) return null;
   const nums: number[] = [];
   for (let i = 1; i <= pages; i++) nums.push(i);
-  const show = nums.filter(
-    (n) => n === 1 || n === pages || Math.abs(n - page) <= 2
-  );
+  const show = nums.filter((n) => n === 1 || n === pages || Math.abs(n - page) <= 2);
   return (
     <div className="pager">
-      <button
-        type="button"
-        className="ghost"
-        disabled={page <= 1}
-        onClick={() => onPage(page - 1)}
-      >
+      <button type="button" className="ghost" disabled={page <= 1} onClick={() => onPage(page - 1)}>
         ‹ Sebelumnya
       </button>
       <span className="pgnums">
@@ -4818,12 +4733,7 @@ function Pager({
           </span>
         ))}
       </span>
-      <button
-        type="button"
-        className="ghost"
-        disabled={page >= pages}
-        onClick={() => onPage(page + 1)}
-      >
+      <button type="button" className="ghost" disabled={page >= pages} onClick={() => onPage(page + 1)}>
         Berikutnya ›
       </button>
     </div>
@@ -4894,10 +4804,8 @@ function TrackingPage({
         <Card ic="clock" title="Resume — PO progres terendah">
           <div className="body">
             <p className="mute small" style={{ margin: '0 0 8px' }}>
-              PO dengan progres terendah (di luar yang rejected), diurutkan dari
-              yang paling tertinggal — 5 per halaman, pantau di tahap apa
-              masing-masing berhenti. Klik nomor PO untuk menampilkan kartunya
-              di bawah.
+              PO dengan progres terendah (di luar yang rejected), diurutkan dari yang paling tertinggal — 5 per halaman, pantau di tahap apa masing-masing
+              berhenti. Klik nomor PO untuk menampilkan kartunya di bawah.
             </p>
             <div className="tbl">
               <table className="dtbl">
@@ -4934,22 +4842,15 @@ function TrackingPage({
                       <td>{fmtD(dayOf(p.iso))}</td>
                       <td>
                         <div className="pbar" style={{ margin: '2px 0' }}>
-                          <i
-                            style={{
-                              width: `${(t.done / TSTEPS.length) * 100}%`,
-                            }}
-                          />
+                          <i style={{ width: `${(t.done / TSTEPS.length) * 100}%` }} />
                         </div>
                         <small>
-                          {Math.round((t.done / TSTEPS.length) * 100)}% (
-                          {t.done}/{TSTEPS.length} tahap)
+                          {Math.round((t.done / TSTEPS.length) * 100)}% ({t.done}/{TSTEPS.length} tahap)
                         </small>
                       </td>
                       <td>{t.all ? 'Semua tahap selesai' : TSTEPS[t.cur].l}</td>
                       <td>
-                        <span
-                          className={'tag ' + (t.all ? 's-Done' : 's-Open')}
-                        >
+                        <span className={'tag ' + (t.all ? 's-Done' : 's-Open')}>
                           {t.all ? 'Selesai' : 'Progress'}
                         </span>
                       </td>
@@ -4957,11 +4858,7 @@ function TrackingPage({
                   ))}
                 </tbody>
               </table>
-              <Pager
-                page={lowPg.page}
-                pages={lowPg.pages}
-                onPage={lowPg.setPage}
-              />
+              <Pager page={lowPg.page} pages={lowPg.pages} onPage={lowPg.setPage} />
             </div>
           </div>
         </Card>
@@ -4972,178 +4869,178 @@ function TrackingPage({
         </Card>
       )}
       <div className="trkgrid">
-        {pg.view.map((p) => {
-          const t = trackOf(p);
-          const lk = lockedOf(p);
-          const isOpen = openNo === p.no;
-          return (
-            <Card key={p.no} cls={'trkcard' + (isOpen ? ' open' : '')}>
-              <div className="body">
-                <button
-                  type="button"
-                  className="trkhead"
-                  onClick={() => setSel(isOpen ? '-' : p.no)}
-                  aria-expanded={isOpen}
-                >
-                  <span className="tl1">
-                    <b>{p.no}</b>
-                    <small>
-                      {p.v.nama} · {p.dept} · {p.by}
-                    </small>
+      {pg.view.map((p) => {
+        const t = trackOf(p);
+        const lk = lockedOf(p);
+        const isOpen = openNo === p.no;
+        return (
+          <Card key={p.no} cls={'trkcard' + (isOpen ? ' open' : '')}>
+            <div className="body">
+              <button
+                type="button"
+                className="trkhead"
+                onClick={() => setSel(isOpen ? '-' : p.no)}
+                aria-expanded={isOpen}
+              >
+                <span className="tl1">
+                  <b>{p.no}</b>
+                  <small>
+                    {p.v.nama} · {p.dept} · {p.by}
+                  </small>
+                </span>
+                <span className="tl2">
+                  <span
+                    className={
+                      'tag ' +
+                      (p.rej ? 's-rejected' : t.all ? 's-Done' : 's-Open')
+                    }
+                  >
+                    {p.rej ? 'Rejected' : t.all ? 'Selesai' : 'Progress'}
                   </span>
-                  <span className="tl2">
-                    <span
-                      className={
-                        'tag ' +
-                        (p.rej ? 's-rejected' : t.all ? 's-Done' : 's-Open')
-                      }
-                    >
-                      {p.rej ? 'Rejected' : t.all ? 'Selesai' : 'Progress'}
-                    </span>
-                    <small>
-                      {t.done}/{TSTEPS.length} tahap ·{' '}
-                      {t.all ? 'Semua tahap selesai' : TSTEPS[t.cur].l}
-                    </small>
-                  </span>
-                  <Ic n={isOpen ? 'up' : 'down'} s={18} />
-                </button>
-                <div className="pbar">
-                  <i style={{ width: `${(t.done / TSTEPS.length) * 100}%` }} />
-                </div>
-                {isOpen && (
-                  <>
-                    {lk && (
-                      <div className="note bad">
-                        🔒 Periode tahun ini terkunci oleh admin, tanggal
-                        tahapan tidak bisa diubah.
-                      </div>
-                    )}
-                    <ol className="tl">
-                      {TSTEPS.map((s, i) => {
-                        const dt = t.dates[i];
-                        const st = dt
-                          ? 'ok'
-                          : i === t.cur && !p.rej
-                          ? 'cur'
-                          : 'open';
-                        // Tanggal "PO dikirim ke supplier" & "Barang diterima" penting: user pembuat PO boleh mengisi/mengubahnya kapan saja (tidak harus menunggu tahap sebelumnya). Tahap milik admin (di-approve, ke kantor pusat, sampai di kantor pusat, pembayaran) juga selalu bisa diisi admin tanpa menunggu giliran
-                        const keyStep =
-                          s.k === 'supp' || s.k === 'recv' || s.by === 'admin';
-                        const can =
-                          !lk &&
-                          !p.rej &&
-                          s.by !== 'auto' &&
-                          (s.by === 'creator'
-                            ? p.uid === me.id
-                            : s.by === 'both'
-                            ? admin || p.uid === me.id
-                            : admin) &&
-                          (keyStep || !!dt || i === t.cur);
-                        const prev = t.dates.slice(0, i).filter(Boolean).pop(); // tanggal terisi terakhir sebelum tahap ini
-                        const nx = t.dates.slice(i + 1).find(Boolean); // tanggal terisi pertama sesudah tahap ini
-                        const lo = prev ? dayOf(prev) : '';
-                        const hi = nx && dayOf(nx) < today ? dayOf(nx) : today;
-                        const k = s.k as TKey;
-                        const change = (v: string) => {
-                          if (!v) return;
-                          if (lo && v < lo)
-                            return notify(
-                              `Tanggal tidak boleh sebelum tahap sebelumnya (${fmtD(
-                                lo
-                              )}).`
-                            );
-                          if (v > hi)
-                            return notify(
-                              nx
-                                ? `Tanggal tidak boleh setelah tahap berikutnya (${fmtD(
-                                    nx
-                                  )}).`
-                                : 'Tanggal tidak boleh di masa depan.'
-                            );
-                          onSet(p.no, k, v);
-                        };
-                        return (
-                          <li key={s.k} className={st}>
-                            <i>
-                              {st === 'ok' ? (
-                                <Ic n="check" s={16} />
-                              ) : st === 'cur' ? (
-                                <Ic n="clock" s={16} />
-                              ) : (
-                                <span className="dt" />
-                              )}
-                            </i>
-                            <div className="tc">
-                              <div className="th">
-                                <b>{s.l}</b>
-                                <span
-                                  className={
-                                    'tag ' +
-                                    (st === 'ok'
-                                      ? 's-Done'
-                                      : st === 'cur'
-                                      ? 's-Open'
-                                      : 's-wait')
-                                  }
-                                >
-                                  {st === 'ok'
-                                    ? 'Selesai'
-                                    : st === 'cur'
-                                    ? 'Progress'
-                                    : 'Open'}
-                                </span>
-                              </div>
-                              <small>
-                                {dt
-                                  ? s.k === 'made'
-                                    ? fmtDT(dt)
-                                    : fmtD(dt)
-                                  : can
-                                  ? 'Isi tanggal untuk menyelesaikan tahap ini'
-                                  : st === 'cur'
-                                  ? s.by === 'creator'
-                                    ? `Menunggu update dari pembuat PO (${p.by})`
-                                    : s.by === 'both'
-                                    ? `Menunggu update dari pembuat PO (${p.by}) atau admin`
-                                    : 'Menunggu update dari admin'
-                                  : 'Belum dimulai'}
-                              </small>
-                              {can && (
-                                <div className="tedit">
-                                  <input
-                                    type="date"
-                                    value={dt ? dayOf(dt) : ''}
-                                    min={lo || undefined}
-                                    max={hi}
-                                    onChange={(e) => change(e.target.value)}
-                                    aria-label={'Tanggal ' + s.l}
-                                  />
-                                  {!!dt && !nx && (
-                                    <button
-                                      className="ghost"
-                                      onClick={() => onSet(p.no, k, '')}
-                                    >
-                                      Hapus
-                                    </button>
-                                  )}
-                                </div>
-                              )}
-                            </div>
-                          </li>
-                        );
-                      })}
-                    </ol>
-                    <div className="acts">
-                      <button className="ghost" onClick={() => onPrint(p.no)}>
-                        Lihat dokumen PO
-                      </button>
-                    </div>
-                  </>
-                )}
+                  <small>
+                    {t.done}/{TSTEPS.length} tahap ·{' '}
+                    {t.all ? 'Semua tahap selesai' : TSTEPS[t.cur].l}
+                  </small>
+                </span>
+                <Ic n={isOpen ? 'up' : 'down'} s={18} />
+              </button>
+              <div className="pbar">
+                <i style={{ width: `${(t.done / TSTEPS.length) * 100}%` }} />
               </div>
-            </Card>
-          );
-        })}
+              {isOpen && (
+                <>
+                  {lk && (
+                    <div className="note bad">
+                      🔒 Periode tahun ini terkunci oleh admin, tanggal tahapan
+                      tidak bisa diubah.
+                    </div>
+                  )}
+                  <ol className="tl">
+                    {TSTEPS.map((s, i) => {
+                      const dt = t.dates[i];
+                      const st = dt
+                        ? 'ok'
+                        : i === t.cur && !p.rej
+                        ? 'cur'
+                        : 'open';
+                      // Tanggal "PO dikirim ke supplier" & "Barang diterima" penting: user pembuat PO boleh mengisi/mengubahnya kapan saja (tidak harus menunggu tahap sebelumnya). Tahap milik admin (di-approve, ke kantor pusat, sampai di kantor pusat, pembayaran) juga selalu bisa diisi admin tanpa menunggu giliran
+                      const keyStep =
+                        s.k === 'supp' || s.k === 'recv' || s.by === 'admin';
+                      const can =
+                        !lk &&
+                        !p.rej &&
+                        s.by !== 'auto' &&
+                        (s.by === 'creator'
+                          ? p.uid === me.id
+                          : s.by === 'both'
+                          ? admin || p.uid === me.id
+                          : admin) &&
+                        (keyStep || !!dt || i === t.cur);
+                      const prev = t.dates.slice(0, i).filter(Boolean).pop(); // tanggal terisi terakhir sebelum tahap ini
+                      const nx = t.dates.slice(i + 1).find(Boolean); // tanggal terisi pertama sesudah tahap ini
+                      const lo = prev ? dayOf(prev) : '';
+                      const hi = nx && dayOf(nx) < today ? dayOf(nx) : today;
+                      const k = s.k as TKey;
+                      const change = (v: string) => {
+                        if (!v) return;
+                        if (lo && v < lo)
+                          return notify(
+                            `Tanggal tidak boleh sebelum tahap sebelumnya (${fmtD(
+                              lo
+                            )}).`
+                          );
+                        if (v > hi)
+                          return notify(
+                            nx
+                              ? `Tanggal tidak boleh setelah tahap berikutnya (${fmtD(
+                                  nx
+                                )}).`
+                              : 'Tanggal tidak boleh di masa depan.'
+                          );
+                        onSet(p.no, k, v);
+                      };
+                      return (
+                        <li key={s.k} className={st}>
+                          <i>
+                            {st === 'ok' ? (
+                              <Ic n="check" s={16} />
+                            ) : st === 'cur' ? (
+                              <Ic n="clock" s={16} />
+                            ) : (
+                              <span className="dt" />
+                            )}
+                          </i>
+                          <div className="tc">
+                            <div className="th">
+                              <b>{s.l}</b>
+                              <span
+                                className={
+                                  'tag ' +
+                                  (st === 'ok'
+                                    ? 's-Done'
+                                    : st === 'cur'
+                                    ? 's-Open'
+                                    : 's-wait')
+                                }
+                              >
+                                {st === 'ok'
+                                  ? 'Selesai'
+                                  : st === 'cur'
+                                  ? 'Progress'
+                                  : 'Open'}
+                              </span>
+                            </div>
+                            <small>
+                              {dt
+                                ? s.k === 'made'
+                                  ? fmtDT(dt)
+                                  : fmtD(dt)
+                                : can
+                                ? 'Isi tanggal untuk menyelesaikan tahap ini'
+                                : st === 'cur'
+                                ? s.by === 'creator'
+                                  ? `Menunggu update dari pembuat PO (${p.by})`
+                                  : s.by === 'both'
+                                  ? `Menunggu update dari pembuat PO (${p.by}) atau admin`
+                                  : 'Menunggu update dari admin'
+                                : 'Belum dimulai'}
+                            </small>
+                            {can && (
+                              <div className="tedit">
+                                <input
+                                  type="date"
+                                  value={dt ? dayOf(dt) : ''}
+                                  min={lo || undefined}
+                                  max={hi}
+                                  onChange={(e) => change(e.target.value)}
+                                  aria-label={'Tanggal ' + s.l}
+                                />
+                                {!!dt && !nx && (
+                                  <button
+                                    className="ghost"
+                                    onClick={() => onSet(p.no, k, '')}
+                                  >
+                                    Hapus
+                                  </button>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ol>
+                  <div className="acts">
+                    <button className="ghost" onClick={() => onPrint(p.no)}>
+                      Lihat dokumen PO
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </Card>
+        );
+      })}
       </div>
       <Pager page={pg.page} pages={pg.pages} onPage={pg.setPage} />
     </>
@@ -6075,10 +5972,7 @@ function TrendChart({
   const nraw = nmx / 4;
   const nex = Math.pow(10, Math.floor(Math.log10(nraw)));
   const nfr = nraw / nex;
-  const nstep = Math.max(
-    1,
-    (nfr <= 1 ? 1 : nfr <= 2 ? 2 : nfr <= 5 ? 5 : 10) * nex
-  );
+  const nstep = Math.max(1, (nfr <= 1 ? 1 : nfr <= 2 ? 2 : nfr <= 5 ? 5 : 10) * nex);
   const mn = nstep * 4;
   const bw = pw / data.length;
   const bwid = Math.min(64, bw * 0.72);
@@ -6148,13 +6042,7 @@ function TrendChart({
             <stop offset="1" stopColor="#fff" stopOpacity=".55" />
           </linearGradient>
           <clipPath id="tclip">
-            <rect
-              x={L - 8}
-              y={T - 14}
-              width={pw + 16}
-              height={ph + 26}
-              rx={18}
-            />
+            <rect x={L - 8} y={T - 14} width={pw + 16} height={ph + 26} rx={18} />
           </clipPath>
           <filter id="tglow" x="-10%" y="-40%" width="120%" height="180%">
             <feGaussianBlur stdDeviation="3.2" />
@@ -6180,11 +6068,11 @@ function TrendChart({
           strokeOpacity=".9"
         />
         <path
-          d={`M${L - 8},${T + 30}V${T + 4}Q${L - 8},${T - 14} ${L + 10},${
-            T - 14
-          }H${L + pw - 2}Q${L + pw + 8},${T - 14} ${L + pw + 8},${T + 4}V${
-            T + 30
-          }Q${L + pw / 2},${T + 8} ${L - 8},${T + 30}Z`}
+          d={`M${L - 8},${T + 30}V${T + 4}Q${L - 8},${T - 14} ${L + 10},${T - 14}H${
+            L + pw - 2
+          }Q${L + pw + 8},${T - 14} ${L + pw + 8},${T + 4}V${T + 30}Q${
+            L + pw / 2
+          },${T + 8} ${L - 8},${T + 30}Z`}
           fill="#fff"
           opacity=".28"
         />
@@ -7169,9 +7057,7 @@ function Dashboard({
                   <Ic n="down" s={14} />
                   <select
                     value={per.n}
-                    onChange={(e) =>
-                      onPer({ ...per, n: Number(e.target.value) })
-                    }
+                    onChange={(e) => onPer({ ...per, n: Number(e.target.value) })}
                     aria-label="Pilih periode"
                   >
                     {nOpts.map((o) => (
@@ -7623,6 +7509,7 @@ function AllPage({
   lockedOf: (p: PO) => boolean;
   onExport: (l: PO[]) => void;
   onViewForm?: (p: PO) => void; // admin: buka form isian PO (mode lihat saja)
+  onAllowReprint?: (no: string) => void;
 }) {
   const fromLink = !!(init.dept || init.stat || init.q); // dibuka dari tautan "Lihat Semua"/pencarian: tampilkan semua periode
   const def = monthRange();
@@ -7779,11 +7666,11 @@ function AllPage({
   const rows = cur
     .filter((p) => !lim || (lim === 'atas' ? isBig(p) : !isBig(p)))
     .sort((a, b) =>
-      sort
-        ? (sort === 'asc' ? 1 : -1) * a.by.localeCompare(b.by, 'id') ||
-          b.iso.localeCompare(a.iso)
-        : b.iso.localeCompare(a.iso)
-    );
+    sort
+      ? (sort === 'asc' ? 1 : -1) * a.by.localeCompare(b.by, 'id') ||
+        b.iso.localeCompare(a.iso)
+      : b.iso.localeCompare(a.iso)
+  );
   const pg = usePager(rows, 15);
   const makers = [...new Set(list.map((p) => p.by))].sort((a, b) =>
     a.localeCompare(b, 'id')
@@ -7998,18 +7885,8 @@ function AllPage({
       <div className="ap-lim">
         {(
           [
-            [
-              'atas',
-              'PO di Atas Rp 10 Juta',
-              big,
-              'Wajib approve Managing Director',
-            ],
-            [
-              'bawah',
-              'PO di Bawah Rp 10 Juta',
-              small,
-              'Tanpa approval Managing Director',
-            ],
+            ['atas', 'PO di Atas Rp 10 Juta', big, 'Wajib approve Managing Director'],
+            ['bawah', 'PO di Bawah Rp 10 Juta', small, 'Tanpa approval Managing Director'],
           ] as const
         ).map(([k, t, l, sub]) => (
           <button
@@ -8209,9 +8086,8 @@ function AllPage({
                               {p.rejWhy && (
                                 <>
                                   <br />
-                                  {p.rejFinal
-                                    ? 'Keterangan reject'
-                                    : 'Alasan'}: {p.rejWhy}
+                                  {p.rejFinal ? 'Keterangan reject' : 'Alasan'}:{' '}
+                                  {p.rejWhy}
                                 </>
                               )}
                               {p.rejFinal && (
@@ -8984,7 +8860,7 @@ function makeDemoPOs(seqBase: Record<number, number>): PO[] {
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
-  const pick = <T>(a: T[]): T => a[Math.floor(rnd() * a.length)];
+  const pick = <T,>(a: T[]): T => a[Math.floor(rnd() * a.length)];
   const now = new Date();
   const today = ymd(now);
   const users = DEMO_USERS.filter((u) => u.status === 'approved');
@@ -9208,8 +9084,7 @@ const makeRefPO = (taken: Set<string>): PO => {
    Lalu ikuti langkah 3-4 di PETUNJUK.md (panggil useSheetSync di dalam App).
    ===================================================================== */
 
-const ENV_ =
-  (import.meta as unknown as { env?: Record<string, string> }).env ?? {};
+const ENV_ = ((import.meta as unknown as { env?: Record<string, string> }).env ?? {});
 // Taruh URL & token di file .env (VITE_SHEET_URL, VITE_SHEET_TOKEN), lalu HAPUS nilai cadangan di bawah. Token lama sudah terlanjur terbuka: ganti token baru di Code.gs.
 const SHEET_URL: string =
   ENV_.VITE_SHEET_URL ||
@@ -9256,18 +9131,10 @@ function brandRows(b: Brand): STable {
   BRAND_IMG.forEach((k) => {
     const v = b[k] || '';
     for (let i = 0, n = 0; i < v.length; i += BRAND_CHUNK, n++)
-      out.push({
-        kunci: k,
-        urut: String(n),
-        nilai: '~' + v.slice(i, i + BRAND_CHUNK),
-      });
+      out.push({ kunci: k, urut: String(n), nilai: '~' + v.slice(i, i + BRAND_CHUNK) });
   });
   out.push({ kunci: 'glass', urut: '0', nilai: String(b.glass) });
-  out.push({
-    kunci: 'sideBox',
-    urut: '0',
-    nilai: b.sideBox === false ? 'FALSE' : 'TRUE',
-  });
+  out.push({ kunci: 'sideBox', urut: '0', nilai: b.sideBox === false ? 'FALSE' : 'TRUE' });
   return out;
 }
 function brandFrom(rows: STable | undefined, cur: Brand): Brand {
@@ -9307,22 +9174,12 @@ const mailShell = (title: string, body: string) =>
 const mailActivated = (u: User) =>
   mailShell(
     'Akun Anda sudah aktif',
-    `<p>Halo <b>${escH(
-      u.nama
-    )}</b>,</p><p>Akun Anda telah diaktifkan oleh admin. Silakan masuk memakai username <b>${escH(
-      uname(u)
-    )}</b> dan password yang Anda daftarkan.</p>`
+    `<p>Halo <b>${escH(u.nama)}</b>,</p><p>Akun Anda telah diaktifkan oleh admin. Silakan masuk memakai username <b>${escH(uname(u))}</b> dan password yang Anda daftarkan.</p>`
   );
 const mailReset = (u: User, tmp: string) =>
   mailShell(
     'Password direset oleh admin',
-    `<p>Halo <b>${escH(
-      u.nama
-    )}</b>,</p><p>Password akun Anda direset. Masuk dengan:</p><p>Username: <b>${escH(
-      uname(u)
-    )}</b><br/>Password sementara: <b>${escH(
-      tmp
-    )}</b></p><p>Segera ganti password setelah masuk (menu Profil &rarr; Ganti Password).</p>`
+    `<p>Halo <b>${escH(u.nama)}</b>,</p><p>Password akun Anda direset. Masuk dengan:</p><p>Username: <b>${escH(uname(u))}</b><br/>Password sementara: <b>${escH(tmp)}</b></p><p>Segera ganti password setelah masuk (menu Profil &rarr; Ganti Password).</p>`
   );
 const TRK_KEYS: TKey[] = ['appr', 'supp', 'hoSend', 'hoRecv', 'recv', 'pay'];
 
@@ -9527,8 +9384,7 @@ function fromTables(t: STables, cur: SyncData): SyncData {
         note: r.note || undefined,
         rej: so_(r.rej),
         rejWhy: so_(r.rejWhy),
-        rejFinal:
-          r.rejFinal === '1' || r.rejFinal === 'true' ? true : undefined,
+        rejFinal: r.rejFinal === '1' || r.rejFinal === 'true' ? true : undefined,
         newNo: so_(r.newNo),
         prevNo: so_(r.prevNo),
         resent: so_(r.resent),
@@ -9606,18 +9462,7 @@ function useSheetSync(
   setters.current = set;
   const tables = useMemo(
     () => toTables(d),
-    [
-      d.users,
-      d.depts,
-      d.cats,
-      d.bps,
-      d.pos,
-      d.hist,
-      d.numCfg,
-      d.theme,
-      d.seen,
-      d.brand,
-    ]
+    [d.users, d.depts, d.cats, d.bps, d.pos, d.hist, d.numCfg, d.theme, d.seen, d.brand]
   ); // eslint-disable-line react-hooks/exhaustive-deps
 
   const push = async (t: STables, key: string) => {
@@ -9727,7 +9572,58 @@ function useSheetSync(
     }, 1500);
     return () => clearTimeout(id);
   }, [tables, ok, kick]); // eslint-disable-line react-hooks/exhaustive-deps
-  return status;
+  useEffect(() => {
+    // belum pernah berhasil terhubung ke Google Sheet: coba lagi otomatis tiap 8 detik
+    if (ok) return;
+    const id = window.setInterval(() => {
+      if (!document.hidden) void pull(true);
+    }, 8000);
+    return () => clearInterval(id);
+  }, [ok]); // eslint-disable-line react-hooks/exhaustive-deps
+  const out: SyncStatus = ok
+    ? status || 'saved'
+    : status === 'error'
+    ? 'offline'
+    : 'loading';
+  return out;
+}
+
+type SyncStatus = 'loading' | 'offline' | 'sync' | 'saved' | 'error';
+
+function SyncChip({ st }: { st: SyncStatus }) {
+  const m: Record<SyncStatus, [string, string, string]> = {
+    loading: ['Menghubungkan ke Google Sheet\u2026', '#8a5b00', '#fff4d6'],
+    offline: ['Tidak terhubung ke Google Sheet \u2013 data belum dibagikan. Mencoba ulang\u2026', '#b42318', '#fde8e8'],
+    sync: ['Menyinkronkan\u2026', '#0f5fc0', '#e6f1ff'],
+    error: ['Gagal sinkron, dicoba lagi otomatis', '#b42318', '#fde8e8'],
+    saved: ['\u25CF Tersinkron dengan Google Sheet', '#157347', '#e6f6ec'],
+  };
+  const [text, fg, bg] = m[st];
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      style={{
+        position: 'fixed',
+        left: 10,
+        bottom: 10,
+        zIndex: 99999,
+        maxWidth: 'calc(100vw - 20px)',
+        padding: '5px 12px',
+        borderRadius: 999,
+        fontSize: 12,
+        fontWeight: 600,
+        fontFamily: 'Arial,sans-serif',
+        color: fg,
+        background: bg,
+        border: '1px solid ' + fg + '55',
+        boxShadow: '0 1px 4px rgba(0,0,0,.15)',
+        pointerEvents: 'none',
+      }}
+    >
+      {text}
+    </div>
+  );
 }
 
 export default function App() {
@@ -9766,7 +9662,7 @@ export default function App() {
   const [fStat, setFStat] = useState('');
   const [viewNo, setViewNo] = useState('');
   const [prevPg, setPrevPg] = useState(''); // halaman sebelum membuka Dokumen PO (untuk tombol Kembali)
-  const [backTo, setBackTo] = useState(''); // halaman asal dokumen PO (mis. "tracking"); kosong = dibuka langsung, tanpa tombol kembali
+  const [, setBackTo] = useState(''); // halaman asal dokumen PO (mis. "tracking"); kosong = dibuka langsung, tanpa tombol kembali
   const [mdOpen, setMdOpen] = useState(true);
   /* Mode HP/tablet: sidebar menjadi drawer geser (dibuka lewat tombol hamburger) */
   const [navOpen, setNavOpen] = useState(false);
@@ -9834,7 +9730,9 @@ export default function App() {
             .includes(uq.trim().toLowerCase()))
     )
     .sort(
-      (a, b) => Number(b.status === 'pending') - Number(a.status === 'pending')
+      (a, b) =>
+        Number(b.status === 'pending') -
+        Number(a.status === 'pending')
     );
   const uPages = Math.max(1, Math.ceil(uRows.length / 15));
   const uPgSafe = Math.min(uPg, uPages);
@@ -9843,7 +9741,7 @@ export default function App() {
     return { type: 'monthly', year: d.getFullYear(), n: d.getMonth() };
   });
   const [themeG, setThemeG] = useLS<number>('po_theme', 0); // tema bawaan sistem: diatur admin, tersimpan
-  useSheetSync(
+  const syncSt = useSheetSync(
     { users, depts, cats, bps, pos, hist, numCfg, theme: themeG, seen, brand },
     {
       users: setUsers,
@@ -9878,11 +9776,7 @@ export default function App() {
         ? l
         : l.map((u) =>
             u.id === 'admin'
-              ? {
-                  ...ADMIN,
-                  email: u.email || ADMIN.email,
-                  pass: u.pass || ADMIN.pass,
-                }
+              ? { ...ADMIN, email: u.email || ADMIN.email, pass: u.pass || ADMIN.pass }
               : u
           );
     });
@@ -9966,8 +9860,7 @@ export default function App() {
   // Akun demo yang sudah terlanjur ada: dinonaktifkan saat admin login (password demo sudah umum diketahui). Admin bisa mengaktifkan kembali bila perlu.
   useEffect(() => {
     if (SEED_DEMO || !me || me.role !== 'admin') return;
-    if (!users.some((u) => u.id.startsWith('demo-') && u.status !== 'rejected'))
-      return;
+    if (!users.some((u) => u.id.startsWith('demo-') && u.status !== 'rejected')) return;
     setUsers((l) =>
       l.map((u) =>
         u.id.startsWith('demo-') && u.status !== 'rejected'
@@ -9980,12 +9873,7 @@ export default function App() {
 
   // Admin login: password lama (teks biasa) milik semua akun di-hash sekali jalan, sehingga tidak ada lagi password terbaca di sheet.
   useEffect(() => {
-    if (
-      !me ||
-      me.role !== 'admin' ||
-      !users.some((u) => u.pass && !isHashed(u.pass))
-    )
-      return;
+    if (!me || me.role !== 'admin' || !users.some((u) => u.pass && !isHashed(u.pass))) return;
     let off = false;
     void (async () => {
       try {
@@ -9993,9 +9881,7 @@ export default function App() {
         for (const u of users)
           if (u.pass && !isHashed(u.pass)) m.set(u.id, await hashPw(u.pass));
         if (!off && m.size)
-          setUsers((l) =>
-            l.map((u) => (m.has(u.id) ? { ...u, pass: m.get(u.id)! } : u))
-          );
+          setUsers((l) => l.map((u) => (m.has(u.id) ? { ...u, pass: m.get(u.id)! } : u)));
       } catch {
         /* abaikan */
       }
@@ -10009,9 +9895,7 @@ export default function App() {
     if (me && WEAK_LOGIN) {
       WEAK_LOGIN = false;
       setPwOpen(true);
-      notify(
-        'Password Anda masih default/lemah. Segera ganti dengan password baru (min. 8 karakter).'
-      );
+      notify('Password Anda masih default/lemah. Segera ganti dengan password baru (min. 8 karakter).');
     }
   }, [me?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -10088,11 +9972,13 @@ export default function App() {
           depts={deptNames}
           users={users}
           setUsers={setUsers}
+          sync={syncSt}
           onLogin={(id) => {
             setSid(id);
             setPage('');
           }}
         />
+        <SyncChip st={syncSt} />
       </>
     );
 
@@ -10195,8 +10081,7 @@ export default function App() {
   };
   // User: PO sudah di-reject final -> buka form baru terisi data lama; nomor PO baru (bertambah) dibuat otomatis.
   const newFromRejected = (p: PO) => {
-    if (admin)
-      return notify('Pembuatan PO baru hanya tersedia untuk akun user.');
+    if (admin) return notify('Pembuatan PO baru hanya tersedia untuk akun user.');
     if (p.uid !== me.id || !p.rejFinal || p.newNo) return;
     setFixedNo(null);
     setFormRO(false);
@@ -10344,12 +10229,7 @@ export default function App() {
     setPos((l) =>
       l.map((p) =>
         p.no === no
-          ? {
-              ...p,
-              printN: n,
-              printAt: new Date().toISOString(),
-              printOk: undefined,
-            }
+          ? { ...p, printN: n, printAt: new Date().toISOString(), printOk: undefined }
           : p
       )
     );
@@ -10357,14 +10237,9 @@ export default function App() {
   const allowReprint = (no: string) => {
     const p0 = pos.find((x) => x.no === no);
     if (!p0 || me?.role !== 'admin') return;
-    logH(
-      no,
-      `Admin mengizinkan cetak ulang PO (sudah dicetak ${p0.printN ?? 0}×)`
-    );
+    logH(no, `Admin mengizinkan cetak ulang PO (sudah dicetak ${p0.printN ?? 0}×)`);
     setPos((l) =>
-      l.map((p) =>
-        p.no === no ? { ...p, printOk: new Date().toISOString() } : p
-      )
+      l.map((p) => (p.no === no ? { ...p, printOk: new Date().toISOString() } : p))
     );
     notify('Cetak ulang diizinkan. User bisa mencetak PO ini satu kali lagi.');
   };
@@ -10397,9 +10272,7 @@ export default function App() {
   const reopen = (no: string) => {
     if (guard(no)) return;
     if (pos.find((x) => x.no === no)?.rejFinal)
-      return notify(
-        'PO Reject (final) tidak bisa dibuka lagi. User membuat PO baru.'
-      );
+      return notify('PO Reject (final) tidak bisa dibuka lagi. User membuat PO baru.');
     logH(no, 'Status PO dibuka kembali (Open)');
     setPos((l) =>
       l.map((p) =>
@@ -10447,10 +10320,7 @@ export default function App() {
     if (why === null) return;
     const reason = why.trim();
     if (!reason) return notify('Keterangan reject wajib diisi.');
-    logH(
-      no,
-      `PO Reject (final): ${reason}. User membuat PO baru dengan nomor baru.`
-    );
+    logH(no, `PO Reject (final): ${reason}. User membuat PO baru dengan nomor baru.`);
     setPos((l) =>
       l.map((p) =>
         p.no === no
@@ -10508,16 +10378,13 @@ export default function App() {
         : 'Reject pendaftaran';
     logH('-', `${act}: ${u.nama} (${u.email})`);
     if (s === 'approved')
-      void sendMail(
-        u.email,
-        'Akun PO Request System sudah aktif',
-        mailActivated(u)
-      ).then((ok) =>
-        notify(
-          ok
-            ? `Akun ${u.nama} aktif. Email notifikasi terkirim ke ${u.email}.`
-            : `Akun ${u.nama} aktif, tetapi email notifikasi gagal terkirim.`
-        )
+      void sendMail(u.email, 'Akun PO Request System sudah aktif', mailActivated(u)).then(
+        (ok) =>
+          notify(
+            ok
+              ? `Akun ${u.nama} aktif. Email notifikasi terkirim ke ${u.email}.`
+              : `Akun ${u.nama} aktif, tetapi email notifikasi gagal terkirim.`
+          )
       );
   };
   /** Ganti password akun sendiri. Mengembalikan pesan error, atau "" bila berhasil. */
@@ -10525,8 +10392,7 @@ export default function App() {
     if (!(await verifyPw(o, me.pass))) return 'Password lama salah.';
     if (n.length < 8) return 'Password baru minimal 8 karakter.';
     if (n === o) return 'Password baru harus berbeda dari password lama.';
-    if (PW_WEAK.includes(n.toLowerCase()))
-      return 'Password terlalu mudah ditebak.';
+    if (PW_WEAK.includes(n.toLowerCase())) return 'Password terlalu mudah ditebak.';
     const h = await hashPw(n);
     setUsers((l) => l.map((u) => (u.id === me.id ? { ...u, pass: h } : u)));
     WEAK_LOGIN = false;
@@ -10562,16 +10428,13 @@ export default function App() {
     setUsers((l) => l.map((x) => (x.id === u.id ? { ...x, pass: th } : x)));
     logH('-', `Reset password akun ${u.nama} (${u.email})`);
     notify(`Password ${u.nama} direset: ${tmp}`);
-    void sendMail(
-      u.email,
-      'Password akun PO Request System direset',
-      mailReset(u, tmp)
-    ).then((ok) =>
-      notify(
-        ok
-          ? `Password ${u.nama} direset: ${tmp}. Email terkirim ke ${u.email}.`
-          : `Password ${u.nama} direset: ${tmp}. Email GAGAL terkirim, berikan password ini secara manual.`
-      )
+    void sendMail(u.email, 'Password akun PO Request System direset', mailReset(u, tmp)).then(
+      (ok) =>
+        notify(
+          ok
+            ? `Password ${u.nama} direset: ${tmp}. Email terkirim ke ${u.email}.`
+            : `Password ${u.nama} direset: ${tmp}. Email GAGAL terkirim, berikan password ini secara manual.`
+        )
     );
   };
   const readOne = (no: string) => {
@@ -10652,24 +10515,15 @@ export default function App() {
           String(p.total),
           p.status === 'Done' ? 'Done' : p.rej ? 'Rejected' : 'Open',
           p.doneAt ? fmtDT(p.doneAt) : '',
-          isBig(p)
-            ? 'Di atas Rp 10 juta (approve Managing Director)'
-            : 'Di bawah Rp 10 juta',
-          p.rejFinal
-            ? `PO Reject: ${p.rejWhy ?? ''}${
-                p.newNo ? ` (diganti ${p.newNo})` : ''
-              }`
-            : p.rejWhy ?? '',
+          isBig(p) ? 'Di atas Rp 10 juta (approve Managing Director)' : 'Di bawah Rp 10 juta',
+          p.rejFinal ? `PO Reject: ${p.rejWhy ?? ''}${p.newNo ? ` (diganti ${p.newNo})` : ''}` : p.rejWhy ?? '',
         ])
       )
     );
     const csv = rows
       .map((r) =>
         r
-          .map(
-            (c) =>
-              `"${(/^[=+\-@\t\r]/.test(c) ? "'" + c : c).replace(/"/g, '""')}"`
-          )
+          .map((c) => `"${(/^[=+\-@\t\r]/.test(c) ? "'" + c : c).replace(/"/g, '""')}"`)
           .join(',')
       )
       .join('\n');
@@ -10706,6 +10560,7 @@ export default function App() {
   return (
     <>
       <style>{themed(css, hue)}</style>
+      <SyncChip st={syncSt} />
       <div className={'shell' + (sideHov ? ' sidehov' : '')}>
         <div
           className={'navmask' + (navOpen ? ' show' : '')}
@@ -10727,61 +10582,58 @@ export default function App() {
         >
           {/* bagian atas: logo, warna mengikuti background dashboard */}
           <div className="stop">
-            <div className={'brand' + (brand.sideBox ?? true ? '' : ' nobox')}>
+            <div className={'brand' + ((brand.sideBox ?? true) ? '' : ' nobox')}>
               <SideLogo src={brand.side} box={brand.sideBox} />
               <b>PO REQUEST SYSTEM</b>
             </div>
           </div>
           {/* panel biru berisi menu */}
           <div className="spanel">
-            <SideFx />
+          <SideFx />
+          <button
+            type="button"
+            className="sclose"
+            aria-label="Tutup menu"
+            onClick={() => setNavOpen(false)}
+          >
+            <Ic n="x" s={18} />
+          </button>
+          <nav className="navlist" aria-label="Menu utama" ref={navRef}>
+            {pill && (
+              <span
+                className={'navpill' + (pillAnim ? ' go' : '')}
+                style={{ transform: `translateY(${pill.t}px)`, height: pill.h }}
+                aria-hidden="true"
+              />
+            )}
+            {main.map((n) => nv(n))}
+            <div className="sep" />
             <button
-              type="button"
-              className="sclose"
-              aria-label="Tutup menu"
-              onClick={() => setNavOpen(false)}
+              className="nv grp"
+              onClick={() => setMdOpen((x) => !x)}
+              aria-expanded={mdOpen}
             >
-              <Ic n="x" s={18} />
+              <span>Master Data</span>
+              <Ic n={mdOpen ? 'up' : 'down'} s={14} />
             </button>
-            <nav className="navlist" aria-label="Menu utama" ref={navRef}>
-              {pill && (
-                <span
-                  className={'navpill' + (pillAnim ? ' go' : '')}
-                  style={{
-                    transform: `translateY(${pill.t}px)`,
-                    height: pill.h,
-                  }}
-                  aria-hidden="true"
-                />
-              )}
-              {main.map((n) => nv(n))}
-              <div className="sep" />
-              <button
-                className="nv grp"
-                onClick={() => setMdOpen((x) => !x)}
-                aria-expanded={mdOpen}
-              >
-                <span>Master Data</span>
-                <Ic n={mdOpen ? 'up' : 'down'} s={14} />
-              </button>
-              {mdOpen && (
-                <div className="sub">{master.map((n) => nv(n, true))}</div>
-              )}
-              <div className="sep" />
-              {admin && nv({ k: 'setting', l: 'Pengaturan', ic: 'gear' })}
-              <button
-                className="nv out"
-                onClick={() => {
-                  setSid('');
-                  setPage('');
-                  setThemeU(null);
-                  setThOpen(false);
-                }}
-              >
-                <Ic n="logout" s={17} />
-                <span>Keluar</span>
-              </button>
-            </nav>
+            {mdOpen && (
+              <div className="sub">{master.map((n) => nv(n, true))}</div>
+            )}
+            <div className="sep" />
+            {admin && nv({ k: 'setting', l: 'Pengaturan', ic: 'gear' })}
+            <button
+              className="nv out"
+              onClick={() => {
+                setSid('');
+                setPage('');
+                setThemeU(null);
+                setThOpen(false);
+              }}
+            >
+              <Ic n="logout" s={17} />
+              <span>Keluar</span>
+            </button>
+          </nav>
           </div>
         </aside>
 
@@ -11135,9 +10987,7 @@ export default function App() {
                     </div>
                   )}
                   <PoTable
-                    list={pos.filter(
-                      (p) => sameDept(p.dept, me.dept) && match(p, gq)
-                    )}
+                    list={pos.filter((p) => sameDept(p.dept, me.dept) && match(p, gq))}
                     onCopy={copy}
                     onPrint={openDoc}
                     onResend={resend}
@@ -11209,9 +11059,7 @@ export default function App() {
                     : hist.filter((h) => {
                         if (h.uid === me.id) return true;
                         const x = pos.find((y) => y.no === h.no);
-                        return (
-                          !!x && (x.uid === me.id || sameDept(x.dept, me.dept))
-                        );
+                        return !!x && (x.uid === me.id || sameDept(x.dept, me.dept));
                       })
                 }
               />
@@ -11483,24 +11331,11 @@ export default function App() {
 const PWLEVELS = [
   { lvl: 'Lemah', desc: 'Kurang dari 6 karakter', color: '#f87171' },
   { lvl: 'Sedang', desc: '6–8 karakter (huruf atau angka)', color: '#fbbf24' },
-  {
-    lvl: 'Kuat',
-    desc: 'Lebih dari 8 karakter (dengan kombinasi huruf dan angka)',
-    color: '#2dd4bf',
-  },
-  {
-    lvl: 'Sangat Kuat',
-    desc: 'Lebih dari 8 karakter (dengan kombinasi huruf besar, huruf kecil, angka dan simbol (contoh: @ $ % & *))',
-    color: '#34d399',
-  },
+  { lvl: 'Kuat', desc: 'Lebih dari 8 karakter (dengan kombinasi huruf dan angka)', color: '#2dd4bf' },
+  { lvl: 'Sangat Kuat', desc: 'Lebih dari 8 karakter (dengan kombinasi huruf besar, huruf kecil, angka dan simbol (contoh: @ $ % & *))', color: '#34d399' },
 ];
 
-function pwStrength(n: string): {
-  lvl: string;
-  desc: string;
-  color: string;
-  filled: number;
-} {
+function pwStrength(n: string): { lvl: string; desc: string; color: string; filled: number } {
   const hasUpper = /[A-Z]/.test(n);
   const hasLower = /[a-z]/.test(n);
   const hasDigit = /\d/.test(n);
@@ -11526,8 +11361,7 @@ function PwMeter({ n, track }: { n: string; track?: string }) {
             <i
               key={k}
               style={{
-                background:
-                  k <= st.filled ? st.color : track || 'rgba(255,255,255,.22)',
+                background: k <= st.filled ? st.color : track || 'rgba(255,255,255,.22)',
                 boxShadow: k <= st.filled ? `0 0 8px ${st.color}` : undefined,
               }}
             />
@@ -11540,11 +11374,7 @@ function PwMeter({ n, track }: { n: string; track?: string }) {
         {PWLEVELS.map((lv) => (
           <div
             key={lv.lvl}
-            style={
-              lv.lvl === st.lvl
-                ? { boxShadow: `inset 0 0 0 1.5px ${lv.color}` }
-                : undefined
-            }
+            style={lv.lvl === st.lvl ? { boxShadow: `inset 0 0 0 1.5px ${lv.color}` } : undefined}
           >
             <b style={{ color: lv.color }}>{lv.lvl}</b>
             <small>{lv.desc}</small>
@@ -11954,8 +11784,7 @@ function makeDemoHist(pos: PO[], users: User[]): Hist[] {
 const DARKER = new Set([-170, 140, 50]); // tema Emas (coklat), Merah Ruby, Ungu Royal: dibuat lebih gelap
 const DARK_K = 0.2; // tema Emas/Ruby/Ungu: dasar 20%
 const DARK_X = 0.15; // tambahan gelap 15% untuk semua tema warna (selain Biru Samudra bawaan & Hitam Putih). Warna sangat terang (latar/kartu) dikecualikan agar halaman tetap terbaca
-const darkK = (d: number) =>
-  1 - (1 - (DARKER.has(d) ? DARK_K : 0)) * (1 - DARK_X);
+const darkK = (d: number) => 1 - (1 - (DARKER.has(d) ? DARK_K : 0)) * (1 - DARK_X);
 const GRAY = 999; // kode khusus tema monokrom "Klasik Hitam Putih" (bukan sudut hue)
 const THEMES: { n: string; d: number }[] = [
   { n: 'Biru Samudra', d: 0 },
