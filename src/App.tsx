@@ -1,0 +1,13535 @@
+import {
+  Fragment,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import type { CSSProperties, ReactNode } from 'react';
+import { createPortal } from 'react-dom';
+
+/* ================= TIPE & KONSTANTA ================= */
+type Vendor = {
+  nama: string;
+  alamat: string;
+  npwp: string;
+  telp: string;
+  fax: string;
+  pic: string;
+  email: string;
+};
+type Pay = { rek: string; bank: string; cabang: string; an: string };
+type Item = {
+  id: number;
+  d: string;
+  q: string;
+  s: string;
+  p: string;
+  k: string;
+};
+type Line = { d: string; q: number; s: string; p: number; k?: string };
+type Status = 'Open' | 'Done';
+type Hist = {
+  id: string;
+  iso: string;
+  uid: string;
+  by: string;
+  dept: string;
+  no: string;
+  what: string;
+}; // satu baris riwayat perubahan (change history)
+type TKey = 'appr' | 'supp' | 'recv' | 'hoSend' | 'hoRecv' | 'pay'; // tanggal tiap tahap tracker (tahap 1 = tanggal PO dibuat, otomatis dari waktu submit)
+type BP = { id: string; kode: string; nama: string; exp: string }; // Supplier BP (Business Partner): exp = tanggal expired (YYYY-MM-DD)
+type PO = {
+  no: string;
+  iso: string;
+  dept: string;
+  uid: string;
+  by: string;
+  v: Vendor;
+  items: Line[];
+  sub: number;
+  rate: number;
+  disc: number;
+  total: number;
+  status: Status;
+  doneAt?: string;
+  pay?: Pay;
+  ong?: number;
+  note?: string;
+  trk?: Partial<Record<TKey, string>>;
+  suppLink?: string;
+  rej?: string;
+  rejWhy?: string;
+  resent?: string;
+  rejFinal?: boolean; // PO Reject (final): tidak bisa diedit/dikirim ulang/dibuka lagi; user membuat PO baru
+  newNo?: string; // nomor PO pengganti (PO baru setelah reject final)
+  prevNo?: string; // PO ini adalah pengganti dari nomor PO yang direject
+  printN?: number; // berapa kali PO sudah dicetak
+  printAt?: string; // waktu cetak terakhir
+  printOk?: string; // waktu admin mengizinkan cetak ulang (hilang setelah dicetak lagi)
+};
+type User = {
+  id: string;
+  username?: string; // nama user untuk login (bukan email)
+  nama: string;
+  email: string;
+  pass: string;
+  dept: string;
+  role: 'admin' | 'user';
+  status: 'pending' | 'approved' | 'rejected';
+};
+type Draft = {
+  v: Vendor;
+  pay: Pay;
+  items: Item[];
+  disc?: string;
+  ong?: string;
+  rate?: string;
+  note?: string;
+  iso?: string;
+  prev?: string; // nomor PO reject final yang digantikan (riwayat)
+};
+type Brand = {
+  logo: string;
+  bg: string;
+  side: string;
+  glass: number;
+  sideBox?: boolean;
+}; // logo & background halaman login (diatur admin); glass = transparansi kartu 0-100
+const BRAND0: Brand = { logo: '', bg: '', side: '', glass: 50 };
+
+/** Master departemen untuk pilihan. Admin dapat menambah/ubah/hapus di Pengaturan. Nomor PO memakai kode tetap PO_CODE. */
+type Dept = { nama: string };
+/** Format nomor PO: <urut>/AGP-PO/GA/<bulan romawi>/<tahun>, mis. 174/AGP-PO/GA/X/2026 */
+const PO_CODE = 'GA';
+const DEF_DEPTS: Dept[] = [
+  { nama: 'Accounting' },
+  { nama: 'Automotive Business Development' },
+  { nama: 'Business Development' },
+  { nama: 'Engineering & Project' },
+  { nama: 'Facility & Service' },
+  { nama: 'Finance' },
+  { nama: 'General Sales' },
+  { nama: 'IT/Digital Transform' },
+  { nama: 'Operation Support' },
+  { nama: 'Production' },
+  { nama: 'Purchasing & Supplier Management' },
+  { nama: 'QA/QC' },
+  { nama: 'Supply Chain' },
+  { nama: 'Talent' },
+  { nama: 'Technical' },
+];
+/** Nama departemen versi lama -> departemen baru (dipakai sekali saat migrasi data lama). */
+const LEGACY_DEPT: Record<string, string> = {
+  'HR Department': 'Talent',
+  Purchasing: 'Purchasing & Supplier Management',
+  Produksi: 'Production',
+  Marketing: 'General Sales',
+  IT: 'IT/Digital Transform',
+};
+const deptSort = (list: Dept[]) =>
+  list.map((d) => d.nama).sort((a, b) => a.localeCompare(b, 'id'));
+const UNITS = [
+  'Pcs',
+  'Unit',
+  'Box',
+  'Rim',
+  'Set',
+  'Paket',
+  'Kg',
+  'Meter',
+  'Jasa',
+];
+const STATUSES: Status[] = ['Open', 'Done'];
+/* Tahapan tracker PO (urut). by = siapa yang boleh mengisi tanggal: auto (otomatis), admin, creator (hanya user pembuat PO), atau both (pembuat PO dan admin).
+   Ubah kolom "by" di sini bila pembagian tugasnya berbeda. */
+const TSTEPS: {
+  k: 'made' | TKey;
+  l: string;
+  by: 'auto' | 'admin' | 'user' | 'creator' | 'both';
+}[] = [
+  { k: 'made', l: 'PO dibuat', by: 'auto' },
+  { k: 'appr', l: 'PO di-approve', by: 'admin' },
+  { k: 'supp', l: 'PO dikirim ke supplier', by: 'creator' }, // diisi tanggal oleh user pembuat PO
+  { k: 'hoSend', l: 'PO dikirim ke kantor pusat', by: 'admin' },
+  { k: 'hoRecv', l: 'PO sampai di kantor pusat', by: 'admin' },
+  { k: 'recv', l: 'Barang diterima', by: 'both' }, // diisi user pembuat PO atau admin
+  { k: 'pay', l: 'PO proses pembayaran', by: 'admin' },
+];
+const pad2 = (n: number) => String(n).padStart(2, '0');
+/** Satu departemen = sama (abaikan huruf besar/kecil & spasi), siapa pun pembuatnya. Dipakai untuk membatasi data user ke departemennya. */
+const sameDept = (a?: string, b?: string) =>
+  (a ?? '').trim().toLowerCase() === (b ?? '').trim().toLowerCase();
+const ymd = (d: Date) =>
+  `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+const dayOf = (x: string) =>
+  /^\d{4}-\d{2}-\d{2}$/.test(x) ? x : ymd(new Date(x));
+const MON_ID: Record<string, number> = {
+  jan: 1,
+  feb: 2,
+  mar: 3,
+  apr: 4,
+  may: 5,
+  mei: 5,
+  jun: 6,
+  jul: 7,
+  aug: 8,
+  agu: 8,
+  agt: 8,
+  sep: 9,
+  oct: 10,
+  okt: 10,
+  nov: 11,
+  nop: 11,
+  dec: 12,
+  des: 12,
+};
+const MON_EN = [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
+];
+const okYMD = (y: number, m: number, d: number) => {
+  const t = new Date(y, m - 1, d);
+  return t.getFullYear() === y && t.getMonth() === m - 1 && t.getDate() === d
+    ? `${y}-${pad2(m)}-${pad2(d)}`
+    : null;
+};
+/** Baca tanggal dari sheet dengan format apa pun -> YYYY-MM-DD (null bila tidak terbaca).
+ *  Mendukung: 22-Mar-2026, 7 Dec 2025, 2-Nov-2026, 29 November 2025, 22/03/2026, 2026-03-22, ISO datetime, serial Excel. */
+const parseExp = (raw: string): string | null => {
+  const x = String(raw ?? '').trim();
+  if (!x) return null;
+  let m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(x);
+  if (m) return okYMD(+m[1], +m[2], +m[3]);
+  if (/^\d{4}-\d{2}-\d{2}[T ]/.test(x)) {
+    const t = new Date(x);
+    return isNaN(t.getTime()) ? null : ymd(t);
+  }
+  m = /^(\d{1,2})[\s.\-\/]+([A-Za-z]{3,})\.?[\s.\-\/,]+(\d{2,4})$/.exec(x);
+  if (m) {
+    const mo = MON_ID[m[2].slice(0, 3).toLowerCase()];
+    let y = +m[3];
+    if (y < 100) y += 2000;
+    return mo ? okYMD(y, mo, +m[1]) : null;
+  }
+  m = /^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$/.exec(x);
+  if (m) {
+    let y = +m[3];
+    if (y < 100) y += 2000;
+    return okYMD(y, +m[2], +m[1]); // hari/bulan/tahun (format Indonesia)
+  }
+  if (/^\d{5}$/.test(x)) {
+    const t = new Date(Date.UTC(1899, 11, 30) + Number(x) * 86400000);
+    return okYMD(t.getUTCFullYear(), t.getUTCMonth() + 1, t.getUTCDate());
+  }
+  const t = new Date(x);
+  return isNaN(t.getTime()) ? null : ymd(t);
+};
+/** Tanggal untuk ditulis ke sheet: format sama seperti kolom exp di sheet, mis. 22-Mar-2026 */
+const toSheetD = (x: string) => {
+  const p = parseExp(x);
+  if (!p) return x;
+  const [y, m, d] = p.split('-').map(Number);
+  return `${d}-${MON_EN[m - 1]}-${y}`;
+};
+const fmtD = (x: string) => {
+  const iso = parseExp(x);
+  if (!iso) return x || '-';
+  const [y, m, d] = iso.split('-').map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString('id-ID', {
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+  });
+};
+const stepDate = (p: PO, k: string) =>
+  k === 'made' ? p.iso : p.trk?.[k as TKey];
+/** Status tracker: tahap pertama yang belum punya tanggal otomatis menjadi "Progress", tahap sesudahnya "Open". */
+const trackOf = (p: PO) => {
+  const dates = TSTEPS.map((x) => stepDate(p, x.k));
+  const cur = dates.findIndex((x) => !x);
+  return { dates, cur, done: dates.filter(Boolean).length, all: cur === -1 };
+};
+/** Status Supplier BP dihitung otomatis dari tanggal expired. */
+const bpInfo = (exp: string) => {
+  const iso = parseExp(exp);
+  if (!iso) return { days: 0, expired: false, soon: false, bad: true };
+  const t = new Date();
+  const [y, m, d] = iso.split('-').map(Number);
+  const days = Math.round(
+    (new Date(y, m - 1, d).getTime() -
+      new Date(t.getFullYear(), t.getMonth(), t.getDate()).getTime()) /
+      86400000
+  );
+  return { days, expired: days < 0, soon: days >= 0 && days <= 30, bad: false };
+};
+/** Supplier BP milik vendor sebuah PO (dicocokkan lewat nama) + status expired-nya. */
+const bpOfPo = (bps: BP[], p: PO) => {
+  const bp = bps.find(
+    (b) => b.nama.trim().toLowerCase() === p.v.nama.trim().toLowerCase()
+  );
+  return { bp, bi: bp ? bpInfo(bp.exp) : null };
+};
+/** Alasan otomatis bila Supplier BP vendor bermasalah ("" bila aktif). Dipakai sebagai usulan alasan penolakan. */
+const bpWhy = (bps: BP[], p: PO) => {
+  const { bp, bi } = bpOfPo(bps, p);
+  if (!bp || !bi) return 'Vendor belum terdaftar sebagai Supplier BP';
+  if (bi.expired)
+    return `Supplier BP ${bp.kode} (${bp.nama}) sudah Expired sejak ${fmtD(
+      bp.exp
+    )}`;
+  if (bi.soon)
+    return `Supplier BP ${bp.kode} (${bp.nama}) akan Expired ${fmtD(bp.exp)}`;
+  return '';
+};
+const DEF_BP: BP[] = [
+  // data contoh (dummy) - admin bisa ubah/hapus/tambah di menu Data Supplier
+  { id: 'bp1', kode: 'BP-001', nama: 'PT Sinar Jaya Abadi', exp: '2027-06-30' },
+  {
+    id: 'bp2',
+    kode: 'BP-002',
+    nama: 'CV Mitra Karya Sejahtera',
+    exp: '2026-11-20',
+  },
+  {
+    id: 'bp3',
+    kode: 'BP-003',
+    nama: 'PT Global Office Supplies',
+    exp: '2026-08-31',
+  },
+  {
+    id: 'bp4',
+    kode: 'BP-004',
+    nama: 'PT Safety Indo Perkasa',
+    exp: '2027-02-28',
+  },
+  { id: 'bp5', kode: 'BP-005', nama: 'CV Berkah Teknik', exp: '2026-05-15' },
+  {
+    id: 'bp6',
+    kode: 'BP-006',
+    nama: 'PT Cahaya Packaging Nusantara',
+    exp: '2027-12-31',
+  },
+  { id: 'bp7', kode: 'BP-007', nama: 'UD Maju Bersama', exp: '2026-12-15' },
+  {
+    id: 'bp8',
+    kode: 'BP-008',
+    nama: 'PT Triputra Logistik',
+    exp: '2027-09-30',
+  },
+];
+const isAppr = (p: PO) => p.status === 'Done' || !!p.trk?.appr; // approved = ditandai Done atau tahap "PO di-approve" sudah terisi
+const isWait = (p: PO) => !p.rej && !isAppr(p); // menunggu approval (rej = tanggal ditolak admin)
+const EMPTY_PAY: Pay = { rek: '', bank: '', cabang: '', an: '' };
+const EMPTY: Vendor = {
+  nama: '',
+  alamat: '',
+  npwp: '',
+  telp: '',
+  fax: '',
+  pic: '',
+  email: '',
+};
+/* ================= KEAMANAN PASSWORD =================
+   Password tidak lagi disimpan/di-sinkron sebagai teks biasa: disimpan sebagai hash PBKDF2-SHA256 + salt acak per akun
+   (format "pbkdf2$iterasi$salt$hash"). Password lama (teks biasa) tetap bisa login satu kali lalu otomatis di-hash. */
+const PW_ITER = 150000;
+const PW_WEAK = ['admin123', 'demo123', '123456', 'password', '12345678'];
+const hex_ = (b: ArrayBuffer | Uint8Array) =>
+  Array.from(new Uint8Array(b as ArrayBuffer), (x) =>
+    x.toString(16).padStart(2, '0')
+  ).join('');
+const unhex_ = (h: string) =>
+  new Uint8Array((h.match(/.{2}/g) ?? []).map((x) => parseInt(x, 16)));
+const pbkdf2_ = async (pw: string, salt: Uint8Array, iter: number) => {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(pw),
+    'PBKDF2',
+    false,
+    ['deriveBits']
+  );
+  return hex_(
+    await crypto.subtle.deriveBits(
+      {
+        name: 'PBKDF2',
+        hash: 'SHA-256',
+        salt: salt as BufferSource,
+        iterations: iter,
+      },
+      key,
+      256
+    )
+  );
+};
+const isHashed = (p: string) => /^pbkdf2\$\d+\$[0-9a-f]+\$[0-9a-f]+$/.test(p);
+async function hashPw(pw: string) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  return `pbkdf2$${PW_ITER}$${hex_(salt)}$${await pbkdf2_(pw, salt, PW_ITER)}`;
+}
+const sameStr = (a: string, b: string) => {
+  let d = a.length ^ b.length;
+  for (let i = 0; i < Math.max(a.length, b.length); i++)
+    d |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  return d === 0;
+};
+async function verifyPw(pw: string, stored: string) {
+  if (!stored) return false;
+  if (!isHashed(stored)) return sameStr(pw, stored); // password lama (teks biasa) -> di-upgrade setelah login
+  const [, it, salt, h] = stored.split('$');
+  return sameStr(await pbkdf2_(pw, unhex_(salt), Number(it)), h);
+}
+/** password sementara acak (kriptografis), tanpa karakter yang mudah tertukar */
+const tmpPw = () => {
+  const A = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+  return (
+    'Agp' +
+    Array.from(
+      crypto.getRandomValues(new Uint8Array(9)),
+      (x) => A[x % A.length]
+    ).join('')
+  );
+};
+/** pembatas percobaan login (sisi browser): 5x salah -> kunci 5 menit per username */
+const FAIL_KEY = 'po_fail';
+const failMap = (): Record<string, { n: number; t: number }> => {
+  try {
+    return JSON.parse(localStorage.getItem(FAIL_KEY) || '{}');
+  } catch {
+    return {};
+  }
+};
+const lockLeft = (un: string) => {
+  const r = failMap()[un];
+  return r && r.n >= 5 ? Math.max(0, r.t + 5 * 60000 - Date.now()) : 0;
+};
+const noteFail = (un: string, ok: boolean) => {
+  try {
+    const m = failMap();
+    const r = m[un];
+    if (ok) delete m[un];
+    else
+      m[un] = {
+        n: r && Date.now() - r.t < 5 * 60000 ? r.n + 1 : 1,
+        t: Date.now(),
+      };
+    localStorage.setItem(FAIL_KEY, JSON.stringify(m));
+  } catch {
+    /* abaikan */
+  }
+};
+let WEAK_LOGIN = false; // true bila user baru saja masuk memakai password default/lemah -> wajib diganti
+
+// Akun admin awal. Password awal hanya untuk instalasi baru dan WAJIB diganti saat login pertama (tidak lagi dipaksa kembali setiap aplikasi dibuka).
+const ADMIN: User = {
+  id: 'admin',
+  username: 'admin',
+  nama: 'Admin PO',
+  email: 'dollar.hidayat@argapura.com',
+  pass: 'admin123',
+  dept: 'Admin',
+  role: 'admin',
+  status: 'approved',
+};
+
+/** Username login. Akun lama tanpa username memakai bagian depan email. */
+const uname = (u: { id?: string; username?: string; email: string }) =>
+  u.id === 'admin'
+    ? 'admin' // akun admin utama selalu login dengan username "admin", apa pun isi sheet
+    : (u.username?.trim() || u.email.split('@')[0]).toLowerCase();
+
+let uid = 1;
+const newItem = (p?: Partial<Item>): Item => ({
+  id: uid++,
+  d: '',
+  q: '',
+  s: '',
+  p: '',
+  k: '',
+  ...p,
+});
+const rp = (n: number) => 'Rp ' + Math.round(n).toLocaleString('id-ID');
+const fmt = (iso: string) =>
+  new Date(iso).toLocaleDateString('id-ID', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+  });
+const fmtDT = (iso: string) =>
+  new Date(iso).toLocaleString('id-ID', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+// Format nomor mengikuti contoh PO: 174/AGP-PO/GA/X/2026  (urut/AGP-PO/kode dept/bulan romawi/tahun)
+const ROMAN = [
+  'I',
+  'II',
+  'III',
+  'IV',
+  'V',
+  'VI',
+  'VII',
+  'VIII',
+  'IX',
+  'X',
+  'XI',
+  'XII',
+];
+/** Pengaturan per tahun (admin): start = nomor awal, locked = periode dikunci. Tahun yang sudah lewat otomatis terkunci kecuali admin membukanya. */
+type YearCfg = { start?: number; locked?: boolean };
+type NumCfg = Record<string, YearCfg>;
+const lockedYear = (cfg: NumCfg, y: number) =>
+  cfg[String(y)]?.locked ?? y < new Date().getFullYear();
+/** Nomor urut terbesar yang sudah terpakai pada suatu tahun (semua departemen berbagi satu urutan). */
+const lastSeq = (pos: PO[], y: number) =>
+  pos.reduce((m, p) => {
+    const x = /^(\d+)\/AGP-PO\/[^/]+\/[^/]+\/(\d{4})$/.exec(p.no);
+    return x && Number(x[2]) === y ? Math.max(m, Number(x[1])) : m;
+  }, 0);
+/** Nomor berikutnya = lanjut dari nomor terbesar, tetapi tidak lebih kecil dari nomor awal yang diset admin. Tahun baru otomatis mulai dari 1. */
+const nextSeq = (pos: PO[], y: number, cfg: NumCfg) =>
+  Math.max(lastSeq(pos, y) + 1, cfg[String(y)]?.start ?? 1);
+const nextNo = (pos: PO[], cfg: NumCfg = {}) => {
+  const d = new Date();
+  const y = d.getFullYear();
+  return `${String(nextSeq(pos, y, cfg)).padStart(3, '0')}/AGP-PO/${PO_CODE}/${
+    ROMAN[d.getMonth()]
+  }/${y}`;
+};
+// Sub Total 2 = Sub Total 1 - Diskon; PPN dihitung dari Sub Total 2; TOTAL = Sub Total 2 + PPN + Ongkir
+const calc = (sub: number, rate: number, disc: number, ong: number) => {
+  const s2 = Math.max(0, sub - disc);
+  const ppn = Math.round(s2 * rate);
+  return { s2, ppn, total: s2 + ppn + ong };
+};
+
+/* Penyimpanan sementara di browser. Nanti diganti Supabase agar data dipakai bersama banyak user. */
+function useLS<T>(key: string, init: T) {
+  const [s, setS] = useState<T>(() => {
+    try {
+      const r = localStorage.getItem(key);
+      return r ? (JSON.parse(r) as T) : init;
+    } catch {
+      return init;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(key, JSON.stringify(s));
+    } catch {
+      /* abaikan */
+    }
+  }, [key, s]);
+  // Sinkron antar tab/jendela browser: perubahan di satu tab langsung terbaca di tab lain (mengurangi data saling menimpa)
+  useEffect(() => {
+    const on = (e: StorageEvent) => {
+      if (e.key === key && e.newValue) {
+        try {
+          setS(JSON.parse(e.newValue) as T);
+        } catch {
+          /* abaikan */
+        }
+      }
+    };
+    window.addEventListener('storage', on);
+    return () => window.removeEventListener('storage', on);
+  }, [key]);
+  return [s, setS] as const;
+}
+
+/** ID unik (UUID acak) agar banyak user/PO/catatan tidak pernah bentrok. */
+const newId = (prefix: string) =>
+  prefix +
+  (typeof crypto !== 'undefined' && 'randomUUID' in crypto
+    ? crypto.randomUUID()
+    : Date.now().toString(36) + Math.random().toString(36).slice(2, 12));
+/** Nomor PO unik: bila nomor sudah dipakai, nomor urut dinaikkan sampai tidak bentrok. */
+const uniqueNo = (no: string, taken: Set<string>) => {
+  const m = /^(\d+)(\/.*)$/.exec(no);
+  if (!m)
+    return taken.has(no)
+      ? no + '-' + Math.random().toString(36).slice(2, 6)
+      : no;
+  let n = Number(m[1]);
+  let out = no;
+  while (taken.has(out)) {
+    n += 1;
+    out = String(n).padStart(m[1].length, '0') + m[2];
+  }
+  return out;
+};
+const hash32 = (t: string) => {
+  let h = 2166136261;
+  for (let i = 0; i < t.length; i++)
+    h = Math.imul(h ^ t.charCodeAt(i), 16777619);
+  return h >>> 0;
+};
+
+/** Baca file gambar, kecilkan, lalu kembalikan data URL (agar muat di penyimpanan browser). */
+function readImage(
+  file: File,
+  max: number,
+  type: 'image/png' | 'image/jpeg'
+): Promise<string> {
+  return new Promise((ok, fail) => {
+    const fr = new FileReader();
+    fr.onerror = () => fail(new Error('Gagal membaca file'));
+    fr.onload = () => {
+      const img = new Image();
+      img.onerror = () => fail(new Error('File bukan gambar yang valid'));
+      img.onload = () => {
+        const k = Math.min(1, max / Math.max(img.width, img.height));
+        const c = document.createElement('canvas');
+        c.width = Math.max(1, Math.round(img.width * k));
+        c.height = Math.max(1, Math.round(img.height * k));
+        const g = c.getContext('2d');
+        if (!g) return fail(new Error('Canvas tidak tersedia'));
+        if (type === 'image/jpeg') {
+          g.fillStyle = '#fff';
+          g.fillRect(0, 0, c.width, c.height);
+        }
+        g.drawImage(img, 0, 0, c.width, c.height);
+        if (type === 'image/png') {
+          // pangkas tepi transparan agar tidak ada ruang kosong di sekitar logo
+          try {
+            const { data } = g.getImageData(0, 0, c.width, c.height);
+            let x0 = c.width,
+              y0 = c.height,
+              x1 = -1,
+              y1 = -1;
+            for (let y = 0; y < c.height; y++)
+              for (let x = 0; x < c.width; x++)
+                if (data[(y * c.width + x) * 4 + 3] > 12) {
+                  if (x < x0) x0 = x;
+                  if (x > x1) x1 = x;
+                  if (y < y0) y0 = y;
+                  if (y > y1) y1 = y;
+                }
+            if (
+              x1 >= x0 &&
+              y1 >= y0 &&
+              (x1 - x0 + 1 < c.width || y1 - y0 + 1 < c.height)
+            ) {
+              const w = x1 - x0 + 1,
+                h = y1 - y0 + 1,
+                t = document.createElement('canvas');
+              t.width = w;
+              t.height = h;
+              t.getContext('2d')?.drawImage(c, x0, y0, w, h, 0, 0, w, h);
+              return ok(t.toDataURL(type));
+            }
+          } catch {
+            /* abaikan, pakai gambar utuh */
+          }
+        }
+        ok(c.toDataURL(type, 0.8));
+      };
+      img.src = String(fr.result);
+    };
+    fr.readAsDataURL(file);
+  });
+}
+
+function Field({
+  label,
+  req,
+  children,
+}: {
+  label: string;
+  req?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <div className="fld">
+      <label>
+        {label} {req && <i>*</i>}
+      </label>
+      {children}
+    </div>
+  );
+}
+
+/* ================= IKON & KARTU ================= */
+const P = (d: string) => <path d={d} />;
+const FILE_D = 'M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z';
+const IC: Record<string, ReactNode> = {
+  home: P('M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z'),
+  search: (
+    <>
+      <circle cx="11" cy="11" r="7" />
+      {P('m20 20-3.5-3.5')}
+    </>
+  ),
+  bell: (
+    <>
+      {P('M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9')}
+      {P('M10.3 21a1.9 1.9 0 0 0 3.4 0')}
+    </>
+  ),
+  user: (
+    <>
+      <circle cx="12" cy="8" r="4" />
+      {P('M4 21a8 8 0 0 1 16 0')}
+    </>
+  ),
+  users: (
+    <>
+      <circle cx="9" cy="8" r="3.5" />
+      {P('M2.5 20a6.5 6.5 0 0 1 13 0')}
+      <circle cx="17" cy="9" r="2.8" />
+      {P('M17 14.5a5.5 5.5 0 0 1 4.5 5.5')}
+    </>
+  ),
+  clock: (
+    <>
+      <circle cx="12" cy="12" r="9" />
+      {P('M12 7v5l3 2')}
+    </>
+  ),
+  file: (
+    <>
+      {P(FILE_D)}
+      {P('M14 3v5h5')}
+    </>
+  ),
+  filePlus: (
+    <>
+      {P(FILE_D)}
+      {P('M14 3v5h5')}
+      {P('M12 11v6M9 14h6')}
+    </>
+  ),
+  fileList: (
+    <>
+      {P(FILE_D)}
+      {P('M14 3v5h5')}
+      {P('M9 9h2M9 13h6M9 17h6')}
+    </>
+  ),
+  truck: (
+    <>
+      {P('M3 6h11v10H3z')}
+      {P('M14 9h4l3 3v4h-7')}
+      <circle cx="7" cy="18" r="1.8" />
+      <circle cx="17" cy="18" r="1.8" />
+    </>
+  ),
+  chart: P('M5 20V10M12 20V4M19 20v-7'),
+  box: (
+    <>
+      {P('M21 8 12 3 3 8v8l9 5 9-5z')}
+      {P('M3 8l9 5 9-5M12 13v8')}
+    </>
+  ),
+  tag: (
+    <>
+      {P('M3 12V4a1 1 0 0 1 1-1h8l9 9-9 9z')}
+      <circle cx="8" cy="8" r="1.4" />
+    </>
+  ),
+  gear: (
+    <>
+      <circle cx="12" cy="12" r="3.2" />
+      {P(
+        'M19.4 13a7.7 7.7 0 0 0 0-2l2-1.5-2-3.4-2.3 1a7.6 7.6 0 0 0-1.7-1L15 3.5h-4l-.4 2.6a7.6 7.6 0 0 0-1.7 1l-2.3-1-2 3.4 2 1.5a7.7 7.7 0 0 0 0 2l-2 1.5 2 3.4 2.3-1a7.6 7.6 0 0 0 1.7 1l.4 2.6h4l.4-2.6a7.6 7.6 0 0 0 1.7-1l2.3 1 2-3.4z'
+      )}
+    </>
+  ),
+  building: (
+    <>
+      {P('M4 21V5a1 1 0 0 1 1-1h9a1 1 0 0 1 1 1v16')}
+      {P('M15 10h4a1 1 0 0 1 1 1v10M3 21h18M8 8h3M8 12h3M8 16h3')}
+    </>
+  ),
+  pin: (
+    <>
+      {P('M12 21s7-6.2 7-11a7 7 0 0 0-14 0c0 4.8 7 11 7 11z')}
+      <circle cx="12" cy="10" r="2.5" />
+    </>
+  ),
+  mail: (
+    <>
+      <rect x="3" y="5" width="18" height="14" rx="2" />
+      {P('m3 7 9 6 9-6')}
+    </>
+  ),
+  phone: P(
+    'M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2z'
+  ),
+  printer: (
+    <>
+      {P('M7 9V3h10v6')}
+      {P(
+        'M7 17H5a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-2'
+      )}
+      {P('M7 14h10v7H7z')}
+    </>
+  ),
+  calendar: (
+    <>
+      <rect x="3" y="5" width="18" height="16" rx="2" />
+      {P('M8 3v4M16 3v4M3 10h18')}
+    </>
+  ),
+  down: P('m6 9 6 6 6-6'),
+  up: P('m6 15 6-6 6 6'),
+  right: P('m9 6 6 6-6 6'),
+  left: P('m15 6-6 6 6 6'),
+  coins: (
+    <>
+      <ellipse cx="12" cy="6" rx="8" ry="3" />
+      {P(
+        'M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6'
+      )}
+    </>
+  ),
+  info: (
+    <>
+      <circle cx="12" cy="12" r="9" />
+      {P('M12 11v5M12 8h.01')}
+    </>
+  ),
+  trash: <>{P('M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6')}</>,
+  plus: P('M12 5v14M5 12h14'),
+  edit: (
+    <>
+      {P('M4 20h4L19 9l-4-4L4 16z')}
+      {P('M13.5 6.5l4 4')}
+    </>
+  ),
+  percent: (
+    <>
+      {P('M19 5 5 19')}
+      <circle cx="7" cy="7" r="2" />
+      <circle cx="17" cy="17" r="2" />
+    </>
+  ),
+  receipt: (
+    <>
+      {P('M6 3h12v18l-3-2-3 2-3-2-3 2z')}
+      {P('M9 8h6M9 12h6')}
+    </>
+  ),
+  card: (
+    <>
+      <rect x="3" y="5" width="18" height="14" rx="2" />
+      {P('M3 10h18M7 15h4')}
+    </>
+  ),
+  logout: (
+    <>
+      {P('M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4')}
+      {P('M16 8l4 4-4 4M20 12H9')}
+    </>
+  ),
+  check: P('m5 12 5 5 9-10'),
+  palette: (
+    <>
+      {P(
+        'M12 3a9 9 0 1 0 0 18c1.5 0 2.1-1 1.6-2.1-.4-1.1.3-2.1 1.5-2.1H17a4 4 0 0 0 4-4c0-5-4-9.8-9-9.8z'
+      )}
+      <circle cx="7.6" cy="11.4" r="1.1" />
+      <circle cx="10.6" cy="7.4" r="1.1" />
+      <circle cx="15.2" cy="7.8" r="1.1" />
+    </>
+  ),
+  eye: (
+    <>
+      {P('M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z')}
+      <circle cx="12" cy="12" r="3" />
+    </>
+  ),
+  eyeOff: (
+    <>
+      {P(
+        'M3 3l18 18M10.6 5.2A9.9 9.9 0 0 1 12 5c6.4 0 10 7 10 7a17 17 0 0 1-3.2 4M6.5 6.7C3.8 8.5 2 12 2 12s3.6 7 10 7c1.7 0 3.2-.4 4.5-1M9.9 9.9a3 3 0 0 0 4.2 4.2'
+      )}
+    </>
+  ),
+  lock: (
+    <>
+      <rect x="4.5" y="10.5" width="15" height="10" rx="2.5" />
+      {P('M8 10.5V8a4 4 0 0 1 8 0v2.5M12 14.5v2.5')}
+    </>
+  ),
+  x: (
+    <>
+      <circle cx="12" cy="12" r="9" />
+      {P('m9 9 6 6M15 9l-6 6')}
+    </>
+  ),
+  pie: (
+    <>
+      <circle cx="12" cy="12" r="9" />
+      {P('M12 3v9h9')}
+    </>
+  ),
+  hourglass: (
+    <>
+      {P('M6 3h12M6 21h12')}
+      {P('M7 3c0 5 5 6 5 9s-5 4-5 9M17 3c0 5-5 6-5 9s5 4 5 9')}
+    </>
+  ),
+  download: (
+    <>
+      {P('M12 4v11M7.5 11 12 15.5 16.5 11')}
+      {P('M5 20h14')}
+    </>
+  ),
+  filter: P('M4 5h16l-6 8v6l-4-2v-4z'),
+  reset: (
+    <>
+      {P('M4 12a8 8 0 1 0 2.6-5.9')}
+      {P('M4 4v4.5h4.5')}
+    </>
+  ),
+  grid: (
+    <>
+      <rect x="4" y="4" width="7" height="7" rx="1" />
+      <rect x="13" y="4" width="7" height="7" rx="1" />
+      <rect x="4" y="13" width="7" height="7" rx="1" />
+      <rect x="13" y="13" width="7" height="7" rx="1" />
+    </>
+  ),
+};
+function Ic({ n, s = 20 }: { n: string; s?: number }) {
+  return (
+    <svg
+      className="ic"
+      width={s}
+      height={s}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {IC[n]}
+    </svg>
+  );
+}
+function Card({
+  ic,
+  title,
+  children,
+  cls,
+}: {
+  ic?: string;
+  title?: string;
+  children: ReactNode;
+  cls?: string;
+}) {
+  return (
+    <div className={'card' + (cls ? ' ' + cls : '')}>
+      {title && (
+        <h2>
+          {ic && <Ic n={ic} s={22} />}
+          {title}
+        </h2>
+      )}
+      {children}
+    </div>
+  );
+}
+/** input dengan ikon di kiri */
+function IF({ ic, children }: { ic: string; children: ReactNode }) {
+  return (
+    <div className="ifld">
+      <span className="ico">
+        <Ic n={ic} s={18} />
+      </span>
+      {children}
+    </div>
+  );
+}
+/** logo sidebar: gambar unggahan admin (Pengaturan). Bila belum ada, pakai logo PT Argapura di kotak putih. */
+function SideLogo({ src, box }: { src: string; box?: boolean }) {
+  const img = <img src={src || LOGO_TIGHT} alt="Logo PT Argapura" />;
+  return box ?? true ? <div className="logoph">{img}</div> : img;
+}
+
+/* ================= LOGIN / DAFTAR ================= */
+/** Latar sidebar: partikel melayang yang saling terhubung garis tipis bila berdekatan (efek jaringan/konstelasi).
+ *  Garis juga menyambung ke kursor saat mouse berada di sidebar. Berhenti otomatis saat tab/drawer tidak terlihat. */
+function SideFx() {
+  const ref = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const cv = ref.current;
+    const host = cv?.parentElement;
+    const ctx = cv?.getContext('2d');
+    if (!cv || !host || !ctx) return;
+    const still = !!window.matchMedia?.('(prefers-reduced-motion: reduce)')
+      .matches;
+    type Pt = { x: number; y: number; vx: number; vy: number; r: number };
+    let w = 0,
+      h = 0,
+      pts: Pt[] = [],
+      raf = 0,
+      tick = 0,
+      off = false;
+    const mouse = { x: -999, y: -999, on: false };
+    const LINK = 105,
+      MLINK = 140;
+    const draw = () => {
+      ctx.clearRect(0, 0, w, h);
+      if (!still)
+        for (const p of pts) {
+          p.x += p.vx;
+          p.y += p.vy;
+          if (p.x < 0 || p.x > w) {
+            p.vx *= -1;
+            p.x = Math.min(w, Math.max(0, p.x));
+          }
+          if (p.y < 0 || p.y > h) {
+            p.vy *= -1;
+            p.y = Math.min(h, Math.max(0, p.y));
+          }
+        }
+      ctx.lineWidth = 1;
+      for (let i = 0; i < pts.length; i++) {
+        const a = pts[i];
+        for (let j = i + 1; j < pts.length; j++) {
+          const b = pts[j],
+            d = Math.hypot(a.x - b.x, a.y - b.y);
+          if (d < LINK) {
+            ctx.strokeStyle = `rgba(170,235,255,${(
+              (1 - d / LINK) *
+              0.5
+            ).toFixed(3)})`;
+            ctx.beginPath();
+            ctx.moveTo(a.x, a.y);
+            ctx.lineTo(b.x, b.y);
+            ctx.stroke();
+          }
+        }
+        if (mouse.on) {
+          const d = Math.hypot(a.x - mouse.x, a.y - mouse.y);
+          if (d < MLINK) {
+            ctx.strokeStyle = `rgba(255,255,255,${(
+              (1 - d / MLINK) *
+              0.75
+            ).toFixed(3)})`;
+            ctx.beginPath();
+            ctx.moveTo(a.x, a.y);
+            ctx.lineTo(mouse.x, mouse.y);
+            ctx.stroke();
+          }
+        }
+      }
+      for (const p of pts) {
+        ctx.fillStyle = 'rgba(150,230,255,.18)';
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r * 3, 0, 6.2832);
+        ctx.fill();
+        ctx.fillStyle = 'rgba(225,248,255,.9)';
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r, 0, 6.2832);
+        ctx.fill();
+      }
+    };
+    const build = () => {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const nw = host.clientWidth,
+        nh = host.clientHeight;
+      if (!nw || !nh) return;
+      const ow = w,
+        oh = h;
+      w = nw;
+      h = nh;
+      cv.width = Math.round(w * dpr);
+      cv.height = Math.round(h * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      const n = Math.max(14, Math.min(44, Math.round((w * h) / 9500)));
+      const mk = (): Pt => ({
+        x: Math.random() * w,
+        y: Math.random() * h,
+        vx: (Math.random() - 0.5) * 0.4,
+        vy: (Math.random() - 0.5) * 0.4,
+        r: 1 + Math.random() * 1.3,
+      });
+      if (pts.length && ow && oh) {
+        // ukuran berubah (sidebar melebar/menyempit): partikel lama diskalakan, tidak diacak ulang
+        for (const p of pts) {
+          p.x = (p.x * w) / ow;
+          p.y = (p.y * h) / oh;
+        }
+        while (pts.length > n) pts.pop();
+        while (pts.length < n) pts.push(mk());
+      } else pts = Array.from({ length: n }, mk);
+      draw();
+    };
+    const loop = () => {
+      raf = requestAnimationFrame(loop);
+      if (document.hidden || still) return;
+      if (tick++ % 20 === 0)
+        off = getComputedStyle(host).visibility === 'hidden'; // drawer HP tertutup = tidak digambar
+      if (!off) draw();
+    };
+    const move = (e: PointerEvent) => {
+      const r = host.getBoundingClientRect();
+      mouse.x = e.clientX - r.left;
+      mouse.y = e.clientY - r.top;
+      mouse.on = e.pointerType === 'mouse';
+    };
+    const leave = () => {
+      mouse.on = false;
+    };
+    build();
+    const ro = new ResizeObserver(build);
+    ro.observe(host);
+    host.addEventListener('pointermove', move);
+    host.addEventListener('pointerleave', leave);
+    raf = requestAnimationFrame(loop);
+    return () => {
+      cancelAnimationFrame(raf);
+      ro.disconnect();
+      host.removeEventListener('pointermove', move);
+      host.removeEventListener('pointerleave', leave);
+    };
+  }, []);
+  return <canvas ref={ref} className="sidefx" aria-hidden="true" />;
+}
+
+/** Logo login: video logo diputar sekali -> setelah selesai, video memudar & logo asli (latar putih, unggahan admin) masuk dengan efek transisi
+ *  -> ditahan LOGO_HOLD ms -> kembali memutar video dari awal, berulang terus. Ubah LOGO_HOLD untuk mengatur jeda. */
+const ADMIN_ONLY = new Set(['all', 'doc', 'users', 'history', 'setting']); // Semua Pengajuan, Dokumen PO, Verifikasi User, Change History, Pengaturan
+const IDLE_MS = 2 * 60 * 1000; // batas tanpa aktivitas sebelum auto-logout (2 menit)
+const LOGO_HOLD = 3000; // jeda logo tampil (ms) setelah transisi masuk selesai
+const LOGO_FADE = 900; // lama transisi (ms), samakan dengan .al-swap di CSS
+function LoginLogo({ src, leaving }: { src: string; leaving: boolean }) {
+  const vref = useRef<HTMLVideoElement>(null);
+  const timer = useRef<number>(0);
+  const [phase, setPhase] = useState<'video' | 'logo'>('video');
+  useEffect(() => () => clearTimeout(timer.current), []);
+  const toLogo = (loopBack: boolean) => {
+    setPhase('logo');
+    clearTimeout(timer.current);
+    if (!loopBack) return;
+    timer.current = window.setTimeout(() => {
+      setPhase('video');
+      const v = vref.current;
+      if (v) {
+        v.currentTime = 0;
+        v.play().catch(() => {});
+      } // video diputar ulang saat logo memudar keluar
+    }, LOGO_FADE + LOGO_HOLD);
+  };
+  return (
+    <div
+      className={
+        'logobox alogo videobox' +
+        (phase === 'logo' ? ' show-logo' : '') +
+        (leaving ? ' burst' : '')
+      }
+    >
+      {/* Video logo: file logo-anim.mp4 harus diletakkan di folder public/ project (diakses sebagai /logo-anim.mp4).
+          muted wajib agar browser mengizinkan autoplay. Tanpa "loop": pengulangan diatur manual lewat onEnded. */}
+      <div className={'al-swap ' + (phase === 'logo' ? 'is-logo' : 'is-video')}>
+        <video
+          ref={vref}
+          className="al-video"
+          src="/logo-anim.mp4"
+          autoPlay
+          muted
+          playsInline
+          onEnded={() => toLogo(true)}
+          onError={() => toLogo(false)}
+        />
+        <img className="al-logo" src={src} alt="Logo PT Argapura" />
+        <span className="al-sweep" aria-hidden="true" />
+      </div>
+      <span className="al-ring r1" aria-hidden="true" />
+      <span className="al-ring r2" aria-hidden="true" />
+      <span className="al-flash" aria-hidden="true" />
+    </div>
+  );
+}
+
+/** Logo login beranimasi (autoplay berulang, tanpa emas): 1) Terangkai cepat — 4 pita atap meluncur bergantian dari kiri/kanan, pilar naik, teks menyusul dari kanan, 2) Shimmer putih kebiruan, 3) Beacon Glow biru neon, 4) Pulse & Flash saat login berhasil (class "burst"). */
+function AnimLogo({ src, burst }: { src: string; burst: boolean }) {
+  const custom = !!src; // logo unggahan admin: efek per-bagian (pilar/atap) dimatikan, efek keseluruhan tetap jalan
+  const img = src || LOGO_WIDE;
+  const mask = {
+    WebkitMaskImage: `url("${img}")`,
+    maskImage: `url("${img}")`,
+  } as CSSProperties;
+  return (
+    <div
+      className={
+        'logobox alogo' + (custom ? ' custom' : '') + (burst ? ' burst' : '')
+      }
+    >
+      <span className="al-aura" aria-hidden="true" />
+      <div className="al-stage">
+        <img className="al-base" src={img} alt="Logo PT Argapura" />
+        {!custom && (
+          <span className="al-rw" aria-hidden="true">
+            <img className="al-roof" src={img} alt="" />
+          </span>
+        )}
+        {!custom && (
+          <img className="al-pil" src={img} alt="" aria-hidden="true" />
+        )}
+        {!custom && (
+          <span className="al-rb rb1" aria-hidden="true">
+            <img src={img} alt="" />
+          </span>
+        )}
+        {!custom && (
+          <span className="al-rb rb2" aria-hidden="true">
+            <img src={img} alt="" />
+          </span>
+        )}
+        {!custom && (
+          <span className="al-rb rb3" aria-hidden="true">
+            <img src={img} alt="" />
+          </span>
+        )}
+        {!custom && (
+          <span className="al-rb rb4" aria-hidden="true">
+            <img src={img} alt="" />
+          </span>
+        )}
+        <span className="al-shine" style={mask} aria-hidden="true" />
+      </div>
+      <span className="al-ring r1" aria-hidden="true" />
+      <span className="al-ring r2" aria-hidden="true" />
+      <span className="al-flash" aria-hidden="true" />
+    </div>
+  );
+}
+
+function Auth({
+  users,
+  setUsers,
+  onLogin,
+  brand,
+  depts,
+  tint,
+}: {
+  tint: boolean;
+  depts: string[];
+  users: User[];
+  setUsers: (f: (u: User[]) => User[]) => void;
+  onLogin: (id: string) => void;
+  brand: Brand;
+}) {
+  const [mode, setMode] = useState<'login' | 'daftar'>('login');
+  const [f, setF] = useState({
+    nama: '',
+    username: '',
+    email: '',
+    pass: '',
+    dept: '',
+  });
+  const [msg, setMsg] = useState('');
+  useEffect(() => {
+    // tampilkan alasan bila keluar otomatis karena tidak aktif
+    try {
+      if (sessionStorage.getItem('po_idle')) {
+        sessionStorage.removeItem('po_idle');
+        setMsg(
+          'Anda otomatis keluar karena tidak ada aktivitas selama 2 menit. Silakan masuk kembali.'
+        );
+      }
+    } catch {
+      /* abaikan */
+    }
+  }, []);
+  const [show, setShow] = useState(false);
+  const set = (k: string, v: string) => setF((x) => ({ ...x, [k]: v }));
+
+  /* Loading state tombol: "login" = spinner saat autentikasi, "daftar" = progress bar + spinner, lalu centang "Berhasil!" */
+  const [busy, setBusy] = useState<'' | 'login' | 'daftar'>('');
+  const [prog, setProg] = useState(0);
+  const [done, setDone] = useState(false);
+  const [leaving, setLeaving] = useState(false); // efek keluar setelah login berhasil: kartu membesar + glow, lalu memudar
+  const timers = useRef<number[]>([]);
+  const later = (fn: () => void | Promise<void>, ms: number) => {
+    timers.current.push(window.setTimeout(fn, ms));
+  };
+  useEffect(
+    () => () => {
+      timers.current.forEach((t) => {
+        clearTimeout(t);
+        clearInterval(t);
+      });
+    },
+    []
+  );
+
+  const submit = () => {
+    if (busy) return; // cegah klik / Enter berulang selama proses
+    const email = f.email.trim().toLowerCase();
+    const un = f.username.trim().toLowerCase();
+    if (mode === 'login') {
+      setMsg('');
+      setBusy('login');
+      // Tombol disabled + spinner sampai autentikasi selesai
+      later(async () => {
+        const left = lockLeft(un);
+        if (left > 0) {
+          setBusy('');
+          return setMsg(
+            `Terlalu banyak percobaan gagal. Coba lagi ${Math.ceil(
+              left / 60000
+            )} menit lagi.`
+          );
+        }
+        const cand = users.find((x) => uname(x) === un);
+        let okPw = false;
+        try {
+          okPw = !!cand && (await verifyPw(f.pass, cand.pass));
+        } catch {
+          setBusy('');
+          return setMsg(
+            'Browser tidak mendukung enkripsi (gunakan HTTPS / browser terbaru).'
+          );
+        }
+        noteFail(un, okPw);
+        const u = okPw ? cand : undefined;
+        if (!u) {
+          setBusy('');
+          return setMsg('Username atau password salah.');
+        }
+        if (u.status === 'approved') {
+          WEAK_LOGIN = PW_WEAK.includes(f.pass.toLowerCase());
+          if (!isHashed(u.pass)) {
+            const h = await hashPw(f.pass); // upgrade password lama -> hash
+            setUsers((l) =>
+              l.map((x) => (x.id === u.id ? { ...x, pass: h } : x))
+            );
+          }
+        }
+        if (u.status === 'pending') {
+          setBusy('');
+          return setMsg('Akun Anda masih menunggu verifikasi admin.');
+        }
+        if (u.status === 'rejected') {
+          setBusy('');
+          return setMsg('Akun Anda tidak aktif. Hubungi admin.');
+        }
+        // Glassmorphic Expansion & Fade-out: kartu membesar (102%) + pendaran biru, lalu melebur sebelum pindah ke dashboard
+        setDone(true);
+        setLeaving(true);
+        const quick = window.matchMedia?.(
+          '(prefers-reduced-motion: reduce)'
+        ).matches;
+        later(() => onLogin(u.id), quick ? 150 : 1050);
+      }, 900);
+      return;
+    }
+    if (!f.nama.trim() || !un || !email || f.pass.length < 8 || !f.dept)
+      return setMsg('Lengkapi semua isian. Password minimal 8 karakter.');
+    if (!/^[a-z0-9._-]{3,20}$/.test(un))
+      return setMsg(
+        'Username 3-20 karakter: huruf, angka, titik, strip, atau garis bawah (tanpa spasi).'
+      );
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+      return setMsg('Format email tidak valid.');
+    if (users.some((x) => uname(x) === un))
+      return setMsg('Username sudah dipakai. Pilih username lain.');
+    if (users.some((x) => x.email.trim().toLowerCase() === email))
+      return setMsg('Email sudah terdaftar.');
+    setMsg('');
+    setBusy('daftar');
+    setProg(0);
+    // Progress bar terisi kiri → kanan, form diberi overlay shimmer, lalu tombol berubah jadi centang hijau
+    const iv = window.setInterval(
+      () => setProg((p) => Math.min(100, p + 4 + Math.random() * 6)),
+      90
+    );
+    timers.current.push(iv);
+    later(async () => {
+      clearInterval(iv);
+      setProg(100);
+      const ph = await hashPw(f.pass);
+      setUsers((l) =>
+        l.some((x) => x.email.trim().toLowerCase() === email)
+          ? l
+          : [
+              ...l,
+              {
+                id: newId('u-'),
+                nama: f.nama.trim(),
+                username: un,
+                email,
+                pass: ph,
+                dept: f.dept,
+                role: 'user',
+                status: 'pending',
+              },
+            ]
+      );
+      setDone(true);
+      later(() => {
+        setBusy('');
+        setDone(false);
+        setProg(0);
+        setMode('login');
+        setF({ nama: '', username: '', email: '', pass: '', dept: '' });
+        setMsg(
+          'Pendaftaran terkirim. Tunggu verifikasi admin sebelum bisa masuk.'
+        );
+      }, 1100);
+    }, 1800);
+  };
+
+  const sbtn = (kind: 'login' | 'daftar', label: string) => {
+    const on = busy === kind;
+    return (
+      <div className="btntray">
+        <button
+          type="button"
+          className={
+            'pri wide sbtn' + (on ? ' loading' : '') + (on && done ? ' ok' : '')
+          }
+          disabled={!!busy}
+          aria-busy={on}
+          onClick={submit}
+        >
+          {kind === 'daftar' && on && (
+            <span
+              className="pbfill"
+              style={{ width: prog + '%' }}
+              aria-hidden="true"
+            />
+          )}
+          <span className="sbl">
+            {on && done ? (
+              <>
+                <span className="chk" aria-hidden="true">
+                  ✓
+                </span>
+                Berhasil!
+              </>
+            ) : on ? (
+              <>
+                <span className="spin" aria-hidden="true" />
+                Memproses...{kind === 'daftar' ? ` ${Math.round(prog)}%` : ''}
+              </>
+            ) : (
+              label
+            )}
+          </span>
+          {kind === 'login' && !on && (
+            <span className="sarrow" aria-hidden="true">
+              <Ic n="right" s={18} />
+            </span>
+          )}
+        </button>
+      </div>
+    );
+  };
+
+  const reg = mode === 'daftar';
+  const go = (m: 'login' | 'daftar') => {
+    setMode(m);
+    setMsg('');
+    setShow(false);
+    setF({ nama: '', username: '', email: '', pass: '', dept: '' }); // kosongkan isian (hindari autofill browser)
+  };
+
+  const userFld = (
+    <Field label="Username">
+      <div className="fin">
+        <span className="fic" aria-hidden="true">
+          <Ic n="user" s={19} />
+        </span>
+        <input
+          type="text"
+          name={reg ? 'daftar-username' : 'username'}
+          autoComplete={reg ? 'off' : 'username'}
+          autoCapitalize="none"
+          spellCheck={false}
+          disabled={!!busy}
+          value={f.username}
+          onChange={(e) => set('username', e.target.value.replace(/\s/g, ''))}
+        />
+      </div>
+    </Field>
+  );
+  const email = (
+    <Field label="Email (untuk notifikasi)">
+      <div className="fin">
+        <span className="fic" aria-hidden="true">
+          <Ic n="mail" s={19} />
+        </span>
+        <input
+          type="email"
+          name="daftar-email"
+          autoComplete="off"
+          disabled={!!busy}
+          value={f.email}
+          onChange={(e) => set('email', e.target.value)}
+        />
+      </div>
+    </Field>
+  );
+  const pass = (
+    <Field label="Password">
+      <div className="pw">
+        <span className="fic" aria-hidden="true">
+          <Ic n="lock" s={19} />
+        </span>
+        <input
+          type={show ? 'text' : 'password'}
+          name={reg ? 'daftar-password' : 'password'}
+          autoComplete={reg ? 'new-password' : 'current-password'}
+          disabled={!!busy}
+          value={f.pass}
+          onChange={(e) => set('pass', e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && submit()}
+        />
+        <button
+          type="button"
+          className="eye"
+          aria-label={show ? 'Sembunyikan password' : 'Tampilkan password'}
+          title={show ? 'Sembunyikan password' : 'Tampilkan password'}
+          onClick={() => setShow((x) => !x)}
+        >
+          <Ic n={show ? 'eyeOff' : 'eye'} s={18} />
+        </button>
+      </div>
+    </Field>
+  );
+  const head = (side: 'login' | 'daftar') => (
+    <>
+      <LoginLogo src={brand.logo || LOGO_WIDE} leaving={leaving} />
+      <h1>PO Request System</h1>
+      <p className="mute">PT Argapura</p>
+      <div className="tabs">
+        <button
+          type="button"
+          className={side === 'login' ? 'on' : ''}
+          disabled={!!busy}
+          onClick={() => go('login')}
+        >
+          <Ic n="user" s={18} />
+          Masuk
+        </button>
+        <button
+          type="button"
+          className={side === 'daftar' ? 'on' : ''}
+          disabled={!!busy}
+          onClick={() => go('daftar')}
+        >
+          <Ic n="fileList" s={18} />
+          Daftar
+        </button>
+      </div>
+    </>
+  );
+
+  return (
+    <div
+      className={
+        'auth' + (brand.bg ? ' hasbg' : '') + (leaving ? ' leaving' : '')
+      }
+      style={
+        {
+          '--g': (100 - brand.glass) / 50,
+          ...(brand.bg
+            ? {
+                backgroundImage: `url("${brand.bg}")`,
+                backgroundSize: 'cover',
+                backgroundPosition: 'center',
+              }
+            : {}),
+        } as CSSProperties
+      }
+    >
+      {brand.bg && tint && <div className="authtint" aria-hidden="true" />}
+      {/* Slow Flowing Abstract Waves: pita gelombang biru yang mengalir sangat pelan di belakang kartu */}
+      <svg
+        className="waves"
+        viewBox="0 0 1600 900"
+        preserveAspectRatio="xMidYMid slice"
+        aria-hidden="true"
+        focusable="false"
+      >
+        <defs>
+          <linearGradient id="wvA" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stopColor="#0a3a9e" stopOpacity=".0" />
+            <stop offset=".35" stopColor="#3aa0ff" stopOpacity=".95" />
+            <stop offset=".7" stopColor="#7fe3ff" stopOpacity=".9" />
+            <stop offset="1" stopColor="#ffffff" stopOpacity=".0" />
+          </linearGradient>
+          <linearGradient id="wvB" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stopColor="#7fe3ff" stopOpacity=".0" />
+            <stop offset=".4" stopColor="#2f8bff" stopOpacity=".9" />
+            <stop offset=".8" stopColor="#1a5ff0" stopOpacity=".8" />
+            <stop offset="1" stopColor="#0b4fc4" stopOpacity=".0" />
+          </linearGradient>
+          <linearGradient id="wvC" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stopColor="#ffffff" stopOpacity=".0" />
+            <stop offset=".5" stopColor="#d6f2ff" stopOpacity=".8" />
+            <stop offset="1" stopColor="#3aa0ff" stopOpacity=".0" />
+          </linearGradient>
+        </defs>
+        <g className="wv w1">
+          <path
+            d="M-300 640 C 0 520, 340 790, 760 650 S 1380 500, 1900 650 L1900 735 C1400 600, 1120 790, 760 735 S 80 590, -300 730 Z"
+            fill="url(#wvA)"
+          />
+          <path
+            d="M-300 640 C 0 520, 340 790, 760 650 S 1380 500, 1900 650"
+            fill="none"
+            stroke="#ffffff"
+            strokeOpacity=".4"
+            strokeWidth="1.5"
+          />
+        </g>
+        <g className="wv w2">
+          <path
+            d="M-300 770 C 120 690, 420 880, 820 790 S 1420 680, 1900 790 L1900 880 C1450 760, 1160 930, 820 880 S 160 740, -300 870 Z"
+            fill="url(#wvB)"
+          />
+          <path
+            d="M-300 770 C 120 690, 420 880, 820 790 S 1420 680, 1900 790"
+            fill="none"
+            stroke="#bfeaff"
+            strokeOpacity=".35"
+            strokeWidth="1.2"
+          />
+        </g>
+        <g className="wv w3">
+          <path
+            d="M-300 150 C 100 40, 480 260, 880 140 S 1440 20, 1900 150 L1900 215 C1450 95, 1180 290, 880 205 S 150 90, -300 225 Z"
+            fill="url(#wvC)"
+          />
+          <path
+            d="M-300 150 C 100 40, 480 260, 880 140 S 1440 20, 1900 150"
+            fill="none"
+            stroke="#ffffff"
+            strokeOpacity=".3"
+            strokeWidth="1.2"
+          />
+        </g>
+        <g className="wv w4">
+          <path
+            d="M-300 400 C 60 300, 380 500, 780 400 S 1360 300, 1900 410 L1900 450 C1400 350, 1140 540, 780 450 S 120 340, -300 450 Z"
+            fill="url(#wvA)"
+            opacity=".85"
+          />
+        </g>
+      </svg>
+      <span className="orb o1" aria-hidden="true" />
+      <span className="orb o2" aria-hidden="true" />
+      <span className="orb o3" aria-hidden="true" />
+      <div
+        className={
+          'scene' + (reg ? ' flipped' : '') + (leaving ? ' leaving' : '')
+        }
+      >
+        {/* Sisi depan: Masuk */}
+        <div
+          className={'face f authbox' + (reg ? '' : ' act')}
+          aria-hidden={reg}
+        >
+          <span className="sheen" aria-hidden="true" />
+          {head('login')}
+          {userFld}
+          {pass}
+          {!reg && msg && <div className="info">{msg}</div>}
+          {sbtn('login', 'Login')}
+        </div>
+
+        {/* Sisi belakang: Daftar */}
+        <div
+          className={
+            'face b authbox' +
+            (reg ? ' act' : '') +
+            (busy === 'daftar' ? ' formbusy' : '')
+          }
+          aria-hidden={!reg}
+        >
+          <span className="sheen" aria-hidden="true" />
+          {head('daftar')}
+          <Field label="Nama lengkap">
+            <input
+              disabled={!!busy}
+              value={f.nama}
+              onChange={(e) => set('nama', e.target.value)}
+            />
+          </Field>
+          {userFld}
+          {email}
+          {pass}
+          <Field label="Departemen">
+            <select
+              disabled={!!busy}
+              value={f.dept}
+              onChange={(e) => set('dept', e.target.value)}
+            >
+              <option value="">Pilih departemen</option>
+              {depts.map((d) => (
+                <option key={d}>{d}</option>
+              ))}
+            </select>
+          </Field>
+          {reg && msg && <div className="info">{msg}</div>}
+          {sbtn('daftar', 'Kirim pendaftaran')}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ================= DOKUMEN PO (A4 portrait, siap cetak) ================= */
+// Data tetap di dokumen PO. Ubah di sini jika alamat pengiriman / nomor form berubah.
+const LOGO =
+  'data:image/png;base64,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';
+const LOGO_WIDE =
+  'data:image/png;base64,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'; // logo horizontal PT Argapura (dipangkas) untuk halaman login beranimasi
+// Versi logo yang sudah dipangkas (tanpa ruang kosong) untuk sidebar & halaman login. LOGO asli tetap dipakai di dokumen PO.
+const LOGO_TIGHT =
+  'data:image/png;base64,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';
+// Logo horizontal PT Argapura untuk kop dokumen PO (sudah dipangkas, rasio 2137:414)
+const LOGO_PO =
+  'data:image/png;base64,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6Ii7CJFS5EkPAbK5nHRdX+7vu9IBApqW1dhYryTNmTvXtqyjtUc9T7qOs//AgaX33bd2zZqmlpZcNsOFOO+88wYMGIiMpZJJOx5PxGKJRKKiqqpXr56ArK62NpfNuJ7n5B0hBDKmexzy+bzruYIL07KklADAOYegRG/HYgDgOPnQP5AhY5yFnvm5fM4wTINzYIyUYsgM02xON0tJUncTIOOMM4amaSbiMddxstlsMpkcPmyoaZodJQWURmmURmmURmm0O0pg9P/O6LCKahjG5JMn6f9uampeseLpdDrtKek5riclKCUETyRTnpMfddLo02ed0errzz37bC6ft207m80WoBkAKXno0MExY8eOHj06+vnmpqY33nijrKws3dLiep7urUHG7JhtWVYun5s4cWKrTax+9dW6urpUKpXNZpSS6Qx3Pdd1nPpj9Z6Up51+OgTuRUIYRHDSmDEnjRnz/HPPua7rua7julJJIuCcW6bRpWsXzsWA/v2TqdTHd7qfXrGi7ujRVDIlNULUMF0qxnldbe20GTOGDBmid7t/0rfESyaTnuvpcC8pFefAhYjHY7Yd44bRr0+faTNmRDfRo3v311a/eujAgZ69euedvOc44JdFMB6PO46LALPOOKPVA75mzZpjdXXl5eXpdFophQBMcC6EwUVzU1O3bt0nT54c/fzhw4cfe+TRsvIyT0rH9TzP0+62whCMIRCes+Cc6qrKyAq49EYpjdIojdIojRNhy0rzRgmMAoBulhdC1NbW/umP//PySy8mEknPc/XfaveWqqqq6//1x+PHT1BKhoDDdd3tO3f88fd/OHTwIENUQU4mY8x13ZNOOun6H/9Ym3rqaD7GWDqdfuWVl++9d8mxo3U6zRkBGDJE1rN3729885sjR44MXeg1Bzlx4sTaI0ceeuBBAlJSEgIpdXD//sampuaWliuuvFJwHkanA5DnSSnl8889t+SeexoaGpQiAgWKtL99PJkcMnjwj3/yk/Hjx7ueJz5SsaNSipRSgGvWrLnhj390XJcCRwIC4owDQiqV/O9f/WbgwIEBV01KKmQskUjYsdjhw4c5R8aZlPKeu+/WPfxCGP/0/e+fPHkyoN+wr7975MjhP/zud7t275HKU5IIiAFyIZRSffv1++KXvtTY0BCPx6VSnDF9Mutqa2/481/e2fhOLpt1XEfrDAzTlJ43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';
+const CO = [
+  'Jl. Kedoya Agave Raya Blok A1 No.1-2,',
+  'Tomang Tol Raya, Jakarta 11520',
+  'P: 021-5801448 | F: 021-582-3443',
+  'NPWP: 01.301.159.8-038.000',
+];
+const SHIP = {
+  nama: 'PT ARGAPURA - FACTORY',
+  alamat: [
+    'Kawasan Industri Jababeka V. Jl. Science Timur I, Blok A5 No.G.',
+    'Cikarang, Bekasi 17533, Indonesia, Telp 021 508 50208',
+  ],
+};
+const FORM_DOC = { dok: 'FRM-HG-01-09', rev: '00', terbit: '02 Oktober 2019' };
+const TERMS: string[] = [
+  '1. Pekerjaan yang mengandung jasa akan dikenakan pajak sesuai ketentuan yang berlaku.',
+  '2. Jadwal penukaran faktur (Head Office) Selasa dan Kamis, Pukul 14.00-16.00 WIB.',
+  '3. Waktu pembayaran adalah 14 hari kerja, sejak invoice diterima.',
+  '4. Supplier yang menggunakan prosedur uang muka, wajib melampirkan Performa Invoice.',
+  '5. Supplier harap memberikan paraf pada kolom yang telah disediakan dan mengirimkan kembali Form',
+];
+
+const SATUAN = [
+  '',
+  'satu',
+  'dua',
+  'tiga',
+  'empat',
+  'lima',
+  'enam',
+  'tujuh',
+  'delapan',
+  'sembilan',
+  'sepuluh',
+  'sebelas',
+];
+function tb(n: number): string {
+  if (n < 12) return SATUAN[n];
+  if (n < 20) return tb(n - 10) + ' belas';
+  if (n < 100)
+    return tb(Math.floor(n / 10)) + ' puluh' + (n % 10 ? ' ' + tb(n % 10) : '');
+  if (n < 200) return 'seratus' + (n > 100 ? ' ' + tb(n - 100) : '');
+  if (n < 1000)
+    return (
+      tb(Math.floor(n / 100)) + ' ratus' + (n % 100 ? ' ' + tb(n % 100) : '')
+    );
+  if (n < 2000) return 'seribu' + (n > 1000 ? ' ' + tb(n - 1000) : '');
+  if (n < 1e6)
+    return (
+      tb(Math.floor(n / 1e3)) + ' ribu' + (n % 1e3 ? ' ' + tb(n % 1e3) : '')
+    );
+  if (n < 1e9)
+    return (
+      tb(Math.floor(n / 1e6)) + ' juta' + (n % 1e6 ? ' ' + tb(n % 1e6) : '')
+    );
+  if (n < 1e12)
+    return (
+      tb(Math.floor(n / 1e9)) + ' miliar' + (n % 1e9 ? ' ' + tb(n % 1e9) : '')
+    );
+  return (
+    tb(Math.floor(n / 1e12)) + ' triliun' + (n % 1e12 ? ' ' + tb(n % 1e12) : '')
+  );
+}
+const terbilang = (n: number) => {
+  const w = Math.round(n) === 0 ? 'nol' : tb(Math.round(n));
+  return w.charAt(0).toUpperCase() + w.slice(1) + ' rupiah';
+};
+
+const esc = (s: string) =>
+  s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+const en = (n: number, d = 0) =>
+  n.toLocaleString('en-US', { maximumFractionDigits: d });
+const MON = [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
+];
+
+let measureCtx: CanvasRenderingContext2D | null | undefined;
+/** Kecilkan ukuran font bila teks tidak muat di lebar yang tersedia. */
+function fitSize(txt: string, wPt: number, maxPt: number) {
+  try {
+    if (measureCtx === undefined)
+      measureCtx = document.createElement('canvas').getContext('2d');
+    if (measureCtx) {
+      measureCtx.font = `${
+        (maxPt * 96) / 72
+      }px Calibri, Carlito, Arial, sans-serif`;
+      const w = (measureCtx.measureText(txt).width * 72) / 96;
+      if (w > wPt)
+        return Math.max(5, Math.floor(((maxPt * wPt) / w) * 10) / 10);
+    }
+  } catch {
+    /* abaikan */
+  }
+  return maxPt;
+}
+/** Perkiraan jumlah baris teks agar item yang panjang tidak keluar dari tabel. */
+function lineCount(txt: string, wPt: number, sizePt: number) {
+  try {
+    if (measureCtx === undefined)
+      measureCtx = document.createElement('canvas').getContext('2d');
+    if (measureCtx) {
+      measureCtx.font = `${
+        (sizePt * 96) / 72
+      }px Calibri, Carlito, Arial, sans-serif`;
+      return Math.max(
+        1,
+        Math.ceil(
+          (((measureCtx.measureText(txt).width * 72) / 96) * 1.08) / wPt
+        )
+      );
+    }
+  } catch {
+    /* abaikan */
+  }
+  return Math.max(1, Math.ceil((txt.length * sizePt * 0.52) / wPt));
+}
+
+const DOC_CSS = `
+@page{size:A4 portrait;margin:0}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{font-family:Calibri,Carlito,"Segoe UI",Arial,sans-serif;color:#000;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+.sheet{position:relative;width:595.28pt;height:841pt;overflow:hidden;background:#fff;break-after:page;page-break-after:always}
+.sheet:last-child{break-after:auto;page-break-after:auto}
+.t,.r,.title{position:absolute}
+.t{white-space:nowrap;font-size:8.2pt;line-height:8.2pt;overflow:hidden;text-overflow:ellipsis}
+.b{font-weight:700}.i{font-style:italic}
+.wrap{white-space:pre-line;line-height:10.44pt;overflow:hidden;text-overflow:clip}
+.title{left:204pt;width:200.9pt;top:31pt;text-align:center;white-space:nowrap;font:900 16.3pt/16.3pt "Arial Black","Arial Bold",Arial,sans-serif;text-shadow:.7pt .7pt .9pt rgba(0,0,0,.45)}
+.ul{box-shadow:.7pt .7pt .9pt rgba(0,0,0,.45)}
+@media screen{body{background:#cfd6e0;padding:0 0 1px}.sheet{margin:0 auto 12px}}
+`;
+
+type O = { b?: boolean; i?: boolean; s?: number; c?: string; w?: number };
+const sty = (o: O, base: string[]) => {
+  if (o.s) base.push(`font-size:${o.s}pt`, `line-height:${o.s}pt`);
+  if (o.c) base.push(`color:${o.c}`);
+  return `${o.b ? ' b' : ''}${o.i ? ' i' : ''}" style="${base.join(';')}`;
+};
+/** teks rata kiri di koordinat (x,y) dalam pt, sama dengan PDF contoh */
+const TL = (x: number, y: number, s: string, o: O = {}) =>
+  `<div class="t${sty(o, [
+    `left:${x}pt`,
+    `top:${y}pt`,
+    ...(o.w ? [`width:${o.w}pt`] : []),
+  ])}">${s}</div>`;
+const TR = (x1: number, y: number, s: string, o: O = {}) => {
+  const w = o.w ?? 100;
+  return `<div class="t${sty(o, [
+    `left:${x1 - w}pt`,
+    `top:${y}pt`,
+    `width:${w}pt`,
+    'text-align:right',
+  ])}">${s}</div>`;
+};
+const TC = (cx: number, y: number, s: string, o: O = {}) => {
+  const w = o.w ?? 80;
+  return `<div class="t${sty(o, [
+    `left:${cx - w / 2}pt`,
+    `top:${y}pt`,
+    `width:${w}pt`,
+    'text-align:center',
+  ])}">${s}</div>`;
+};
+const BX = (
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  bg = '#000',
+  cls = ''
+) =>
+  `<div class="r ${cls}" style="left:${x}pt;top:${y}pt;width:${w}pt;height:${h}pt;background:${bg}"></div>`;
+
+const BODY_H = 221.78,
+  ROW_H = 15.36,
+  LINE_H = 10.44;
+const COLS = [29.4, 354.91, 398.59, 443.26, 510.46];
+
+function poHtml(po: PO): string {
+  const v = po.v,
+    pay = po.pay ?? EMPTY_PAY,
+    ong = po.ong ?? 0;
+  const sub = po.items.reduce((a, l) => a + l.q * l.p, 0);
+  const c = calc(sub, po.rate, po.disc, ong);
+  const d = new Date(po.iso);
+  const tgl = `${String(d.getDate()).padStart(2, '0')}-${
+    MON[d.getMonth()]
+  }-${d.getFullYear()}`;
+
+  // bagi item ke halaman (14 baris per halaman; item panjang memakai lebih dari satu baris)
+  type Row = { l: Line; n: number; h: number };
+  const big = po.items.length > 14; // lebih dari 14 item: tabel dua kolom (30 baris x 2) seperti PO contoh
+  const BIG_CAP = 60;
+  const pages: Row[][] = [[]];
+  let used = 0;
+  po.items.forEach((l, n) => {
+    if (big) {
+      if (pages[pages.length - 1].length >= BIG_CAP) pages.push([]);
+      pages[pages.length - 1].push({ l, n, h: 0 });
+      return;
+    }
+    const h = ROW_H + (lineCount(l.d, 318, 8.2) - 1) * LINE_H;
+    if (used + h > BODY_H && pages[pages.length - 1].length) {
+      pages.push([]);
+      used = 0;
+    }
+    pages[pages.length - 1].push({ l, n, h });
+    used += h;
+  });
+  const total = pages.length;
+
+  const sheet = (rows: Row[], pi: number) => {
+    const last = pi === total - 1;
+    const dy = big ? 46.7 : 0; // semua bagian di bawah tabel turun mengikuti tabel dua kolom
+    const sy = big ? 11.4 : 0; // blok NPWP/rekening turun karena alamat supplier
+    const o: string[] = [];
+    // kop
+    o.push(
+      `<img class="r" alt="" src="${LOGO_PO}" style="left:18.4pt;top:24pt;width:133pt;height:25.8pt;object-fit:contain">`
+    );
+    o.push(
+      `<svg class="r" style="left:219.6pt;top:20pt;width:172pt;height:34pt" viewBox="0 0 172 34"><g font-family="'Arial Black','Arial Bold',Arial,sans-serif" font-weight="900" font-size="16.35"><text x=".7" y="26.7" textLength="169.67" lengthAdjust="spacingAndGlyphs" fill="rgba(0,0,0,.45)">PURCHASE ORDER</text><text x="0" y="26" textLength="169.67" lengthAdjust="spacingAndGlyphs" fill="#000">PURCHASE ORDER</text></g></svg>`,
+      BX(219.6, 48, 169.6, 1, '#000', 'ul')
+    );
+    CO.forEach((s, k) =>
+      o.push(
+        TL(18.4, [79.8, 90.1, 100.5, 110.8][k], s, { b: true, c: '#595959' })
+      )
+    );
+    o.push(
+      TL(445.1, 70.7, 'No', { b: true }),
+      TL(465.7, 70.7, esc(po.no), { b: true }),
+      TL(445.1, 79.9, 'Date', { b: true }),
+      TL(465.7, 79.5, tgl, { b: true })
+    );
+    // supplier
+    o.push(
+      TL(18.4, 150.1, 'SUPPLIER', { b: true, c: '#808080' }),
+      TL(18.4, 161.2, esc(v.nama), { b: true, w: 330 })
+    );
+    o.push(
+      `<div class="t wrap" style="left:18.4pt;top:171pt;width:330pt;height:41.4pt">${esc(
+        v.alamat
+      )}</div>`
+    );
+    o.push(
+      TL(18.4, 215.9 + sy, 'NPWP', { b: true }),
+      TL(57.6, 215.9 + sy, esc(v.npwp), { w: 132 })
+    );
+    o.push(
+      TL(18.4, 226.2 + sy, 'Phone', { b: true }),
+      TL(57.6, 226.2 + sy, esc(v.telp + (v.fax ? ' / Fax ' + v.fax : '')), {
+        w: 132,
+      })
+    );
+    o.push(
+      TL(18.4, 236.5 + sy, 'PIC Name', { b: true }),
+      TL(57.6, 236.5 + sy, esc(v.pic), { w: 132 })
+    );
+    o.push(
+      TL(18.4, 248.4 + sy, 'Email', { b: true }),
+      TL(57.6, 247.5 + sy, esc(v.email), { w: 132 })
+    );
+    o.push(
+      TL(192.3, 215.9 + sy, 'No Rek', { b: true }),
+      TL(225.2, 215.9 + sy, esc(pay.rek), { w: 126 })
+    );
+    o.push(
+      TL(192.3, 226.2 + sy, 'Bank', { b: true }),
+      TL(225.2, 226.2 + sy, esc(pay.bank), { w: 126 })
+    );
+    o.push(
+      TL(192.3, 236.5 + sy, 'Cabang', { b: true }),
+      TL(225.2, 236.5 + sy, esc(pay.cabang), { w: 126 })
+    );
+    o.push(
+      TL(192.3, 248.4 + sy, 'A/N', { b: true }),
+      TL(225.2, 247.5 + sy, esc(pay.an), { w: 126 })
+    );
+    // alamat pengiriman
+    o.push(BX(354.91, 148.59, 0.48, 108.74 + sy));
+    o.push(
+      TL(356.7, 150.6, 'Alamat Pengiriman', { b: true, c: '#808080' }),
+      TL(356.7, 161.2, SHIP.nama, { b: true })
+    );
+    o.push(
+      `<div class="t" style="left:356.7pt;top:171pt;line-height:10.44pt;overflow:visible">${SHIP.alamat.join(
+        '<br>'
+      )}</div>`
+    );
+    o.push(
+      TL(356.7, 193.6 + sy + 0.6, 'PIC Name', { b: true }),
+      TL(400.4, 193.6 + sy + 0.6, esc(po.by), { w: 160 })
+    );
+
+    // tabel item
+    if (big) {
+      // Model dua kolom: kiri baris 1-30, kanan baris 31-60 (otomatis, ukuran sama dengan PO contoh)
+      const T0 = 286.9,
+        HH = 8.3,
+        RH = 8.53,
+        BT = 551.2,
+        FS = 6.7;
+      const XS = [
+        [17.3, 34.2, 143.6, 172.8, 202.0, 248.0, 289.6],
+        [294.8, 312.1, 423.4, 452.5, 481.7, 527.8, 571.3],
+      ];
+      const HEAD = [
+        'No',
+        'Deskripsi',
+        'Jumlah',
+        'Satuan',
+        'Harga satuan',
+        'Total',
+      ];
+      XS.forEach((X) => {
+        o.push(BX(X[0], T0, X[6] - X[0], HH));
+        HEAD.forEach((h, k) =>
+          o.push(
+            TC((X[k] + X[k + 1]) / 2, T0 + 0.9, h, {
+              c: '#fff',
+              s: FS + 0.2,
+              w: X[k + 1] - X[k],
+            })
+          )
+        );
+        X.forEach((x, k) => {
+          if (k > 0 && k < 6) o.push(BX(x - 0.24, T0, 0.48, HH, '#fff'));
+          o.push(BX(x - 0.24, T0 + HH, 0.48, BT - T0 - HH));
+        });
+        o.push(BX(X[0], BT - 0.48, X[6] - X[0], 0.48));
+      });
+      rows.forEach((r, i) => {
+        const X = XS[i < 30 ? 0 : 1],
+          y = T0 + HH + (i % 30) * RH + (RH - FS) / 2 - 0.2;
+        const dsc = esc(r.l.d),
+          w = X[2] - X[1] - 3,
+          fs = fitSize(r.l.d, w, FS);
+        o.push(
+          TC((X[0] + X[1]) / 2, y, String(r.n + 1), { s: FS, w: X[1] - X[0] })
+        );
+        o.push(TL(X[1] + 1.6, y, dsc, { s: fs, w }));
+        o.push(
+          TC((X[2] + X[3]) / 2, y, en(r.l.q, 2), { s: FS, w: X[3] - X[2] }),
+          TC((X[3] + X[4]) / 2, y, esc(r.l.s), { s: FS, w: X[4] - X[3] })
+        );
+        o.push(
+          TR(X[5] - 2, y, en(r.l.p, 2), { s: FS, w: X[5] - X[4] - 2 }),
+          TR(X[6] - 2, y, en(r.l.q * r.l.p), { s: FS, w: X[6] - X[5] - 2 })
+        );
+      });
+    } else {
+      o.push(BX(16.8, 274.01, 555, 15.48));
+      COLS.forEach((x) => o.push(BX(x, 274.25, 0.48, 14.88, '#fff')));
+      o.push(TC(23.5, 278.1, 'No', { b: true, c: '#fff', w: 12.8 }));
+      (
+        [
+          [192.4, 'Diskripsi'],
+          [377, 'Jumlah'],
+          [421.2, 'Satuan'],
+          [477.1, 'Harga Satuan'],
+          [541.2, 'Total Biaya'],
+        ] as [number, string][]
+      ).forEach(([x, s]) =>
+        o.push(TC(x, 278.4, s, { b: true, c: '#fff', s: 7.2 }))
+      );
+      o.push(
+        BX(17.04, 273.77, 554.88, 0.48),
+        BX(16.56, 273.77, 0.48, 237.62),
+        BX(17.04, 510.91, 554.88, 0.48)
+      );
+      o.push(BX(571.44, 274.25, 0.48, last ? 301.34 : 237.14));
+      COLS.forEach((x) => o.push(BX(x, 289.61, 0.48, 221.78)));
+      let y = 0;
+      const cells: string[] = [];
+      rows.forEach((r) => {
+        cells.push(TC(23.5, y + 4.1, String(r.n + 1), { w: 12.8 }));
+        cells.push(
+          `<div class="t wrap" style="left:31.2pt;top:${
+            y + 2.5
+          }pt;width:322pt;height:${r.h - 3}pt">${esc(r.l.d)}</div>`
+        );
+        cells.push(
+          TC(377, y + 4.1, en(r.l.q, 2)),
+          TC(421.2, y + 4.1, esc(r.l.s)),
+          TC(477.1, y + 4.1, en(r.l.p, 2)),
+          TR(570.2, y + 4.1, en(r.l.q * r.l.p))
+        );
+        y += r.h;
+      });
+      o.push(
+        `<div class="r" style="left:0;top:289.61pt;width:595pt;height:${BODY_H}pt;overflow:hidden">${cells.join(
+          ''
+        )}</div>`
+      );
+    }
+
+    // syarat & ketentuan
+    if (big) {
+      o.push(
+        TL(19.8, 564.4, 'Syarat dan Ketentuan:', { b: true, s: 7.2 }),
+        BX(19.83, 570.5, 66.5, 0.49)
+      );
+      TERMS.forEach((t, k) =>
+        o.push(
+          TL(19.8, [573.0, 580.5, 587.9, 595.4, 602.8][k], t, {
+            b: true,
+            s: 6.1,
+          })
+        )
+      );
+      o.push(
+        TL(
+          25.3,
+          610.3,
+          'Purchase Order (PO) ini sebagai bukti pesanan telah diterima.',
+          { b: true, s: 6.1 }
+        )
+      );
+    } else {
+      o.push(
+        TL(19.8, 518, 'Syarat dan Ketentuan:', { b: true }),
+        BX(19.83, 526.2, 75.7, 0.49)
+      );
+      TERMS.forEach((t, k) =>
+        o.push(
+          TL(19.8, [527.7, 536.4, 545.2, 553.9, 562.6][k], t, {
+            b: true,
+            s: 7.2,
+          })
+        )
+      );
+    }
+
+    if (last) {
+      // ringkasan nominal
+      const lab = [
+        'Sub Total 1',
+        'Diskon',
+        'Sub Total 2',
+        `Ppn ${Math.round(po.rate * 100)}%`,
+        'Ongkir',
+        'TOTAL',
+      ];
+      const val = [sub, po.disc, c.s2, c.ppn, ong, c.total];
+      for (let k = 0; k <= 6; k++)
+        o.push(BX(443.74, 513.19 + dy + 10.32 * k, 128.18, 0.48));
+      o.push(
+        BX(443.26, 513.19 + dy, 0.48, 62.4),
+        BX(510.46, 513.19 + dy, 0.48, 62.4)
+      );
+      if (big) o.push(BX(571.44, 559.87, 0.48, 62.45)); // garis kanan kotak ringkasan (mode dua kolom tidak punya garis tepi tabel yang memanjang ke bawah)
+      lab.forEach((s, k) => {
+        o.push(
+          TL(445.1, 514.8 + dy + 10.3 * k, s, { b: true }),
+          TL(515.4, 515.2 + dy + 10.32 * k, 'Rp', { b: true })
+        );
+        o.push(
+          TR(567.6, 515.2 + dy + 10.32 * k, val[k] ? en(val[k]) : '-', {
+            b: true,
+          })
+        );
+      });
+      // terbilang
+      o.push(
+        TL(18.4, 578.9 + dy, 'Terbilang', { b: true }),
+        BX(72.5, 577.63 + dy, 499.3, 10.44, '#d9d9d9')
+      );
+      o.push(
+        TL(74.1, 579.4 + dy, esc(terbilang(c.total)), {
+          b: true,
+          i: true,
+          w: 495,
+        })
+      );
+      // catatan
+      o.push(
+        `<svg class="r" style="left:16.5pt;top:${
+          601.3 + dy
+        }pt;width:214.7pt;height:82.5pt" viewBox="0 0 214.7 82.5"><rect x=".26" y=".26" width="214.18" height="81.98" rx="13.7" ry="13.7" fill="none" stroke="#000" stroke-width=".51"/></svg>`
+      );
+      o.push(TL(27.5, 604.5 + dy, 'Catatan:', { b: true, s: 8.1 }));
+      if (po.note)
+        o.push(
+          `<div class="t wrap" style="left:27.5pt;top:${
+            616 + dy
+          }pt;width:196pt;height:62pt">${esc(po.note)}</div>`
+        );
+      // tanda tangan
+      const sx = [309.67, 370.56, 432.92, 494.24, 556.45];
+      [603.21, 611.8, 664.9, 673.69].forEach((yy) =>
+        o.push(BX(309.67, yy + dy, 246.78, 0.3))
+      );
+      sx.forEach((x) => o.push(BX(x, 603.21 + dy, 0.3, 70.78)));
+      [
+        'Diajukan oleh',
+        'Diketahui oleh',
+        'Disetujui oleh',
+        'Diterima Supplier',
+      ].forEach((s, k) =>
+        o.push(
+          TC((sx[k] + sx[k + 1]) / 2, 604.8 + dy, s, { b: true, s: 7.2, w: 60 })
+        )
+      );
+      {
+        const fs = fitSize(po.by, 56, 8.2);
+        o.push(
+          `<div class="t" style="left:309.67pt;top:${
+            664.9 + dy
+          }pt;width:60.89pt;height:8.79pt;padding:0 1.5pt 1.6pt;display:flex;align-items:center;justify-content:center;overflow:visible;font-size:${fs}pt;line-height:${fs}pt">${esc(
+            po.by
+          )}</div>`
+        );
+      }
+    } else {
+      o.push(
+        TR(570, big ? 553 : 516, 'Bersambung ke halaman berikutnya…', {
+          i: true,
+          s: 7.2,
+          w: 200,
+        })
+      );
+    }
+
+    // footer
+    o.push(
+      BX(17.04, 695.14 + dy, 554.88, 0.48),
+      BX(17.04, 705.46 + dy, 554.88, 0.48)
+    );
+    [16.56, 190.49, 354.91, 510.46, 571.44].forEach((x) =>
+      o.push(BX(x, 695.62 + dy, 0.48, 10.32))
+    );
+    o.push(
+      TL(18.4, 696.9 + dy, `No. Dokumen : ${FORM_DOC.dok}`),
+      TL(192.3, 696.9 + dy, `Revisi : ${FORM_DOC.rev}`),
+      TL(356.7, 696.9 + dy, `Tanggal terbit : ${FORM_DOC.terbit}`),
+      TL(512.3, 696.9 + dy, `Halaman : ${pi + 1}/${total}`)
+    );
+    return `<div class="sheet">${o.join('')}</div>`;
+  };
+
+  return `<!DOCTYPE html><html lang="id"><head><meta charset="utf-8"><title>PO ${esc(
+    po.no
+  )}</title><style>${DOC_CSS}</style></head><body>${pages
+    .map((r, i) => sheet(r, i))
+    .join('')}</body></html>`;
+}
+
+/* Tampilan dokumen PO + tombol cetak/download. Dipakai admin (halaman Dokumen PO) dan user (popup). */
+/** teks tooltip tombol cetak yang belum bisa dipakai user */
+const waitTip = (p: PO) =>
+  p.rej ? 'Pengajuan ditolak admin' : 'Menunggu approve admin';
+function PoViewer({
+  po,
+  list,
+  onPick,
+  onClose,
+  onBack,
+  backLabel,
+  canPrint = true,
+  admin = false,
+  onPrinted,
+}: {
+  po: PO;
+  list?: PO[];
+  onPick?: (no: string) => void;
+  onClose?: () => void;
+  onBack?: () => void;
+  backLabel?: string;
+  canPrint?: boolean;
+  admin?: boolean;
+  onPrinted?: (no: string) => void;
+}) {
+  const html = useMemo(() => poHtml(po), [po]);
+  const pn = po.printN ?? 0;
+  const blocked = !admin && pn > 0 && !po.printOk; // user: sudah dicetak, tunggu izin admin
+  const blockTip = `Sudah dicetak ${pn}× — hanya admin yang bisa mengizinkan cetak ulang`;
+  const frame = useRef<HTMLIFrameElement>(null);
+  const box = useRef<HTMLDivElement>(null);
+  const [h, setH] = useState(1140);
+  const [sc, setSc] = useState(1);
+
+  useEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    const fit = () =>
+      setSc(Math.min(1, Math.max(0.3, (el.clientWidth - 24) / 794)));
+    fit();
+    const ro = new ResizeObserver(fit);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const loaded = () => {
+    const d = frame.current?.contentDocument;
+    if (d) setH(d.documentElement.scrollHeight);
+  };
+  const print = () => {
+    const w = frame.current?.contentWindow;
+    if (!w) return;
+    if (
+      admin &&
+      pn > 0 &&
+      !window.confirm(
+        `PO ini sudah dicetak ${pn}×. Cetak lagi? (akan tercatat di riwayat perubahan)`
+      )
+    )
+      return;
+    const t = document.title;
+    document.title = 'PO ' + po.no.split('/').join('-'); // nama file default saat Simpan sebagai PDF
+    w.focus();
+    w.print();
+    window.setTimeout(() => {
+      document.title = t;
+    }, 1500);
+    onPrinted?.(po.no);
+  };
+  // membuka tab baru = bisa dicetak dari sana, jadi dihitung sebagai cetak juga
+  const newTab = () => {
+    if (
+      admin &&
+      pn > 0 &&
+      !window.confirm(`PO ini sudah dicetak ${pn}×. Buka & cetak lagi?`)
+    )
+      return;
+    window.open(
+      URL.createObjectURL(new Blob([html], { type: 'text/html' })),
+      '_blank'
+    );
+    onPrinted?.(po.no);
+  };
+
+  return (
+    <div className="viewer">
+      <div className="vbar">
+        {list && (
+          <div className="vsel">
+            <label>Pilih Nomor PO</label>
+            <select value={po.no} onChange={(e) => onPick?.(e.target.value)}>
+              {list.map((p) => (
+                <option key={p.no} value={p.no}>
+                  {p.no} — {p.v.nama} ({p.dept})
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+        <div className="vinfo">
+          <b>{po.no}</b>
+          <small>
+            {po.v.nama} · {fmt(po.iso)} · {rp(po.total)}
+          </small>
+        </div>
+        <div className="vact">
+          {onBack && (
+            <button onClick={onBack}>
+              <Ic n="left" s={14} /> {backLabel ?? 'Kembali'}
+            </button>
+          )}
+          {canPrint && blocked ? (
+            <span className="tipw" data-tip={blockTip}>
+              <button type="button" className="prred" aria-disabled="true">
+                🖨 Sudah dicetak {pn}×
+              </button>
+            </span>
+          ) : canPrint ? (
+            <button className="pri prgreen" onClick={print}>
+              🖨 Cetak / Download PDF
+            </button>
+          ) : (
+            <span className="tipw" data-tip={waitTip(po)}>
+              <button type="button" className="off" aria-disabled="true">
+                🖨 Cetak / Download PDF
+              </button>
+            </span>
+          )}
+          {canPrint && blocked ? (
+            <span className="tipw" data-tip={blockTip}>
+              <button type="button" className="off" aria-disabled="true">
+                Buka di tab baru
+              </button>
+            </span>
+          ) : canPrint ? (
+            <button onClick={newTab}>Buka di tab baru</button>
+          ) : (
+            <span className="tipw" data-tip={waitTip(po)}>
+              <button type="button" className="off" aria-disabled="true">
+                Buka di tab baru
+              </button>
+            </span>
+          )}
+          {onClose && <button onClick={onClose}>Tutup</button>}
+        </div>
+      </div>
+      <p className="mute small">
+        Ukuran A4 portrait. Pada dialog cetak pilih printer, atau pilih “Simpan
+        sebagai PDF” untuk mengunduh. Atur Margin = None/Tidak ada dan Skala =
+        100%.
+      </p>
+      <div className="vpaper" ref={box}>
+        <div style={{ width: 794 * sc, height: h * sc }}>
+          <iframe
+            ref={frame}
+            title={'PO ' + po.no}
+            srcDoc={html}
+            onLoad={loaded}
+            style={{
+              width: 794,
+              height: h,
+              transform: `scale(${sc})`,
+              transformOrigin: '0 0',
+            }}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* Cari riwayat PO berdasarkan supplier, lalu salin ke form */
+function History({
+  list,
+  onApply,
+}: {
+  list: PO[];
+  onApply: (p: PO, picked: number[] | null) => void;
+}) {
+  const [q, setQ] = useState('');
+  const [open, setOpen] = useState('');
+  const [sel, setSel] = useState<number[]>([]);
+  const [drop, setDrop] = useState(true);
+  const key = q.trim().toLowerCase();
+  const rows = [...list]
+    .sort((a, b) => b.iso.localeCompare(a.iso))
+    .filter((p) => !key || p.v.nama.toLowerCase().includes(key));
+  const shown = rows.slice(0, 6);
+  const toggle = (p: PO) => {
+    if (open === p.no) return setOpen('');
+    setOpen(p.no);
+    setSel(p.items.map((_, n) => n));
+  };
+  return (
+    <Card ic="search" title="Cari Riwayat PO (berdasarkan Supplier)">
+      <div className="body">
+        <p className="mute small">
+          Ketik nama supplier untuk menyalin data supplier dan item, lalu
+          sesuaikan pembeliannya. Nomor PO baru dibuat otomatis saat request
+          dikirim.
+        </p>
+        <div className="ifld cmb">
+          <span className="ico">
+            <Ic n="search" s={18} />
+          </span>
+          <input
+            value={q}
+            onChange={(e) => {
+              setQ(e.target.value);
+              setDrop(true);
+            }}
+            placeholder="Ketik nama supplier..."
+          />
+          <button
+            type="button"
+            className="arr"
+            aria-label={drop ? 'Sembunyikan riwayat' : 'Tampilkan riwayat'}
+            onClick={() => setDrop((d) => !d)}
+          >
+            <Ic n={drop ? 'down' : 'up'} s={18} />
+          </button>
+        </div>
+        {drop && list.length === 0 && (
+          <div className="mute">Belum ada riwayat PO di departemen Anda.</div>
+        )}
+        {drop && list.length > 0 && shown.length === 0 && (
+          <div className="mute">Tidak ada supplier yang cocok.</div>
+        )}
+        {drop &&
+          shown.map((p) => (
+            <div className="hist" key={p.no}>
+              <button type="button" className="hhead" onClick={() => toggle(p)}>
+                <span className="hi">
+                  <Ic n="building" s={22} />
+                </span>
+                <span className="ht">
+                  <b>{p.v.nama}</b>
+                  <small>
+                    {p.no} · {fmt(p.iso)} · {p.items.length} item ·{' '}
+                    {rp(p.total)}
+                  </small>
+                </span>
+                <Ic n={open === p.no ? 'up' : 'down'} s={18} />
+              </button>
+              {open === p.no && (
+                <div className="hbody">
+                  {p.items.map((l, n) => (
+                    <label key={n} className="chk">
+                      <input
+                        type="checkbox"
+                        checked={sel.includes(n)}
+                        onChange={() =>
+                          setSel((x) =>
+                            x.includes(n) ? x.filter((i) => i !== n) : [...x, n]
+                          )
+                        }
+                      />
+                      <span>
+                        {l.d} — {l.q} {l.s} × {rp(l.p)}
+                      </span>
+                    </label>
+                  ))}
+                  <div className="acts">
+                    <button className="ghost" onClick={() => onApply(p, null)}>
+                      Salin supplier saja
+                    </button>
+                    <button
+                      className="pri"
+                      disabled={!sel.length}
+                      onClick={() =>
+                        onApply(
+                          p,
+                          [...sel].sort((a, b) => a - b)
+                        )
+                      }
+                    >
+                      Salin supplier + item terpilih
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          ))}
+        {drop && rows.length > shown.length && (
+          <div className="mute small" style={{ marginTop: 8 }}>
+            Menampilkan {shown.length} dari {rows.length} riwayat. Persempit
+            pencarian.
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+/* ================= PANDUAN KATEGORI (popup untuk user saat mengisi Form PO) ================= */
+function CatGuide({
+  cats,
+  current,
+  onPick,
+  onClose,
+}: {
+  cats: Cat[];
+  current: string;
+  onPick: (name: string) => void;
+  onClose: () => void;
+}) {
+  const [q, setQ] = useState('');
+  const [t, setT] = useState<'all' | CatType>('all');
+  const rows = cats.filter(
+    (c) => !c.off && (t === 'all' || c.type === t) && catMatch(c, q)
+  );
+  return (
+    <div
+      className="modal"
+      onClick={(e) => e.target === e.currentTarget && onClose()}
+    >
+      <div className="viewer">
+        <div className="vbar">
+          <div className="vinfo">
+            <b>Panduan Kategori Barang/Jasa</b>
+            <small>
+              Cari barang/jasa yang akan dibeli, lalu klik Pilih pada kategori
+              yang sesuai.
+            </small>
+          </div>
+          <div className="vact">
+            <button onClick={onClose}>Tutup</button>
+          </div>
+        </div>
+        <div className="bar">
+          <input
+            autoFocus
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Cari, mis. helm, laptop, servis AC, ekspedisi..."
+            aria-label="Cari kategori"
+          />
+          <div className="cseg">
+            {(['all', 'Barang', 'Jasa'] as const).map((x) => (
+              <button
+                key={x}
+                className={t === x ? 'on' : ''}
+                onClick={() => setT(x)}
+              >
+                {x === 'all' ? 'Semua' : x}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="tbl" style={{ maxHeight: '60vh', overflowY: 'auto' }}>
+          <table>
+            <thead>
+              <tr>
+                <th>Nama Kategori</th>
+                <th>Tipe</th>
+                <th>Deskripsi</th>
+                <th>Contoh Pengajuan PO</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((c) => (
+                <tr key={c.name}>
+                  <td>
+                    <b>{c.name}</b>
+                  </td>
+                  <td>
+                    <span
+                      className={'tag ' + (c.type === 'Jasa' ? 's-Done' : '')}
+                    >
+                      {c.type}
+                    </span>
+                  </td>
+                  <td>{c.desc ?? '-'}</td>
+                  <td>{c.ex ?? '-'}</td>
+                  <td>
+                    <div className="acts sm">
+                      <button className="pri" onClick={() => onPick(c.name)}>
+                        {c.name === current ? 'Dipilih' : 'Pilih'}
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+              {!rows.length && (
+                <tr>
+                  <td colSpan={5} className="empty">
+                    Tidak ada kategori yang cocok dengan “{q}”. Coba kata lain,
+                    atau hubungi admin untuk menambah kategori.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ================= FORM PO ================= */
+function Form({
+  me,
+  pos,
+  draft,
+  cats,
+  bps,
+  cfg,
+  onSubmit,
+  notify,
+  fixedNo,
+  readOnly,
+  onBack,
+}: {
+  me: User;
+  pos: PO[];
+  draft: Draft | null;
+  cats: Cat[];
+  bps: BP[];
+  cfg: NumCfg;
+  onSubmit: (p: PO) => void;
+  notify: (m: string) => void;
+  fixedNo?: string | null; // nomor PO yang sedang diperbaiki/dilihat (null = pengajuan baru)
+  readOnly?: boolean; // mode lihat saja (admin): semua isian terkunci
+  onBack?: () => void; // tombol Batal (edit) / Kembali (lihat)
+}) {
+  const [v, setV] = useState<Vendor>(draft?.v ?? EMPTY);
+  const [pay, setPay] = useState<Pay>(draft?.pay ?? EMPTY_PAY);
+  const [items, setItems] = useState<Item[]>(draft?.items ?? [newItem()]);
+  const [cat, setCat] = useState<string>(
+    draft?.items.find((x) => x.k)?.k ?? ''
+  ); // satu kategori untuk seluruh item dalam PO
+  const [guide, setGuide] = useState(false); // popup panduan kategori
+  const [tax, setTax] = useState(draft?.rate ?? '');
+  const [disc, setDisc] = useState(draft?.disc ?? '');
+  const [ong, setOng] = useState(draft?.ong ?? '');
+  const [note, setNote] = useState(draft?.note ?? '');
+  const [infoOpen, setInfoOpen] = useState(true);
+
+  const sub = useMemo(
+    () =>
+      items.reduce((a, i) => a + (Number(i.q) || 0) * (Number(i.p) || 0), 0),
+    [items]
+  );
+  const rate = Number(tax) || 0;
+  const dv = Number(disc) || 0;
+  const ov = Number(ong) || 0;
+  const { ppn, total: grand } = calc(sub, rate, dv, ov);
+  const sv = (k: keyof Vendor, val: string) =>
+    setV((x) => ({ ...x, [k]: val }));
+  const sp = (k: keyof Pay, val: string) => setPay((x) => ({ ...x, [k]: val }));
+  const si = (id: number, k: keyof Item, val: string) =>
+    setItems((l) => l.map((i) => (i.id === id ? { ...i, [k]: val } : i)));
+  const history = pos.filter((p) => sameDept(p.dept, me.dept));
+  const bp = v.nama.trim()
+    ? bps.find((b) => b.nama.toLowerCase() === v.nama.trim().toLowerCase())
+    : undefined;
+  const bi = bp ? bpInfo(bp.exp) : null;
+  const bpWarn =
+    bp && bi && (bi.expired || bi.soon) ? (
+      <div className={'bpw' + (bi.expired ? ' bad' : '')}>
+        {bi.expired
+          ? `⚠ Supplier BP ${bp.kode} sudah Expired sejak ${fmtD(bp.exp)}.`
+          : `⚠ Supplier BP ${bp.kode} akan Expired ${fmtD(bp.exp)} (${
+              bi.days
+            } hari lagi).`}
+      </div>
+    ) : null;
+
+  // Salin dari riwayat: supplier + pembayaran selalu diganti; item terpilih ditambahkan ke daftar item
+  const apply = (p: PO, picked: number[] | null) => {
+    setV({ ...p.v });
+    setPay({ ...(p.pay ?? EMPTY_PAY) });
+    if (picked) {
+      const k0 = p.items[picked[0]]?.k;
+      if (!cat && k0) setCat(k0);
+      setItems((l) => [
+        ...l.filter((i) => i.d.trim() || i.q || i.s || i.p),
+        ...picked.map((n) =>
+          newItem({
+            d: p.items[n].d,
+            q: String(p.items[n].q),
+            s: p.items[n].s,
+            p: String(p.items[n].p),
+            k: p.items[n].k ?? '',
+          })
+        ),
+      ]);
+    }
+    notify(
+      picked
+        ? 'Supplier & item disalin. Sesuaikan qty/harga. Nomor PO baru dibuat otomatis.'
+        : 'Data supplier & pembayaran disalin. Lengkapi item barang.'
+    );
+  };
+
+  const activeCats = cats.filter((c) => !c.off);
+  // pilih kategori sekali untuk seluruh PO; untuk tipe Jasa satuan item yang kosong otomatis "Jasa"
+  const pickCat = (name: string) => {
+    setCat(name);
+    if (cats.find((c) => c.name === name)?.type === 'Jasa')
+      setItems((l) => l.map((i) => (i.s ? i : { ...i, s: 'Jasa' })));
+  };
+  const catObj = cats.find((c) => c.name === cat);
+  const send = () => {
+    const yr = new Date().getFullYear();
+    if (lockedYear(cfg, yr))
+      return notify(
+        `Periode ${yr} terkunci oleh admin. PO baru belum bisa dibuat.`
+      );
+    const { fax, ...must } = v;
+    void fax;
+    if (
+      Object.values(must).some((x) => !x.trim()) ||
+      Object.values(pay).some((x) => !x.trim()) ||
+      !tax
+    )
+      return notify('Lengkapi semua isian bertanda *');
+    if (
+      items.some(
+        (i) => !i.d.trim() || !(Number(i.q) > 0) || !i.s || !(Number(i.p) > 0)
+      )
+    )
+      return notify('Lengkapi detail setiap item');
+    if (!activeCats.some((c) => c.name === cat))
+      return notify(
+        cat
+          ? `Kategori "${cat}" sudah nonaktif. Pilih kategori lain.`
+          : 'Pilih kategori barang/jasa terlebih dahulu'
+      );
+    onSubmit({
+      no: fixedNo ?? nextNo(pos, cfg),
+      iso: new Date().toISOString(),
+      dept: me.dept,
+      uid: me.id,
+      by: me.nama,
+      v,
+      pay,
+      items: items.map((i) => ({
+        d: i.d,
+        q: Number(i.q),
+        s: i.s,
+        p: Number(i.p),
+        k: cat,
+      })),
+      sub,
+      rate,
+      disc: dv,
+      ong: ov,
+      note: note.trim(),
+      total: grand,
+      status: 'Open',
+      ...(!fixedNo && draft?.prev ? { prevNo: draft.prev } : {}),
+    });
+  };
+
+  return (
+    <div className="two">
+      {guide && (
+        <CatGuide
+          cats={cats}
+          current={cat}
+          onClose={() => setGuide(false)}
+          onPick={(n) => {
+            pickCat(n);
+            setGuide(false);
+          }}
+        />
+      )}
+      <div className="cl">
+        <fieldset
+          disabled={readOnly}
+          style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}
+        >
+          <History list={history} onApply={apply} />
+        </fieldset>
+      </div>
+      <div className="cr">
+        {readOnly && (
+          <div className="info">
+            <span>
+              Mode lihat saja — isian pengajuan ini tidak dapat diubah.
+            </span>{' '}
+            <button type="button" className="ghost" onClick={onBack}>
+              Kembali
+            </button>
+          </div>
+        )}
+        <Card ic="file" title="Data PO">
+          <div className="body">
+            <div className="info">
+              <Ic n="gear" s={20} />
+              <span>
+                {readOnly
+                  ? 'Menampilkan isian pengajuan (mode lihat saja).'
+                  : fixedNo
+                  ? 'Perbaikan pengajuan ditolak — nomor pengajuan tetap sama.'
+                  : 'Nomor pengajuan dibuat otomatis saat request dikirim.'}
+              </span>
+            </div>
+            <div className="kvi">
+              <div>
+                <span>
+                  <Ic n="file" s={18} />
+                  No. Pengajuan
+                </span>
+                <b>
+                  {fixedNo ?? nextNo(pos, cfg)}{' '}
+                  <em className="tag">
+                    {fixedNo ? (readOnly ? 'Lihat' : 'Perbaikan') : 'Auto'}
+                  </em>
+                </b>
+              </div>
+              <div>
+                <span>
+                  <Ic n="calendar" s={18} />
+                  Tanggal
+                </span>
+                <b>{fmt(draft?.iso ?? new Date().toISOString())}</b>
+              </div>
+              <div>
+                <span>
+                  <Ic n="building" s={18} />
+                  Departemen
+                </span>
+                <b>{me.dept}</b>
+              </div>
+              <div>
+                <span>
+                  <Ic n="user" s={18} />
+                  Pemohon
+                </span>
+                <b>{me.nama}</b>
+              </div>
+            </div>
+            <div className="sum">
+              <div>
+                <span>
+                  <Ic n="receipt" s={18} />
+                  Subtotal
+                </span>
+                <span>{rp(sub)}</span>
+              </div>
+              <div>
+                <span>
+                  <Ic n="receipt" s={18} />
+                  Discount
+                </span>
+                <span>{rp(dv)}</span>
+              </div>
+              <div>
+                <span>
+                  <Ic n="receipt" s={18} />
+                  Pajak{rate ? ` (${Math.round(rate * 100)}%)` : ''}
+                </span>
+                <span>{rp(ppn)}</span>
+              </div>
+              <div>
+                <span>
+                  <Ic n="truck" s={18} />
+                  Ongkir
+                </span>
+                <span>{rp(ov)}</span>
+              </div>
+              <div className="gt">
+                <span>
+                  <Ic n="coins" s={22} />
+                  Grand Total
+                </span>
+                <span>{rp(grand)}</span>
+              </div>
+            </div>
+          </div>
+        </Card>
+      </div>
+      <div className="cl">
+        <fieldset
+          disabled={readOnly}
+          style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}
+        >
+          <Card ic="fileList" title="A. General Information">
+            <div className="body gi">
+              <Field label="1. Nama Vendor" req>
+                <IF ic="building">
+                  <input
+                    list="bp-list"
+                    value={v.nama}
+                    onChange={(e) => sv('nama', e.target.value)}
+                    placeholder="Masukkan nama vendor"
+                  />
+                </IF>
+                <datalist id="bp-list">
+                  {bps.map((b) => (
+                    <option key={b.id} value={b.nama}>
+                      {b.kode}
+                    </option>
+                  ))}
+                </datalist>
+                {bpWarn}
+              </Field>
+              <Field label="2. Alamat Vendor" req>
+                <IF ic="pin">
+                  <textarea
+                    rows={1}
+                    value={v.alamat}
+                    onChange={(e) => sv('alamat', e.target.value)}
+                    placeholder="Masukkan alamat vendor lengkap"
+                  />
+                </IF>
+              </Field>
+              <Field label="3. Email Vendor" req>
+                <IF ic="mail">
+                  <input
+                    type="email"
+                    value={v.email}
+                    onChange={(e) => sv('email', e.target.value)}
+                    placeholder="contoh@supplier.com"
+                  />
+                </IF>
+              </Field>
+              <Field label="4. NPWP" req>
+                <IF ic="file">
+                  <input
+                    value={v.npwp}
+                    onChange={(e) => sv('npwp', e.target.value)}
+                    placeholder="Masukkan NPWP vendor"
+                  />
+                </IF>
+              </Field>
+              <Field label="5. No. Fax (jika ada)">
+                <IF ic="printer">
+                  <input
+                    value={v.fax}
+                    onChange={(e) => sv('fax', e.target.value)}
+                    placeholder="Masukkan nomor fax"
+                  />
+                </IF>
+              </Field>
+              <Field label="6. Nama PIC Vendor" req>
+                <IF ic="user">
+                  <input
+                    value={v.pic}
+                    onChange={(e) => sv('pic', e.target.value)}
+                    placeholder="Masukkan nama PIC vendor"
+                  />
+                </IF>
+              </Field>
+              <Field label="7. No. Telepon Vendor" req>
+                <IF ic="phone">
+                  <input
+                    value={v.telp}
+                    onChange={(e) => sv('telp', e.target.value)}
+                    placeholder="021-12345678"
+                  />
+                </IF>
+              </Field>
+            </div>
+          </Card>
+        </fieldset>
+      </div>
+      <div className="cr">
+        <fieldset
+          disabled={readOnly}
+          style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}
+        >
+          <Card title="C. Pajak & Discount">
+            <div className="body grid3">
+              <Field label="1. Pajak" req>
+                <select value={tax} onChange={(e) => setTax(e.target.value)}>
+                  <option value="">Pilih Pajak</option>
+                  <option value="0.11">PPN 11%</option>
+                  <option value="0.12">PPN 12%</option>
+                </select>
+              </Field>
+              <Field label="2. Discount (Nominal)">
+                <input
+                  type="number"
+                  min="0"
+                  value={disc}
+                  onChange={(e) => setDisc(e.target.value)}
+                  placeholder="Rp 0"
+                />
+              </Field>
+              <Field label="3. Ongkir (Nominal)">
+                <input
+                  type="number"
+                  min="0"
+                  value={ong}
+                  onChange={(e) => setOng(e.target.value)}
+                  placeholder="Rp 0"
+                />
+              </Field>
+              <Field label="4. Grand Total (Otomatis)">
+                <input readOnly value={rp(grand)} />
+              </Field>
+            </div>
+          </Card>
+        </fieldset>
+      </div>
+      <div className="cl">
+        <fieldset
+          disabled={readOnly}
+          style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}
+        >
+          <Card ic="box" title="B. Detail Barang / Jasa">
+            <div className="body">
+              <div style={{ marginBottom: 12 }}>
+                <Field
+                  label="Kategori Barang / Jasa (cukup dipilih sekali untuk semua item)"
+                  req
+                >
+                  <select value={cat} onChange={(e) => pickCat(e.target.value)}>
+                    <option value="">Pilih kategori</option>
+                    {cat && !activeCats.some((c) => c.name === cat) && (
+                      <option value={cat} disabled>
+                        {cat} (nonaktif)
+                      </option>
+                    )}
+                    {(['Barang', 'Jasa'] as CatType[]).map(
+                      (t) =>
+                        activeCats.some((c) => c.type === t) && (
+                          <optgroup key={t} label={t}>
+                            {activeCats
+                              .filter((c) => c.type === t)
+                              .map((c) => (
+                                <option key={c.name} value={c.name}>
+                                  {c.name}
+                                </option>
+                              ))}
+                          </optgroup>
+                        )
+                    )}
+                  </select>
+                  <button
+                    type="button"
+                    className="lnk small"
+                    style={{ marginTop: 4 }}
+                    onClick={() => setGuide(true)}
+                  >
+                    Bingung pilih kategori? Lihat panduan &amp; contoh
+                  </button>
+                  {catObj?.desc && (
+                    <div className="mute small" style={{ marginTop: 4 }}>
+                      {catObj.desc}. Kebutuhan dengan kategori lain diajukan di
+                      PO terpisah.
+                    </div>
+                  )}
+                </Field>
+              </div>
+              {items.map((i, n) => (
+                <div className="item" key={i.id}>
+                  <div className="ihead">
+                    <b>Item {n + 1}</b>
+                    <button
+                      aria-label="Hapus item"
+                      title="Hapus item"
+                      onClick={() =>
+                        items.length > 1
+                          ? setItems((l) => l.filter((x) => x.id !== i.id))
+                          : notify('Minimal 1 item')
+                      }
+                    >
+                      <Ic n="trash" s={16} />
+                    </button>
+                  </div>
+                  {(() => {
+                    const exs = (catObj?.ex ?? '')
+                      .split(',')
+                      .map((x) => x.trim())
+                      .filter(Boolean)
+                      .map((x) => x.charAt(0).toUpperCase() + x.slice(1));
+                    return exs.length ? (
+                      <div className="exs">
+                        <small>Pilih barang/jasa untuk kategori ini:</small>
+                        {exs.map((x) => (
+                          <button
+                            type="button"
+                            key={x}
+                            onClick={() => si(i.id, 'd', x)}
+                          >
+                            {x}
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="exs">
+                        <small>
+                          {cat
+                            ? 'Ketik deskripsi barang/jasa di bawah.'
+                            : 'Pilih kategori di atas dulu untuk melihat contoh barang/jasa.'}
+                        </small>
+                      </div>
+                    );
+                  })()}
+                  <div className="r1">
+                    <Field label="1. Description Barang / Jasa" req>
+                      <input
+                        value={i.d}
+                        onChange={(e) => si(i.id, 'd', e.target.value)}
+                        placeholder="Masukkan deskripsi barang/jasa"
+                      />
+                    </Field>
+                    <Field label="2. Qty" req>
+                      <input
+                        type="number"
+                        min="0"
+                        value={i.q}
+                        onChange={(e) => si(i.id, 'q', e.target.value)}
+                        placeholder="0"
+                      />
+                    </Field>
+                    <Field label="3. Satuan" req>
+                      <select
+                        value={i.s}
+                        onChange={(e) => si(i.id, 's', e.target.value)}
+                      >
+                        <option value="">Pilih</option>
+                        {UNITS.map((u) => (
+                          <option key={u}>{u}</option>
+                        ))}
+                      </select>
+                    </Field>
+                  </div>
+                  <div
+                    className="r2"
+                    style={{ gridTemplateColumns: 'repeat(2,minmax(0,1fr))' }}
+                  >
+                    <Field label="4. Unit Price / Harga Satuan (Rp)" req>
+                      <input
+                        type="number"
+                        min="0"
+                        value={i.p}
+                        onChange={(e) => si(i.id, 'p', e.target.value)}
+                        placeholder="0"
+                      />
+                    </Field>
+                    <Field label="5. Total / Jumlah (Rp)">
+                      <input
+                        readOnly
+                        value={rp((Number(i.q) || 0) * (Number(i.p) || 0))}
+                      />
+                    </Field>
+                  </div>
+                </div>
+              ))}
+              <p>
+                <button
+                  className="pri"
+                  onClick={() =>
+                    setItems((l) => [
+                      ...l,
+                      newItem(
+                        catObj?.type === 'Jasa' ? { s: 'Jasa' } : undefined
+                      ),
+                    ])
+                  }
+                >
+                  <Ic n="plus" s={16} /> Tambah Item
+                </button>
+              </p>
+            </div>
+          </Card>
+        </fieldset>
+      </div>
+      <div className="cr">
+        <fieldset
+          disabled={readOnly}
+          style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}
+        >
+          <Card ic="card" title="D. Informasi Pembayaran">
+            <div className="body grid">
+              <Field label="1. No. Rekening" req>
+                <input
+                  value={pay.rek}
+                  onChange={(e) => sp('rek', e.target.value)}
+                  placeholder="Masukkan nomor rekening"
+                  inputMode="numeric"
+                />
+              </Field>
+              <Field label="2. Nama Bank" req>
+                <input
+                  value={pay.bank}
+                  onChange={(e) => sp('bank', e.target.value)}
+                  placeholder="Contoh: BCA, Mandiri, BNI"
+                />
+              </Field>
+              <Field label="3. Kantor Cabang" req>
+                <input
+                  value={pay.cabang}
+                  onChange={(e) => sp('cabang', e.target.value)}
+                  placeholder="Masukkan kantor cabang"
+                />
+              </Field>
+              <Field label="4. Atas Nama" req>
+                <input
+                  value={pay.an}
+                  onChange={(e) => sp('an', e.target.value)}
+                  placeholder="Masukkan nama pemilik rekening"
+                />
+              </Field>
+            </div>
+          </Card>
+
+          <div className="card fold">
+            <button
+              type="button"
+              className="fhead"
+              onClick={() => setInfoOpen((x) => !x)}
+              aria-expanded={infoOpen}
+            >
+              <Ic n="info" s={20} />
+              <b>Informasi Tambahan</b>
+              <span className="sp" />
+              <Ic n={infoOpen ? 'up' : 'down'} s={18} />
+            </button>
+            {infoOpen && (
+              <div className="body">
+                <textarea
+                  rows={3}
+                  maxLength={250}
+                  value={note}
+                  onChange={(e) => setNote(e.target.value)}
+                  placeholder="Masukkan catatan atau informasi tambahan jika diperlukan..."
+                />
+              </div>
+            )}
+          </div>
+        </fieldset>
+        {!readOnly && (
+          <div className="actions">
+            <button
+              className="l"
+              onClick={() => {
+                setV(EMPTY);
+                setPay(EMPTY_PAY);
+                setItems([newItem()]);
+                setTax('');
+                setDisc('');
+                setOng('');
+                setNote('');
+              }}
+            >
+              Reset Form
+            </button>
+            {onBack && (
+              <button className="ghost" onClick={onBack}>
+                Batal
+              </button>
+            )}
+            <button className="pri" onClick={send}>
+              Kirim Request
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ================= TABEL PO (user & admin) ================= */
+function PoTable({
+  list,
+  onCopy,
+  onPrint,
+  onDone,
+  onReject,
+  onReopen,
+  lockedOf,
+  onResend,
+  resendOf,
+  onAllowReprint,
+  onEdit,
+  onNewFrom,
+  aksiLabel,
+}: {
+  list: PO[];
+  onCopy: (p: PO, all: boolean) => void;
+  onPrint: (no: string) => void;
+  onDone?: (no: string) => void;
+  onReject?: (no: string) => void;
+  onReopen?: (no: string) => void;
+  lockedOf?: (p: PO) => boolean;
+  onResend?: (p: PO) => void;
+  resendOf?: (p: PO) => boolean;
+  onAllowReprint?: (no: string) => void;
+  onEdit?: (p: PO) => void; // buka form terisi data PO ditolak untuk diperbaiki
+  onNewFrom?: (p: PO) => void; // PO Reject final: buat PO baru (nomor baru) dari data PO lama
+  aksiLabel?: string; // label kolom terakhir (default 'Aksi')
+}) {
+  const [open, setOpen] = useState('');
+  if (!list.length)
+    return <div className="empty">Belum ada data pengajuan.</div>;
+  const rows = [...list].sort((a, b) => b.iso.localeCompare(a.iso)); // terbaru di atas
+  return (
+    <div className="tbl">
+      <table>
+        <thead>
+          <tr>
+            <th>No. Pengajuan</th>
+            <th>Waktu Submit</th>
+            <th>Departemen</th>
+            <th>Vendor</th>
+            <th>Pemohon</th>
+            <th>Total</th>
+            <th>Status</th>
+            <th>{aksiLabel ?? 'Aksi'}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((p) => {
+            const done = p.status === 'Done';
+            const lk = lockedOf?.(p) ?? false;
+            const pn = p.printN ?? 0;
+            const printLocked = pn > 0 && !p.printOk; // sudah dicetak: user tidak bisa cetak lagi sampai admin mengizinkan
+            return (
+              <Fragment key={p.no}>
+                <tr>
+                  <td>
+                    <button
+                      type="button"
+                      className="lnk"
+                      title="Lihat & cetak dokumen PO"
+                      onClick={() => onPrint(p.no)}
+                    >
+                      <b>{p.no}</b>
+                    </button>
+                    {lk && (
+                      <span
+                        className="tag s-wait"
+                        style={{ marginLeft: 6 }}
+                        title="Periode tahun ini terkunci"
+                      >
+                        🔒
+                      </span>
+                    )}
+                  </td>
+                  <td>{fmtDT(p.iso)}</td>
+                  <td>{p.dept}</td>
+                  <td>{p.v.nama}</td>
+                  <td>{p.by}</td>
+                  <td className="num">{rp(p.total)}</td>
+                  <td>
+                    <span
+                      className={
+                        'tag ' +
+                        (p.rej ? 's-rejected' : 's-' + (done ? 'Done' : 'Open'))
+                      }
+                    >
+                      {p.rej ? 'Rejected' : done ? 'Done' : 'Open'}
+                    </span>
+                    {p.rej && (
+                      <div className="note bad">
+                        {p.rejFinal ? 'PO Reject' : 'Ditolak'} {fmtDT(p.rej)}
+                        {p.rejWhy && (
+                          <>
+                            <br />
+                            Alasan: {p.rejWhy}
+                          </>
+                        )}
+                        {p.rejFinal && (
+                          <>
+                            <br />
+                            <b>
+                              {p.newNo
+                                ? `Diganti PO baru: ${p.newNo}`
+                                : 'PO ini tidak bisa diedit lagi. Buat PO baru (nomor baru).'}
+                            </b>
+                          </>
+                        )}
+                      </div>
+                    )}
+                    {p.prevNo && (
+                      <div className="note">Pengganti PO reject {p.prevNo}</div>
+                    )}
+                    {!p.rej && !done && p.resent && (
+                      <div className="note">
+                        Dikirim ulang {fmtDT(p.resent)}
+                      </div>
+                    )}
+                    {done && (
+                      <div className="note">
+                        {p.doneAt ? `Selesai ${fmtDT(p.doneAt)}` : ''}
+                        <br />
+                        <b>✔ PO sudah bisa dicetak</b>
+                        {pn > 0 && (
+                          <>
+                            <br />
+                            <span className="prnote">
+                              🖨 Dicetak {pn}×
+                              {p.printAt
+                                ? ` · terakhir ${fmtDT(p.printAt)}`
+                                : ''}
+                              {p.printOk ? ' · cetak ulang diizinkan' : ''}
+                            </span>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </td>
+                  <td>
+                    <div className="abtn">
+                      {onDone && !lk && !done && !p.rej && (
+                        <button className="pri" onClick={() => onDone(p.no)}>
+                          Done
+                        </button>
+                      )}
+                      {onReject && !lk && !done && !p.rej && (
+                        <button className="cx" onClick={() => onReject(p.no)}>
+                          Cancel
+                        </button>
+                      )}
+                      {onNewFrom &&
+                        p.rejFinal &&
+                        !p.newNo &&
+                        !lk &&
+                        (resendOf ? resendOf(p) : true) && (
+                          <button className="pri" onClick={() => onNewFrom(p)}>
+                            Buat PO Baru
+                          </button>
+                        )}
+                      {onResend &&
+                        p.rej &&
+                        !p.rejFinal &&
+                        !lk &&
+                        (resendOf ? resendOf(p) : true) && (
+                          <button className="pri" onClick={() => onResend(p)}>
+                            Kirim Ulang
+                          </button>
+                        )}
+                      {onEdit &&
+                        p.rej &&
+                        !p.rejFinal &&
+                        !lk &&
+                        (resendOf ? resendOf(p) : true) && (
+                          <button className="ghost" onClick={() => onEdit(p)}>
+                            Edit PO
+                          </button>
+                        )}
+                      {onReopen && !lk && !p.rejFinal && (done || p.rej) && (
+                        <button
+                          className="ghost"
+                          onClick={() => onReopen(p.no)}
+                        >
+                          Buka Lagi
+                        </button>
+                      )}
+                      {onAllowReprint && done && printLocked && (
+                        <button
+                          className="ghost"
+                          title="Izinkan user mencetak PO ini sekali lagi (tercatat di riwayat)"
+                          onClick={() => onAllowReprint(p.no)}
+                        >
+                          Izinkan Cetak Ulang
+                        </button>
+                      )}
+                      {done && !onDone && printLocked ? (
+                        <span
+                          className="tipw"
+                          data-tip={`Sudah dicetak ${pn}× — hanya admin yang bisa mengizinkan cetak ulang`}
+                        >
+                          <button
+                            type="button"
+                            className="ghost prred"
+                            aria-disabled="true"
+                          >
+                            Cetak PO
+                          </button>
+                        </span>
+                      ) : done || onDone ? (
+                        <button
+                          className={
+                            'ghost ' +
+                            (done
+                              ? printLocked
+                                ? 'prred adm'
+                                : 'prgreen'
+                              : '')
+                          }
+                          title={
+                            done && printLocked
+                              ? `Sudah dicetak ${pn}× (admin tetap bisa mencetak ulang)`
+                              : undefined
+                          }
+                          onClick={() => onPrint(p.no)}
+                        >
+                          Cetak PO
+                        </button>
+                      ) : (
+                        <span className="tipw" data-tip={waitTip(p)}>
+                          <button
+                            type="button"
+                            className="ghost off"
+                            aria-disabled="true"
+                          >
+                            Cetak PO
+                          </button>
+                        </span>
+                      )}
+                      <button
+                        className="ghost"
+                        onClick={() => setOpen(open === p.no ? '' : p.no)}
+                      >
+                        Detail
+                      </button>
+                      <button
+                        className="ghost"
+                        onClick={() => onCopy(p, false)}
+                      >
+                        Salin Vendor
+                      </button>
+                      <button className="ghost" onClick={() => onCopy(p, true)}>
+                        Salin Semua
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+                {open === p.no && (
+                  <tr>
+                    <td colSpan={8} className="detail">
+                      <div>
+                        <b>{p.v.nama}</b> · PIC {p.v.pic} · {p.v.telp}
+                        {p.v.fax && ` · Fax ${p.v.fax}`} · {p.v.email}
+                        <br />
+                        {p.v.alamat} · NPWP {p.v.npwp}
+                      </div>
+                      {p.pay && (
+                        <div>
+                          Pembayaran: {p.pay.bank} · {p.pay.cabang} · No. Rek{' '}
+                          {p.pay.rek} a.n. {p.pay.an}
+                        </div>
+                      )}
+                      <ul>
+                        {p.items.map((l, n) => (
+                          <li key={n}>
+                            {l.d} — {l.q} {l.s} × {rp(l.p)} = {rp(l.q * l.p)}
+                          </li>
+                        ))}
+                      </ul>
+                      <div>
+                        Subtotal {rp(p.sub)} · Discount {rp(p.disc)} · Pajak{' '}
+                        {Math.round(p.rate * 100)}%
+                        {p.ong ? ` · Ongkir ${rp(p.ong)}` : ''} ·{' '}
+                        <b>Grand Total {rp(p.total)}</b>
+                      </div>
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* ================= PENGATURAN TAMPILAN (admin): logo & background login, logo sidebar ================= */
+function BrandSettings({
+  brand,
+  setBrand,
+  notify,
+}: {
+  brand: Brand;
+  setBrand: (f: (b: Brand) => Brand) => void;
+  notify: (m: string) => void;
+}) {
+  const pick = async (f: File | undefined, kind: 'logo' | 'bg' | 'side') => {
+    if (!f) return;
+    if (!f.type.startsWith('image/'))
+      return notify('File harus berupa gambar (PNG/JPG/WebP).');
+    if (f.size > 8 * 1024 * 1024) return notify('Ukuran file maksimal 8 MB.');
+    try {
+      const url =
+        kind === 'bg'
+          ? await readImage(f, 1800, 'image/jpeg')
+          : await readImage(f, 500, 'image/png');
+      setBrand((b) => ({ ...b, [kind]: url }));
+      notify(
+        kind === 'logo'
+          ? 'Logo login diperbarui.'
+          : kind === 'side'
+          ? 'Logo sidebar diperbarui.'
+          : 'Background login diperbarui.'
+      );
+    } catch (e) {
+      notify(e instanceof Error ? e.message : 'Gagal memproses gambar');
+    }
+  };
+  const file = (label: string, kind: 'logo' | 'bg' | 'side') => (
+    <label className="btnfile">
+      {label}
+      <input
+        type="file"
+        accept="image/*"
+        hidden
+        onChange={(e) => {
+          void pick(e.target.files?.[0], kind);
+          e.target.value = '';
+        }}
+      />
+    </label>
+  );
+  return (
+    <Card ic="gear" title="Tampilan Halaman Login & Sidebar">
+      <div className="body">
+        <p className="mute">
+          Logo tampil di tengah atas kartu login (latar putih), disusul tulisan
+          “PO Request System”. Background, transparansi kartu, dan logo sidebar
+          juga diatur di sini.
+        </p>
+        <div className="grid3">
+          <div>
+            <label>Logo login</label>
+            <div className="prev logo">
+              <img src={brand.logo || LOGO_TIGHT} alt="Logo" />
+            </div>
+            <div className="acts" style={{ marginTop: 8 }}>
+              {file('Unggah logo', 'logo')}
+              {brand.logo && (
+                <button onClick={() => setBrand((b) => ({ ...b, logo: '' }))}>
+                  Kembalikan bawaan
+                </button>
+              )}
+            </div>
+          </div>
+          <div>
+            <label>Background login</label>
+            <div
+              className="prev bg"
+              style={
+                brand.bg ? { backgroundImage: `url("${brand.bg}")` } : undefined
+              }
+            >
+              {!brand.bg && <span>Bawaan (gradien biru)</span>}
+            </div>
+            <div className="acts" style={{ marginTop: 8 }}>
+              {file('Unggah background', 'bg')}
+              {brand.bg && (
+                <button onClick={() => setBrand((b) => ({ ...b, bg: '' }))}>
+                  Hapus background
+                </button>
+              )}
+            </div>
+          </div>
+          <div>
+            <label>Logo sidebar (putih/transparan)</label>
+            <div className="prev side">
+              <SideLogo src={brand.side} box={brand.sideBox} />
+            </div>
+            <div className="acts" style={{ marginTop: 8 }}>
+              {file('Unggah logo sidebar', 'side')}
+              {brand.side && (
+                <button onClick={() => setBrand((b) => ({ ...b, side: '' }))}>
+                  Kembalikan bawaan
+                </button>
+              )}
+            </div>
+            <label className="chk">
+              <input
+                type="checkbox"
+                checked={brand.sideBox !== false}
+                onChange={(e) =>
+                  setBrand((b) => ({ ...b, sideBox: e.target.checked }))
+                }
+              />
+              <span>Tampilkan di kotak putih (mengikuti ukuran logo)</span>
+            </label>
+            <p className="mute small">
+              Logo ini menggantikan tulisan ARGAPURA di sidebar. Matikan centang
+              hanya jika logo berupa PNG transparan berwarna putih.
+            </p>
+          </div>
+        </div>
+        <div style={{ marginTop: 16, maxWidth: 420 }}>
+          <label>Transparansi kartu login: {brand.glass}%</label>
+          <input
+            type="range"
+            min={0}
+            max={100}
+            step={5}
+            value={brand.glass}
+            onChange={(e) =>
+              setBrand((b) => ({ ...b, glass: Number(e.target.value) }))
+            }
+          />
+          <p className="mute small">
+            0% = kartu lebih pekat, 100% = hampir bening sehingga background
+            terlihat jelas.
+          </p>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+/* ================= HALAMAN-HALAMAN (data diturunkan dari riwayat PO) ================= */
+type SupRow = { v: Vendor; pay?: Pay; n: number; total: number; last: string };
+const supplierRows = (list: PO[]): SupRow[] => {
+  const m = new Map<string, SupRow>();
+  [...list]
+    .sort((a, b) => a.iso.localeCompare(b.iso))
+    .forEach((p) => {
+      const k = p.v.nama.trim().toLowerCase();
+      const x = m.get(k);
+      m.set(k, {
+        v: p.v,
+        pay: p.pay,
+        n: (x?.n ?? 0) + 1,
+        total: (x?.total ?? 0) + p.total,
+        last: p.iso,
+      });
+    });
+  return [...m.values()].sort((a, b) => b.last.localeCompare(a.last));
+};
+type PriceHist = { p: number; last: string; qty: number; n: number }; // riwayat per harga: tanggal order terakhir di harga tsb, total qty, jumlah order
+type ItemRow = {
+  d: string;
+  s: string;
+  p: number;
+  k: string;
+  n: number;
+  qty: number;
+  h: PriceHist[];
+};
+const itemRows = (list: PO[]): ItemRow[] => {
+  const m = new Map<string, ItemRow>();
+  [...list]
+    .sort((a, b) => a.iso.localeCompare(b.iso))
+    .forEach((po) =>
+      po.items.forEach((l) => {
+        const key = l.d.trim().toLowerCase();
+        const x = m.get(key);
+        const h = x ? [...x.h] : [];
+        const i = h.findIndex((e) => e.p === l.p);
+        if (i >= 0)
+          h[i] = { p: l.p, last: po.iso, qty: h[i].qty + l.q, n: h[i].n + 1 };
+        else h.push({ p: l.p, last: po.iso, qty: l.q, n: 1 });
+        m.set(key, {
+          d: l.d,
+          s: l.s,
+          p: l.p,
+          k: l.k ?? x?.k ?? '',
+          n: (x?.n ?? 0) + 1,
+          qty: (x?.qty ?? 0) + l.q,
+          h,
+        });
+      })
+    );
+  // harga terbaru (order terakhir) paling atas
+  m.forEach((r) => r.h.sort((a, b) => b.last.localeCompare(a.last)));
+  return [...m.values()].sort((a, b) => b.n - a.n || a.d.localeCompare(b.d));
+};
+
+/* Drill-down: seluruh transaksi (supplier, nama barang, harga, tanggal) untuk satu barang/jasa, terbaru di atas */
+type ItemTrx = {
+  no: string;
+  iso: string;
+  vendor: string;
+  d: string;
+  q: number;
+  s: string;
+  p: number;
+};
+const itemTrx = (list: PO[], key: string): ItemTrx[] => {
+  const o: ItemTrx[] = [];
+  list.forEach((po) =>
+    po.items.forEach((l) => {
+      if (l.d.trim().toLowerCase() === key)
+        o.push({
+          no: po.no,
+          iso: po.iso,
+          vendor: po.v.nama,
+          d: l.d,
+          q: l.q,
+          s: l.s,
+          p: l.p,
+        });
+    })
+  );
+  return o.sort((x, y) => y.iso.localeCompare(x.iso));
+};
+
+function SupplierPage({
+  list,
+  onUse,
+}: {
+  list: PO[];
+  onUse?: (r: SupRow) => void;
+}) {
+  const [q, setQ] = useState('');
+  const rows = supplierRows(list).filter(
+    (r) => !q.trim() || r.v.nama.toLowerCase().includes(q.trim().toLowerCase())
+  );
+  const pg = usePager(rows, 15);
+  return (
+    <Card ic="users" title="Supplier dari Riwayat PO">
+      <div className="body">
+        <div className="bar">
+          <div className="ifld grow">
+            <span className="ico">
+              <Ic n="search" s={18} />
+            </span>
+            <input
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="Cari nama supplier..."
+            />
+          </div>
+        </div>
+        {!rows.length ? (
+          <div className="empty">
+            Belum ada data supplier. Supplier tersimpan otomatis dari PO yang
+            diajukan.
+          </div>
+        ) : (
+          <div className="tbl">
+            <table>
+              <thead>
+                <tr>
+                  <th>Supplier</th>
+                  <th>PIC / Kontak</th>
+                  <th>Email</th>
+                  <th>Jumlah PO</th>
+                  <th>Total Nilai</th>
+                  <th>PO Terakhir</th>
+                  {onUse && <th>Keterangan</th>}
+                </tr>
+              </thead>
+              <tbody>
+                {pg.view.map((r) => (
+                  <tr key={r.v.nama}>
+                    <td>
+                      <b>{r.v.nama}</b>
+                      <div className="mute small">
+                        {r.v.alamat.split('\n')[0]}
+                      </div>
+                    </td>
+                    <td>
+                      {r.v.pic}
+                      <div className="mute small">{r.v.telp}</div>
+                    </td>
+                    <td>{r.v.email}</td>
+                    <td>{r.n}</td>
+                    <td className="num">{rp(r.total)}</td>
+                    <td>{fmt(r.last)}</td>
+                    {onUse && (
+                      <td>
+                        <button className="ghost" onClick={() => onUse(r)}>
+                          Buat PO
+                        </button>
+                      </td>
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <Pager page={pg.page} pages={pg.pages} onPage={pg.setPage} />
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+function BPPage({
+  bps,
+  setBps,
+  canEdit,
+  notify,
+}: {
+  bps: BP[];
+  setBps: (f: (b: BP[]) => BP[]) => void;
+  canEdit: boolean;
+  notify: (m: string) => void;
+}) {
+  const nextKode = () =>
+    'BP-' +
+    String(
+      bps.reduce((m, b) => {
+        const x = /^BP-(\d+)$/i.exec(b.kode.trim());
+        return x ? Math.max(m, Number(x[1])) : m;
+      }, 0) + 1
+    ).padStart(3, '0');
+  const [f, setF] = useState({ kode: '', nama: '', exp: '' });
+  const [eid, setEid] = useState('');
+  const [q, setQ] = useState('');
+  const [fs, setFs] = useState('');
+  const all = bps.map((b) => ({ b, i: bpInfo(b.exp) }));
+  const rows = all
+    .filter(
+      ({ b, i }) =>
+        (!fs || (fs === 'Expired') === i.expired) &&
+        (!q.trim() ||
+          (b.kode + ' ' + b.nama)
+            .toLowerCase()
+            .includes(q.trim().toLowerCase()))
+    )
+    .sort((x, y) => x.b.nama.localeCompare(y.b.nama));
+  const pg = usePager(rows, 15);
+  const reset = () => {
+    setF({ kode: '', nama: '', exp: '' });
+    setEid('');
+  };
+  const save = () => {
+    const kode = f.kode.trim().toUpperCase() || nextKode();
+    const nama = f.nama.trim();
+    if (!nama || !f.exp)
+      return notify('Isi nama supplier dan tanggal expired.');
+    if (bps.some((b) => b.id !== eid && b.kode === kode))
+      return notify('Kode BP sudah dipakai.');
+    if (
+      bps.some(
+        (b) => b.id !== eid && b.nama.toLowerCase() === nama.toLowerCase()
+      )
+    )
+      return notify('Nama supplier BP sudah terdaftar.');
+    if (eid)
+      setBps((l) =>
+        l.map((b) => (b.id === eid ? { ...b, kode, nama, exp: f.exp } : b))
+      );
+    else
+      setBps((l) => [...l, { id: 'bp' + Date.now(), kode, nama, exp: f.exp }]);
+    notify(eid ? 'Supplier BP diperbarui.' : 'Supplier BP ditambahkan.');
+    reset();
+  };
+  const edit = (b: BP) => {
+    setEid(b.id);
+    setF({ kode: b.kode, nama: b.nama, exp: parseExp(b.exp) ?? '' });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+  const del = (b: BP) => {
+    if (window.confirm(`Hapus supplier BP "${b.nama}"?`))
+      setBps((l) => l.filter((x) => x.id !== b.id));
+  };
+  return (
+    <>
+      <div className="stats">
+        <div className="card stat">
+          <span>Total Supplier BP</span>
+          <b>{all.length}</b>
+        </div>
+        <div className="card stat">
+          <span>Aktif</span>
+          <b>{all.filter((x) => !x.i.expired && !x.i.bad).length}</b>
+        </div>
+        <div className="card stat">
+          <span>Segera Exp (≤ 30 hari)</span>
+          <b>{all.filter((x) => x.i.soon).length}</b>
+        </div>
+        <div className="card stat">
+          <span>Expired</span>
+          <b>{all.filter((x) => x.i.expired).length}</b>
+        </div>
+      </div>
+      <Card ic="users" title="Supplier BP (Business Partner)">
+        <div className="body">
+          {canEdit ? (
+            <div className="bpbox">
+              <b>{eid ? 'Ubah Supplier BP' : 'Tambah Supplier BP'}</b>
+              <div className="bpf">
+                <Field label="Kode BP">
+                  <input
+                    value={f.kode}
+                    onChange={(e) =>
+                      setF((x) => ({ ...x, kode: e.target.value }))
+                    }
+                    placeholder={nextKode()}
+                  />
+                </Field>
+                <Field label="Nama Supplier BP" req>
+                  <input
+                    value={f.nama}
+                    onChange={(e) =>
+                      setF((x) => ({ ...x, nama: e.target.value }))
+                    }
+                    placeholder="Nama supplier / business partner"
+                  />
+                </Field>
+                <Field label="Tanggal Exp" req>
+                  <input
+                    type="date"
+                    value={f.exp}
+                    onChange={(e) =>
+                      setF((x) => ({ ...x, exp: e.target.value }))
+                    }
+                  />
+                </Field>
+                <div className="acts">
+                  <button className="pri" onClick={save}>
+                    <Ic n={eid ? 'check' : 'plus'} s={16} />{' '}
+                    {eid ? 'Simpan' : 'Tambah'}
+                  </button>
+                  {(eid || f.nama || f.exp || f.kode) && (
+                    <button onClick={reset}>Batal</button>
+                  )}
+                </div>
+              </div>
+              <p className="mute small">
+                Status otomatis: Aktif selama tanggal expired belum lewat,
+                Expired bila sudah lewat.
+              </p>
+            </div>
+          ) : (
+            <p className="mute small">
+              Data Supplier BP dikelola oleh admin. Gunakan supplier berstatus
+              Aktif untuk pengajuan PO.
+            </p>
+          )}
+          <div className="bar">
+            <div className="ifld grow">
+              <span className="ico">
+                <Ic n="search" s={18} />
+              </span>
+              <input
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+                placeholder="Cari kode / nama supplier BP..."
+              />
+            </div>
+            <select value={fs} onChange={(e) => setFs(e.target.value)}>
+              <option value="">Semua status</option>
+              <option>Aktif</option>
+              <option>Expired</option>
+            </select>
+          </div>
+          {!rows.length ? (
+            <div className="empty">Belum ada data Supplier BP.</div>
+          ) : (
+            <div className="tbl">
+              <table className="bpt">
+                <thead>
+                  <tr>
+                    <th>Kode BP</th>
+                    <th>Nama Supplier BP</th>
+                    <th>Status</th>
+                    <th>Tanggal Exp</th>
+                    <th>Sisa Waktu</th>
+                    {canEdit && <th>Keterangan</th>}
+                  </tr>
+                </thead>
+                <tbody>
+                  {pg.view.map(({ b, i }) => (
+                    <tr key={b.id}>
+                      <td>
+                        <b>{b.kode}</b>
+                      </td>
+                      <td>{b.nama}</td>
+                      <td>
+                        <span
+                          className={
+                            'bpst ' +
+                            (i.expired ? 'ex' : i.soon || i.bad ? 'so' : 'ak')
+                          }
+                        >
+                          <i />
+                          {i.bad
+                            ? 'Cek tanggal'
+                            : i.expired
+                            ? 'Expired'
+                            : i.soon
+                            ? 'Segera Exp'
+                            : 'Aktif'}
+                        </span>
+                      </td>
+                      <td>{fmtD(b.exp)}</td>
+                      <td
+                        className={
+                          i.expired || i.bad ? 'bad' : i.soon ? 'warnt' : ''
+                        }
+                      >
+                        {i.bad
+                          ? 'Format tanggal tidak terbaca'
+                          : i.expired
+                          ? `Lewat ${-i.days} hari`
+                          : i.days === 0
+                          ? 'Berakhir hari ini'
+                          : `${i.days} hari lagi`}
+                      </td>
+                      {canEdit && (
+                        <td>
+                          <select
+                            className="actsel"
+                            value=""
+                            aria-label={'Tindakan untuk ' + b.nama}
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              if (v === 'edit') edit(b);
+                              else if (v === 'del') del(b);
+                            }}
+                          >
+                            <option value="">Pilih tindakan…</option>
+                            <option value="edit">Edit</option>
+                            <option value="del">Delete</option>
+                          </select>
+                        </td>
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <Pager page={pg.page} pages={pg.pages} onPage={pg.setPage} />
+            </div>
+          )}
+        </div>
+      </Card>
+    </>
+  );
+}
+
+function BarangPage({
+  list,
+  onUse,
+}: {
+  list: PO[];
+  onUse?: (r: ItemRow) => void;
+}) {
+  const [q, setQ] = useState('');
+  const [sel, setSel] = useState<string | null>(null); // kunci barang yang sedang di-drill down
+  const rows = itemRows(list).filter(
+    (r) => !q.trim() || r.d.toLowerCase().includes(q.trim().toLowerCase())
+  );
+  const pg = usePager(rows, 15);
+  useEffect(() => {
+    if (!sel) return;
+    const k = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setSel(null);
+    };
+    window.addEventListener('keydown', k);
+    return () => window.removeEventListener('keydown', k);
+  }, [sel]);
+
+  const item = sel
+    ? itemRows(list).find((r) => r.d.trim().toLowerCase() === sel)
+    : undefined;
+  if (sel && item) {
+    const trx = itemTrx(list, sel);
+    const prices = trx.map((t) => t.p);
+    const lo = Math.min(...prices),
+      hi = Math.max(...prices);
+    return (
+      <Card ic="box" title="Detail Barang / Jasa">
+        <div className="body drill">
+          <div className="drhead">
+            <button className="ghost back" onClick={() => setSel(null)}>
+              <Ic n="left" s={14} /> Kembali
+            </button>
+            <div className="drttl">
+              <b>{item.d}</b>
+              <small>
+                {item.k || 'Tanpa kategori'} · Satuan {item.s}
+              </small>
+            </div>
+            {onUse && (
+              <button className="pri" onClick={() => onUse(item)}>
+                Pakai di PO
+              </button>
+            )}
+          </div>
+          <div className="drstat">
+            <div>
+              <small>Jumlah Transaksi</small>
+              <b>{trx.length}×</b>
+            </div>
+            <div>
+              <small>Total Qty</small>
+              <b>
+                {item.qty.toLocaleString('id-ID')} {item.s}
+              </b>
+            </div>
+            <div>
+              <small>Harga Terakhir</small>
+              <b>{rp(trx[0].p)}</b>
+            </div>
+            <div>
+              <small>Rentang Harga</small>
+              <b>{lo === hi ? rp(lo) : rp(lo) + ' – ' + rp(hi)}</b>
+            </div>
+          </div>
+          <div className="tbl">
+            <table>
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Supplier / Vendor</th>
+                  <th>Nama Barang</th>
+                  <th>Harga</th>
+                  <th>Qty</th>
+                  <th>Tanggal</th>
+                  <th>No. Pengajuan</th>
+                </tr>
+              </thead>
+              <tbody>
+                {trx.map((t, i) => (
+                  <tr key={t.no + i} className={i === 0 ? 'cur' : ''}>
+                    <td>{i + 1}</td>
+                    <td>
+                      <b>{t.vendor}</b>
+                    </td>
+                    <td>
+                      {t.d}
+                      {i === 0 && <span className="tnew2">Terbaru</span>}
+                    </td>
+                    <td className="num">{rp(t.p)}</td>
+                    <td>
+                      {t.q.toLocaleString('id-ID')} {t.s}
+                    </td>
+                    <td>{fmt(t.iso)}</td>
+                    <td>{t.no}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <Pager page={pg.page} pages={pg.pages} onPage={pg.setPage} />
+          </div>
+        </div>
+      </Card>
+    );
+  }
+
+  return (
+    <Card ic="box" title="Daftar Barang">
+      <div className="body">
+        <div className="bar">
+          <div className="ifld grow">
+            <span className="ico">
+              <Ic n="search" s={18} />
+            </span>
+            <input
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="Cari nama barang / jasa..."
+            />
+          </div>
+        </div>
+        {!rows.length ? (
+          <div className="empty">
+            Belum ada barang. Daftar terisi otomatis dari item PO yang diajukan.
+          </div>
+        ) : (
+          <div className="tbl">
+            <table>
+              <thead>
+                <tr>
+                  <th>Barang / Jasa</th>
+                  <th>Kategori</th>
+                  <th>Satuan</th>
+                  <th>Harga Terakhir</th>
+                  <th>Dipesan</th>
+                  <th>Total Qty</th>
+                  {onUse && <th>Keterangan</th>}
+                </tr>
+              </thead>
+              <tbody>
+                {pg.view.map((r) => (
+                  <tr
+                    key={r.d}
+                    className="rowlink"
+                    tabIndex={0}
+                    title="Klik untuk melihat detail transaksi"
+                    onClick={() => setSel(r.d.trim().toLowerCase())}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') setSel(r.d.trim().toLowerCase());
+                    }}
+                  >
+                    <td>
+                      <b>{r.d}</b>
+                    </td>
+                    <td>{r.k || '-'}</td>
+                    <td>{r.s}</td>
+                    <td className="num">{rp(r.p)}</td>
+                    <td>
+                      <span className="drlnk">
+                        {r.n}× <Ic n="right" s={13} />
+                      </span>
+                    </td>
+                    <td>{r.qty.toLocaleString('id-ID')}</td>
+                    {onUse && (
+                      <td>
+                        <button
+                          className="ghost"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onUse(r);
+                          }}
+                        >
+                          Pakai di PO
+                        </button>
+                      </td>
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+function KategoriPage({
+  cats,
+  setCats,
+  setPos,
+  list,
+  canEdit,
+  notify,
+}: {
+  cats: Cat[];
+  setCats: (f: (c: Cat[]) => Cat[]) => void;
+  setPos: (f: (p: PO[]) => PO[]) => void;
+  list: PO[];
+  canEdit: boolean;
+  notify: (m: string) => void;
+}) {
+  const [v, setV] = useState('');
+  const [vt, setVt] = useState<CatType>('Barang');
+  const [vd, setVd] = useState('');
+  const [vx, setVx] = useState('');
+  const [q, setQ] = useState('');
+  const [tf, setTf] = useState<'all' | CatType>('all');
+  const [eid, setEid] = useState<string | null>(null); // nama kategori yang sedang diedit
+  const [en, setEn] = useState('');
+  const [et, setEt] = useState<CatType>('Barang');
+  const [ed, setEd] = useState('');
+  const [ex, setEx] = useState('');
+  const count = (c: string) =>
+    list.reduce((a, p) => a + p.items.filter((l) => l.k === c).length, 0);
+  const dup = (t: string, except?: string) =>
+    cats.some(
+      (c) => c.name.toLowerCase() === t.toLowerCase() && c.name !== except
+    );
+  const add = () => {
+    const t = v.trim();
+    if (!canEdit || !t) return;
+    if (dup(t)) return notify('Kategori sudah ada.');
+    setCats((c) => [
+      ...c,
+      { name: t, type: vt, desc: vd.trim(), ex: vx.trim() },
+    ]);
+    setV('');
+    setVd('');
+    setVx('');
+    notify(`Kategori "${t}" (${vt}) ditambahkan.`);
+  };
+  const startEdit = (c: Cat) => {
+    setEid(c.name);
+    setEn(c.name);
+    setEt(c.type);
+    setEd(c.desc ?? '');
+    setEx(c.ex ?? '');
+  };
+  const saveEdit = () => {
+    const old = eid;
+    const t = en.trim();
+    if (!canEdit || old === null) return;
+    if (!t) return notify('Nama kategori tidak boleh kosong.');
+    if (dup(t, old)) return notify('Nama kategori sudah dipakai.');
+    const n = count(old);
+    if (
+      t !== old &&
+      n > 0 &&
+      !window.confirm(
+        `Ganti nama "${old}" menjadi "${t}"? ${n} item PO lama ikut diperbarui.`
+      )
+    )
+      return;
+    setCats((l) =>
+      l.map((c) =>
+        c.name === old
+          ? { ...c, name: t, type: et, desc: ed.trim(), ex: ex.trim() }
+          : c
+      )
+    );
+    if (t !== old)
+      setPos((l) =>
+        l.map((p) =>
+          p.items.some((i) => i.k === old)
+            ? {
+                ...p,
+                items: p.items.map((i) => (i.k === old ? { ...i, k: t } : i)),
+              }
+            : p
+        )
+      );
+    setEid(null);
+    notify(
+      t !== old ? `Kategori diubah menjadi "${t}".` : 'Kategori diperbarui.'
+    );
+  };
+  const del = (c: Cat) => {
+    if (!canEdit || count(c.name) > 0) return;
+    if (!window.confirm(`Hapus kategori "${c.name}"? (belum pernah dipakai)`))
+      return;
+    setCats((l) => l.filter((x) => x.name !== c.name));
+  };
+  const shown = cats
+    .map((c, i) => ({ c, no: i + 1 }))
+    .filter(
+      ({ c }) => !c.off && (tf === 'all' || c.type === tf) && catMatch(c, q)
+    );
+  const pg = usePager(shown, 15);
+  return (
+    <Card ic="tag" title="Master Kategori PO">
+      <div className="body">
+        <p className="mute">
+          Pengelompokan kebutuhan barang dan jasa untuk pengajuan Purchase
+          Order. Bingung masuk kategori apa? Cari barang/jasa yang akan dibeli
+          di kolom pencarian, lihat contohnya, lalu pilih kategori yang sesuai
+          di Form PO.{' '}
+          {canEdit
+            ? 'Admin mengatur nama, tipe, deskripsi, dan contoh kategori.'
+            : 'Daftar kategori diatur oleh admin.'}
+        </p>
+        {canEdit && (
+          <div className="bar" style={{ flexWrap: 'wrap' }}>
+            <input
+              value={v}
+              onChange={(e) => setV(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && add()}
+              placeholder="Nama kategori baru"
+            />
+            <select
+              value={vt}
+              onChange={(e) => setVt(e.target.value as CatType)}
+              aria-label="Tipe kategori"
+            >
+              <option>Barang</option>
+              <option>Jasa</option>
+            </select>
+            <input
+              value={vd}
+              onChange={(e) => setVd(e.target.value)}
+              placeholder="Deskripsi"
+            />
+            <input
+              value={vx}
+              onChange={(e) => setVx(e.target.value)}
+              placeholder="Contoh pengajuan (pisahkan dengan koma)"
+            />
+            <button className="pri" onClick={add}>
+              <Ic n="plus" s={16} /> Tambah
+            </button>
+          </div>
+        )}
+        <div className="bar" style={{ flexWrap: 'wrap' }}>
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Cari kategori, deskripsi, atau contoh (mis. laptop, APAR, ekspedisi)..."
+            aria-label="Cari kategori"
+          />
+          <div className="cseg">
+            {(['all', 'Barang', 'Jasa'] as const).map((x) => (
+              <button
+                key={x}
+                className={tf === x ? 'on' : ''}
+                onClick={() => setTf(x)}
+              >
+                {x === 'all' ? 'Semua' : x}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="tbl ctbl">
+          <table>
+            <thead>
+              <tr>
+                <th>No.</th>
+                <th>Nama Kategori</th>
+                <th>Tipe</th>
+                <th>Deskripsi</th>
+                <th>Contoh Pengajuan PO</th>
+                {canEdit && (
+                  <>
+                    <th>Item dipesan</th>
+                    <th>Keterangan</th>
+                  </>
+                )}
+              </tr>
+            </thead>
+            <tbody>
+              {pg.view.map(({ c, no }) => {
+                const e = eid === c.name;
+                return (
+                  <tr
+                    key={c.name}
+                    style={c.off ? { opacity: 0.65 } : undefined}
+                  >
+                    <td>{no}</td>
+                    <td>
+                      {e ? (
+                        <input
+                          value={en}
+                          onChange={(x) => setEn(x.target.value)}
+                          onKeyDown={(x) => x.key === 'Enter' && saveEdit()}
+                          aria-label="Nama kategori"
+                        />
+                      ) : (
+                        <b>{c.name}</b>
+                      )}
+                    </td>
+                    <td>
+                      {e ? (
+                        <select
+                          value={et}
+                          onChange={(x) => setEt(x.target.value as CatType)}
+                          aria-label="Tipe kategori"
+                        >
+                          <option>Barang</option>
+                          <option>Jasa</option>
+                        </select>
+                      ) : (
+                        <span
+                          className={
+                            'tag ' + (c.type === 'Jasa' ? 's-Done' : '')
+                          }
+                        >
+                          {c.type}
+                        </span>
+                      )}
+                    </td>
+                    <td>
+                      {e ? (
+                        <input
+                          value={ed}
+                          onChange={(x) => setEd(x.target.value)}
+                          aria-label="Deskripsi"
+                        />
+                      ) : (
+                        c.desc || '-'
+                      )}
+                    </td>
+                    <td>
+                      {e ? (
+                        <input
+                          value={ex}
+                          onChange={(x) => setEx(x.target.value)}
+                          aria-label="Contoh pengajuan"
+                        />
+                      ) : (
+                        c.ex || '-'
+                      )}
+                    </td>
+                    {canEdit && (
+                      <>
+                        <td>{count(c.name)}</td>
+                        <td>
+                          <div className="acts sm fx">
+                            {e ? (
+                              <>
+                                <button className="pri" onClick={saveEdit}>
+                                  Save
+                                </button>
+                                <button
+                                  className="ghost"
+                                  onClick={() => setEid(null)}
+                                >
+                                  Cancel
+                                </button>
+                              </>
+                            ) : (
+                              <>
+                                <button
+                                  className="ghost"
+                                  onClick={() => startEdit(c)}
+                                >
+                                  <Ic n="edit" s={12} /> Edit
+                                </button>
+                                <button
+                                  className="ghost"
+                                  disabled={count(c.name) > 0}
+                                  title={
+                                    count(c.name) > 0
+                                      ? 'Sudah dipakai di PO, tidak bisa dihapus'
+                                      : 'Hapus kategori'
+                                  }
+                                  onClick={() => del(c)}
+                                >
+                                  Delete
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        </td>
+                      </>
+                    )}
+                  </tr>
+                );
+              })}
+              {!shown.length && (
+                <tr>
+                  <td colSpan={canEdit ? 7 : 5} className="empty">
+                    Tidak ada kategori yang cocok
+                    {q.trim() ? ` dengan “${q.trim()}”` : ''}. Coba kata kunci
+                    lain.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+          <Pager page={pg.page} pages={pg.pages} onPage={pg.setPage} />
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function HistoryPage({ rows, admin }: { rows: Hist[]; admin: boolean }) {
+  const [q, setQ] = useState('');
+  const key = q.trim().toLowerCase();
+  const list = rows.filter(
+    (h) =>
+      !key ||
+      (h.by + ' ' + h.dept + ' ' + h.no + ' ' + h.what)
+        .toLowerCase()
+        .includes(key)
+  );
+  const pg = usePager(list, 15);
+  return (
+    <Card ic="clock" title="Change History">
+      <div className="body">
+        <div className="bar">
+          <div className="ifld grow">
+            <span className="ico">
+              <Ic n="search" s={18} />
+            </span>
+            <input
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="Cari akun / bagian / no. PO / perubahan..."
+            />
+          </div>
+        </div>
+        <p className="mute small" style={{ margin: '0 0 8px' }}>
+          {admin
+            ? 'Semua perubahan dari seluruh akun.'
+            : 'Perubahan yang Anda lakukan dan perubahan pada PO milik Anda.'}{' '}
+          Terbaru di atas · {list.length} catatan.
+        </p>
+        {!list.length ? (
+          <div className="empty">
+            Belum ada riwayat perubahan. Perubahan pengajuan, status, dan
+            tracking PO akan tercatat otomatis di sini.
+          </div>
+        ) : (
+          <div className="tbl">
+            <table>
+              <thead>
+                <tr>
+                  <th>No</th>
+                  <th>Akun</th>
+                  <th>Tanggal</th>
+                  <th>Jam</th>
+                  <th>Bagian</th>
+                  <th>No. PO</th>
+                  <th>Yang Diupdate</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pg.view.map((h, i) => (
+                  <tr key={h.id}>
+                    <td>{(pg.page - 1) * 15 + i + 1}</td>
+                    <td>
+                      <b>{h.by}</b>
+                    </td>
+                    <td>
+                      {new Date(h.iso).toLocaleDateString('id-ID', {
+                        day: 'numeric',
+                        month: 'short',
+                        year: 'numeric',
+                      })}
+                    </td>
+                    <td>
+                      {new Date(h.iso).toLocaleTimeString('id-ID', {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit',
+                      })}
+                    </td>
+                    <td>{h.dept || '-'}</td>
+                    <td>{h.no}</td>
+                    <td>{h.what}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <Pager page={pg.page} pages={pg.pages} onPage={pg.setPage} />
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+/** Paginasi generik: bagi daftar menjadi halaman-halaman (dipakai Tracking PO & semua tabel). */
+function usePager<T>(rows: T[], per: number) {
+  const [page, setPage] = useState(1);
+  const pages = Math.max(1, Math.ceil(rows.length / per));
+  const safe = Math.min(page, pages);
+  return {
+    page: safe,
+    pages,
+    view: rows.slice((safe - 1) * per, safe * per),
+    setPage,
+  };
+}
+
+/** Tombol halaman: Sebelumnya / nomor (jendela di sekitar halaman aktif) / Berikutnya. */
+function Pager({
+  page,
+  pages,
+  onPage,
+}: {
+  page: number;
+  pages: number;
+  onPage: (p: number) => void;
+}) {
+  if (pages <= 1) return null;
+  const nums: number[] = [];
+  for (let i = 1; i <= pages; i++) nums.push(i);
+  const show = nums.filter(
+    (n) => n === 1 || n === pages || Math.abs(n - page) <= 2
+  );
+  return (
+    <div className="pager">
+      <button
+        type="button"
+        className="ghost"
+        disabled={page <= 1}
+        onClick={() => onPage(page - 1)}
+      >
+        ‹ Sebelumnya
+      </button>
+      <span className="pgnums">
+        {show.map((n, i) => (
+          <span key={n}>
+            {i > 0 && n - show[i - 1] > 1 && <em>…</em>}
+            <button
+              type="button"
+              className={n === page ? 'on' : ''}
+              aria-current={n === page ? 'page' : undefined}
+              onClick={() => onPage(n)}
+            >
+              {n}
+            </button>
+          </span>
+        ))}
+      </span>
+      <button
+        type="button"
+        className="ghost"
+        disabled={page >= pages}
+        onClick={() => onPage(page + 1)}
+      >
+        Berikutnya ›
+      </button>
+    </div>
+  );
+}
+
+function TrackingPage({
+  list,
+  me,
+  onPrint,
+  onSet,
+  notify,
+  lockedOf,
+}: {
+  lockedOf: (p: PO) => boolean;
+  list: PO[];
+  me: User;
+  onPrint: (no: string) => void;
+  onSet: (no: string, k: TKey, v: string) => void;
+  notify: (m: string) => void;
+}) {
+  const [q, setQ] = useState('');
+  const [sel, setSel] = useState('');
+  const admin = me.role === 'admin';
+  const today = ymd(new Date());
+  const key = q.trim().toLowerCase();
+  const rows = [...list]
+    .sort((a, b) => b.iso.localeCompare(a.iso))
+    .filter(
+      (p) =>
+        !key ||
+        (p.no + ' ' + p.v.nama + ' ' + p.by + ' ' + p.dept)
+          .toLowerCase()
+          .includes(key)
+    );
+  const pg = usePager(rows, 3); // Tracking PO: 3 kartu per halaman
+  // Resume monitoring: PO progres terendah (di luar yang rejected), urut dari yang paling tertinggal, 5 per halaman
+  const lowAll = [...list]
+    .filter((p) => !p.rej)
+    .map((p) => ({ p, t: trackOf(p) }))
+    .sort((a, b) => a.t.done - b.t.done || b.p.iso.localeCompare(a.p.iso));
+  const lowPg = usePager(lowAll, 5);
+  if (!list.length)
+    return (
+      <Card>
+        <div className="empty">Belum ada pengajuan untuk dilacak.</div>
+      </Card>
+    );
+  const openNo = sel === '-' ? '' : sel || rows[0]?.no;
+  return (
+    <>
+      <div className="bar">
+        <div className="ifld grow">
+          <span className="ico">
+            <Ic n="search" s={18} />
+          </span>
+          <input
+            value={q}
+            onChange={(e) => {
+              setQ(e.target.value);
+              pg.setPage(1);
+            }}
+            placeholder="Cari no. PO / vendor / pemohon..."
+          />
+        </div>
+      </div>
+      {lowAll.length > 0 && (
+        <Card ic="clock" title="Resume — PO progres terendah">
+          <div className="body">
+            <p className="mute small" style={{ margin: '0 0 8px' }}>
+              PO dengan progres terendah (di luar yang rejected), diurutkan dari
+              yang paling tertinggal — 5 per halaman, pantau di tahap apa
+              masing-masing berhenti. Klik nomor PO untuk menampilkan kartunya
+              di bawah.
+            </p>
+            <div className="tbl">
+              <table className="dtbl">
+                <thead>
+                  <tr>
+                    <th>No. PO</th>
+                    <th>Vendor</th>
+                    <th>Departemen</th>
+                    <th>Pembuat</th>
+                    <th>Tanggal</th>
+                    <th>Progres</th>
+                    <th>Tahap saat ini</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {lowPg.view.map(({ p, t }) => (
+                    <tr key={p.no}>
+                      <td>
+                        <button
+                          type="button"
+                          className="lnk"
+                          onClick={() => {
+                            setQ(p.no);
+                            pg.setPage(1);
+                          }}
+                        >
+                          {p.no}
+                        </button>
+                      </td>
+                      <td>{p.v.nama}</td>
+                      <td>{p.dept}</td>
+                      <td>{p.by}</td>
+                      <td>{fmtD(dayOf(p.iso))}</td>
+                      <td>
+                        <div className="pbar" style={{ margin: '2px 0' }}>
+                          <i
+                            style={{
+                              width: `${(t.done / TSTEPS.length) * 100}%`,
+                            }}
+                          />
+                        </div>
+                        <small>
+                          {Math.round((t.done / TSTEPS.length) * 100)}% (
+                          {t.done}/{TSTEPS.length} tahap)
+                        </small>
+                      </td>
+                      <td>{t.all ? 'Semua tahap selesai' : TSTEPS[t.cur].l}</td>
+                      <td>
+                        <span
+                          className={'tag ' + (t.all ? 's-Done' : 's-Open')}
+                        >
+                          {t.all ? 'Selesai' : 'Progress'}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <Pager
+                page={lowPg.page}
+                pages={lowPg.pages}
+                onPage={lowPg.setPage}
+              />
+            </div>
+          </div>
+        </Card>
+      )}
+      {!rows.length && (
+        <Card>
+          <div className="empty">Tidak ada PO yang cocok.</div>
+        </Card>
+      )}
+      <div className="trkgrid">
+        {pg.view.map((p) => {
+          const t = trackOf(p);
+          const lk = lockedOf(p);
+          const isOpen = openNo === p.no;
+          return (
+            <Card key={p.no} cls={'trkcard' + (isOpen ? ' open' : '')}>
+              <div className="body">
+                <button
+                  type="button"
+                  className="trkhead"
+                  onClick={() => setSel(isOpen ? '-' : p.no)}
+                  aria-expanded={isOpen}
+                >
+                  <span className="tl1">
+                    <b>{p.no}</b>
+                    <small>
+                      {p.v.nama} · {p.dept} · {p.by}
+                    </small>
+                  </span>
+                  <span className="tl2">
+                    <span
+                      className={
+                        'tag ' +
+                        (p.rej ? 's-rejected' : t.all ? 's-Done' : 's-Open')
+                      }
+                    >
+                      {p.rej ? 'Rejected' : t.all ? 'Selesai' : 'Progress'}
+                    </span>
+                    <small>
+                      {t.done}/{TSTEPS.length} tahap ·{' '}
+                      {t.all ? 'Semua tahap selesai' : TSTEPS[t.cur].l}
+                    </small>
+                  </span>
+                  <Ic n={isOpen ? 'up' : 'down'} s={18} />
+                </button>
+                <div className="pbar">
+                  <i style={{ width: `${(t.done / TSTEPS.length) * 100}%` }} />
+                </div>
+                {isOpen && (
+                  <>
+                    {lk && (
+                      <div className="note bad">
+                        🔒 Periode tahun ini terkunci oleh admin, tanggal
+                        tahapan tidak bisa diubah.
+                      </div>
+                    )}
+                    <ol className="tl">
+                      {TSTEPS.map((s, i) => {
+                        const dt = t.dates[i];
+                        const st = dt
+                          ? 'ok'
+                          : i === t.cur && !p.rej
+                          ? 'cur'
+                          : 'open';
+                        // Tanggal "PO dikirim ke supplier" & "Barang diterima" penting: user pembuat PO boleh mengisi/mengubahnya kapan saja (tidak harus menunggu tahap sebelumnya). Tahap milik admin (di-approve, ke kantor pusat, sampai di kantor pusat, pembayaran) juga selalu bisa diisi admin tanpa menunggu giliran
+                        const keyStep =
+                          s.k === 'supp' || s.k === 'recv' || s.by === 'admin';
+                        const can =
+                          !lk &&
+                          !p.rej &&
+                          s.by !== 'auto' &&
+                          (s.by === 'creator'
+                            ? p.uid === me.id
+                            : s.by === 'both'
+                            ? admin || p.uid === me.id
+                            : admin) &&
+                          (keyStep || !!dt || i === t.cur);
+                        const prev = t.dates.slice(0, i).filter(Boolean).pop(); // tanggal terisi terakhir sebelum tahap ini
+                        const nx = t.dates.slice(i + 1).find(Boolean); // tanggal terisi pertama sesudah tahap ini
+                        const lo = prev ? dayOf(prev) : '';
+                        const hi = nx && dayOf(nx) < today ? dayOf(nx) : today;
+                        const k = s.k as TKey;
+                        const change = (v: string) => {
+                          if (!v) return;
+                          if (lo && v < lo)
+                            return notify(
+                              `Tanggal tidak boleh sebelum tahap sebelumnya (${fmtD(
+                                lo
+                              )}).`
+                            );
+                          if (v > hi)
+                            return notify(
+                              nx
+                                ? `Tanggal tidak boleh setelah tahap berikutnya (${fmtD(
+                                    nx
+                                  )}).`
+                                : 'Tanggal tidak boleh di masa depan.'
+                            );
+                          onSet(p.no, k, v);
+                        };
+                        return (
+                          <li key={s.k} className={st}>
+                            <i>
+                              {st === 'ok' ? (
+                                <Ic n="check" s={16} />
+                              ) : st === 'cur' ? (
+                                <Ic n="clock" s={16} />
+                              ) : (
+                                <span className="dt" />
+                              )}
+                            </i>
+                            <div className="tc">
+                              <div className="th">
+                                <b>{s.l}</b>
+                                <span
+                                  className={
+                                    'tag ' +
+                                    (st === 'ok'
+                                      ? 's-Done'
+                                      : st === 'cur'
+                                      ? 's-Open'
+                                      : 's-wait')
+                                  }
+                                >
+                                  {st === 'ok'
+                                    ? 'Selesai'
+                                    : st === 'cur'
+                                    ? 'Progress'
+                                    : 'Open'}
+                                </span>
+                              </div>
+                              <small>
+                                {dt
+                                  ? s.k === 'made'
+                                    ? fmtDT(dt)
+                                    : fmtD(dt)
+                                  : can
+                                  ? 'Isi tanggal untuk menyelesaikan tahap ini'
+                                  : st === 'cur'
+                                  ? s.by === 'creator'
+                                    ? `Menunggu update dari pembuat PO (${p.by})`
+                                    : s.by === 'both'
+                                    ? `Menunggu update dari pembuat PO (${p.by}) atau admin`
+                                    : 'Menunggu update dari admin'
+                                  : 'Belum dimulai'}
+                              </small>
+                              {can && (
+                                <div className="tedit">
+                                  <input
+                                    type="date"
+                                    value={dt ? dayOf(dt) : ''}
+                                    min={lo || undefined}
+                                    max={hi}
+                                    onChange={(e) => change(e.target.value)}
+                                    aria-label={'Tanggal ' + s.l}
+                                  />
+                                  {!!dt && !nx && (
+                                    <button
+                                      className="ghost"
+                                      onClick={() => onSet(p.no, k, '')}
+                                    >
+                                      Hapus
+                                    </button>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          </li>
+                        );
+                      })}
+                    </ol>
+                    <div className="acts">
+                      <button className="ghost" onClick={() => onPrint(p.no)}>
+                        Lihat dokumen PO
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            </Card>
+          );
+        })}
+      </div>
+      <Pager page={pg.page} pages={pg.pages} onPage={pg.setPage} />
+    </>
+  );
+}
+
+/** kunci "sudah dibaca" notifikasi; penolakan baru (setelah kirim ulang) selalu dihitung sebagai notifikasi baru */
+const notifKey = (uid: string, p: PO) =>
+  p.rej ? `${uid}|${p.no}|x${p.rej}` : `${uid}|${p.no}`;
+function NotifPage({
+  list,
+  seen,
+  me,
+  onRead,
+  onReadAll,
+  onPrint,
+  onResend,
+  onNewFrom,
+  lockedOf,
+}: {
+  list: PO[];
+  seen: string[];
+  me: string;
+  onRead: (no: string) => void;
+  onReadAll: () => void;
+  onPrint: (no: string) => void;
+  onResend: (p: PO) => void;
+  onNewFrom: (p: PO) => void;
+  lockedOf: (p: PO) => boolean;
+}) {
+  const rows = [...list].sort((a, b) =>
+    (b.rej ?? b.doneAt ?? b.iso).localeCompare(a.rej ?? a.doneAt ?? a.iso)
+  );
+  return (
+    <Card ic="bell" title="Notifikasi">
+      <div className="body">
+        <div className="bar">
+          <button onClick={onReadAll}>Tandai semua dibaca</button>
+        </div>
+        {!rows.length ? (
+          <div className="empty">Belum ada notifikasi.</div>
+        ) : (
+          rows.map((p) => {
+            const done = p.status === 'Done';
+            const rej = !!p.rej;
+            const unread = (done || rej) && !seen.includes(notifKey(me, p));
+            return (
+              <Fragment key={p.no}>
+                <button
+                  type="button"
+                  className={'nt' + (unread ? ' un' : '') + (rej ? ' rj' : '')}
+                  onClick={() => {
+                    onRead(p.no);
+                    onPrint(p.no);
+                  }}
+                >
+                  <span className="nti">
+                    <Ic n={rej ? 'x' : done ? 'check' : 'clock'} s={18} />
+                  </span>
+                  <span className="ntt">
+                    <b>
+                      {rej
+                        ? p.rejFinal
+                          ? 'PO di-reject admin (final)'
+                          : 'Pengajuan ditolak admin'
+                        : done
+                        ? 'PO sudah bisa dicetak'
+                        : 'Pengajuan menunggu diproses'}
+                    </b>
+                    <small>
+                      {p.no} · {p.v.nama} ·{' '}
+                      {fmtDT(
+                        rej && p.rej
+                          ? p.rej
+                          : done && p.doneAt
+                          ? p.doneAt
+                          : p.iso
+                      )}
+                    </small>
+                    {rej && (
+                      <small className="ntr">
+                        Alasan: {p.rejWhy || 'Ditolak oleh admin'}.{' '}
+                        {p.rejFinal
+                          ? p.newNo
+                            ? `PO ini tidak bisa diedit lagi dan sudah diganti PO baru ${p.newNo}.`
+                            : 'PO ini tidak bisa diedit lagi. Tekan Buat PO Baru untuk membuat PO dengan nomor baru.'
+                          : 'Anda tidak perlu membuat ulang: tekan Kirim Ulang untuk melanjutkan PO ini setelah admin memperbarui Supplier BP.'}
+                      </small>
+                    )}
+                  </span>
+                  {unread && <em className="dot" />}
+                </button>
+                {rej && !p.rejFinal && !lockedOf(p) && (
+                  <div className="ntact">
+                    <button
+                      type="button"
+                      className="pri"
+                      onClick={() => onResend(p)}
+                    >
+                      Kirim Ulang
+                    </button>
+                  </div>
+                )}
+                {p.rejFinal && !p.newNo && !lockedOf(p) && (
+                  <div className="ntact">
+                    <button
+                      type="button"
+                      className="pri"
+                      onClick={() => onNewFrom(p)}
+                    >
+                      Buat PO Baru
+                    </button>
+                  </div>
+                )}
+              </Fragment>
+            );
+          })
+        )}
+      </div>
+    </Card>
+  );
+}
+
+/* ================= DEPARTEMEN (admin): dipakai di pendaftaran, form PO, filter, dashboard & kode nomor PO ================= */
+function DeptSettings({
+  depts,
+  setDepts,
+  users,
+  setUsers,
+  pos,
+  setPos,
+  notify,
+}: {
+  depts: Dept[];
+  setDepts: (f: (d: Dept[]) => Dept[]) => void;
+  users: User[];
+  setUsers: (f: (u: User[]) => User[]) => void;
+  pos: PO[];
+  setPos: (f: (p: PO[]) => PO[]) => void;
+  notify: (m: string) => void;
+}) {
+  const [f, setF] = useState({ nama: '' });
+  const [eid, setEid] = useState(''); // nama lama departemen yang sedang diubah
+  const rows = [...depts].sort((a, b) => a.nama.localeCompare(b.nama, 'id'));
+  const uCount = (n: string) =>
+    users.filter((u) => u.role === 'user' && u.dept === n).length;
+  const pCount = (n: string) => pos.filter((x) => x.dept === n).length;
+  const reset = () => {
+    setF({ nama: '' });
+    setEid('');
+  };
+  const save = () => {
+    const nama = f.nama.trim().replace(/\s+/g, ' ');
+    if (!nama) return notify('Isi nama departemen.');
+    if (
+      depts.some(
+        (d) => d.nama !== eid && d.nama.toLowerCase() === nama.toLowerCase()
+      )
+    )
+      return notify('Nama departemen sudah ada.');
+    if (eid) {
+      setDepts((l) => l.map((d) => (d.nama === eid ? { nama } : d)));
+      if (nama !== eid) {
+        setUsers((l) =>
+          l.map((u) => (u.dept === eid ? { ...u, dept: nama } : u))
+        );
+        setPos((l) =>
+          l.map((x) => (x.dept === eid ? { ...x, dept: nama } : x))
+        );
+      }
+      notify('Departemen diperbarui.');
+    } else {
+      setDepts((l) => [...l, { nama }]);
+      notify('Departemen ditambahkan.');
+    }
+    reset();
+  };
+  const edit = (d: Dept) => {
+    setEid(d.nama);
+    setF({ nama: d.nama });
+  };
+  const del = (d: Dept) => {
+    const u = uCount(d.nama),
+      n = pCount(d.nama);
+    if (u || n)
+      return notify(
+        `Departemen masih dipakai ${u} user dan ${n} PO, tidak bisa dihapus.`
+      );
+    if (depts.length <= 1) return notify('Minimal harus ada 1 departemen.');
+    if (window.confirm(`Hapus departemen "${d.nama}"?`))
+      setDepts((l) => l.filter((x) => x.nama !== d.nama));
+  };
+  return (
+    <Card ic="building" title="Departemen">
+      <div className="body">
+        <p className="mute small">
+          Daftar ini otomatis dipakai pada pilihan departemen saat pendaftaran,
+          filter admin, dan dashboard. Mengubah nama departemen ikut memperbarui
+          user dan PO yang sudah ada. Nomor PO tidak memakai kode departemen.
+          Departemen yang masih dipakai user atau PO tidak bisa dihapus.
+        </p>
+        <div className="bpbox">
+          <b>{eid ? 'Ubah Departemen' : 'Tambah Departemen'}</b>
+          <div className="dpf">
+            <Field label="Nama Departemen" req>
+              <input
+                value={f.nama}
+                onChange={(e) => setF((x) => ({ ...x, nama: e.target.value }))}
+                onKeyDown={(e) => e.key === 'Enter' && save()}
+                placeholder="Nama departemen"
+              />
+            </Field>
+            <div className="acts">
+              <button className="pri" onClick={save}>
+                <Ic n={eid ? 'check' : 'plus'} s={16} />{' '}
+                {eid ? 'Simpan' : 'Tambah'}
+              </button>
+              {(eid || f.nama) && <button onClick={reset}>Batal</button>}
+            </div>
+          </div>
+        </div>
+        <div className="tbl">
+          <table>
+            <thead>
+              <tr>
+                <th>Departemen</th>
+                <th>User</th>
+                <th>PO</th>
+                <th>Aksi</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((d) => (
+                <tr key={d.nama}>
+                  <td>
+                    <b>{d.nama}</b>
+                  </td>
+                  <td>{uCount(d.nama)}</td>
+                  <td>{pCount(d.nama)}</td>
+                  <td>
+                    <div className="acts">
+                      <button className="ghost" onClick={() => edit(d)}>
+                        Ubah
+                      </button>
+                      <button className="ghost" onClick={() => del(d)}>
+                        Hapus
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+/* ================= PENGATURAN PENOMORAN PO & PERIODE TAHUN (admin) ================= */
+function NumberSettings({
+  pos,
+  cfg,
+  setCfg,
+  notify,
+}: {
+  pos: PO[];
+  cfg: NumCfg;
+  setCfg: (f: (c: NumCfg) => NumCfg) => void;
+  notify: (m: string) => void;
+}) {
+  const now = new Date();
+  const yr = now.getFullYear();
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const nomor = (n: number) => String(n).padStart(3, '0');
+  const years = [
+    ...new Set<number>([
+      yr,
+      ...pos.map((p) => new Date(p.iso).getFullYear()),
+      ...Object.keys(cfg).map(Number),
+    ]),
+  ].sort((a, b) => b - a);
+
+  const saveStart = (y: number) => {
+    const k = String(y);
+    if (lockedYear(cfg, y))
+      return notify(
+        `Periode ${y} terkunci. Buka kunci dulu untuk mengubah nomor awal.`
+      );
+    const raw = (draft[k] ?? '').trim();
+    const n = Number(raw);
+    if (!raw || !Number.isInteger(n) || n < 1 || n > 999999)
+      return notify('Nomor awal harus berupa angka bulat minimal 1.');
+    const last = lastSeq(pos, y);
+    setCfg((c) => ({ ...c, [k]: { ...c[k], start: n } }));
+    setDraft((d) => {
+      const x = { ...d };
+      delete x[k];
+      return x;
+    });
+    notify(
+      n > last
+        ? `Nomor awal ${y} diset ke ${nomor(
+            n
+          )}. PO berikutnya memakai nomor ini.`
+        : `Tersimpan, tetapi PO sudah sampai nomor ${nomor(
+            last
+          )}. Nomor berikutnya tetap ${nomor(last + 1)}.`
+    );
+  };
+  const resetStart = (y: number) => {
+    const k = String(y);
+    setCfg((c) => ({ ...c, [k]: { ...c[k], start: undefined } }));
+    setDraft((d) => {
+      const x = { ...d };
+      delete x[k];
+      return x;
+    });
+    notify(`Nomor awal ${y} dikembalikan ke bawaan (001).`);
+  };
+  const toggleLock = (y: number) => {
+    const lk = lockedYear(cfg, y);
+    if (
+      !window.confirm(
+        lk
+          ? `Buka kunci periode ${y}? PO tahun ${y} bisa diubah lagi.`
+          : `Kunci periode ${y}? PO tahun ${y} tidak bisa diubah dan PO baru tidak bisa dibuat selama terkunci.`
+      )
+    )
+      return;
+    setCfg((c) => ({ ...c, [String(y)]: { ...c[String(y)], locked: !lk } }));
+    notify(lk ? `Periode ${y} dibuka.` : `Periode ${y} dikunci.`);
+  };
+
+  return (
+    <Card ic="receipt" title="Penomoran PO & Periode Tahun">
+      <div className="body">
+        <div className="info">
+          <Ic n="info" s={20} />
+          <span>
+            Nomor berikutnya (tahun {yr}):{' '}
+            <b>
+              {nomor(nextSeq(pos, yr, cfg))}/AGP-PO/{PO_CODE}/
+              {ROMAN[now.getMonth()]}/{yr}
+            </b>
+          </span>
+        </div>
+        <p className="mute small">
+          Format nomor: urut/AGP-PO/GA/bulan romawi (otomatis mengikuti bulan
+          pembuatan PO)/tahun pembuatan PO. Semua departemen memakai satu urutan
+          nomor yang sama. Nomor awal menentukan angka pertama yang dipakai pada
+          tahun tersebut, lalu nomor berikutnya otomatis melanjutkan. Jika sudah
+          ada PO bernomor lebih besar dari nomor awal, urutan tetap lanjut dari
+          nomor terbesar. Saat tahun berganti, urutan mulai lagi dari 001 dan
+          tahun sebelumnya otomatis terkunci supaya riwayat tidak berubah. Admin
+          tetap bisa membuka atau mengunci periode kapan saja.
+        </p>
+        <div className="tbl">
+          <table>
+            <thead>
+              <tr>
+                <th>Tahun</th>
+                <th>Jumlah PO</th>
+                <th>Nomor terakhir</th>
+                <th>Nomor awal</th>
+                <th>Nomor berikutnya</th>
+                <th>Status</th>
+                <th>Aksi</th>
+              </tr>
+            </thead>
+            <tbody>
+              {years.map((y) => {
+                const k = String(y);
+                const lk = lockedYear(cfg, y);
+                const last = lastSeq(pos, y);
+                const start = cfg[k]?.start;
+                return (
+                  <tr key={y}>
+                    <td>
+                      <b>{y}</b>
+                      {y === yr && (
+                        <span className="tag s-Open" style={{ marginLeft: 6 }}>
+                          Berjalan
+                        </span>
+                      )}
+                    </td>
+                    <td>
+                      {
+                        pos.filter((p) => new Date(p.iso).getFullYear() === y)
+                          .length
+                      }
+                    </td>
+                    <td>{last ? nomor(last) : '-'}</td>
+                    <td>
+                      <input
+                        type="number"
+                        min={1}
+                        style={{ width: 110 }}
+                        disabled={lk}
+                        placeholder="001"
+                        value={
+                          draft[k] ?? (start !== undefined ? String(start) : '')
+                        }
+                        onChange={(e) =>
+                          setDraft((d) => ({ ...d, [k]: e.target.value }))
+                        }
+                        aria-label={'Nomor awal tahun ' + y}
+                      />
+                    </td>
+                    <td>
+                      <b>{lk ? '-' : nomor(nextSeq(pos, y, cfg))}</b>
+                    </td>
+                    <td>
+                      <span className={'tag ' + (lk ? 's-rejected' : 's-Done')}>
+                        {lk ? '🔒 Terkunci' : 'Terbuka'}
+                      </span>
+                    </td>
+                    <td>
+                      <div className="acts sm">
+                        <button
+                          className="pri"
+                          disabled={lk || draft[k] === undefined}
+                          onClick={() => saveStart(y)}
+                        >
+                          Simpan
+                        </button>
+                        {start !== undefined && !lk && (
+                          <button
+                            className="ghost"
+                            onClick={() => resetStart(y)}
+                          >
+                            Reset
+                          </button>
+                        )}
+                        {lk ? (
+                          <button
+                            className="ghost"
+                            title="Buka kunci agar nomor awal & PO tahun ini bisa diedit lagi"
+                            onClick={() => toggleLock(y)}
+                          >
+                            <Ic n="edit" s={12} /> Edit
+                          </button>
+                        ) : (
+                          <button
+                            className="ghost"
+                            onClick={() => toggleLock(y)}
+                          >
+                            Kunci periode
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function SettingsPage({
+  changePw,
+  me,
+  setUsers,
+  brand,
+  setBrand,
+  notify,
+  pos,
+  numCfg,
+  setNumCfg,
+  depts,
+  setDepts,
+  setPos,
+  users,
+}: {
+  changePw: (o: string, n: string) => Promise<string>;
+  depts: Dept[];
+  setDepts: (f: (d: Dept[]) => Dept[]) => void;
+  setPos: (f: (p: PO[]) => PO[]) => void;
+  users: User[];
+  pos: PO[];
+  numCfg: NumCfg;
+  setNumCfg: (f: (c: NumCfg) => NumCfg) => void;
+  me: User;
+  setUsers: (f: (u: User[]) => User[]) => void;
+  brand: Brand;
+  setBrand: (f: (b: Brand) => Brand) => void;
+  notify: (m: string) => void;
+}) {
+  const [oldp, setOldp] = useState('');
+  const [newp, setNewp] = useState('');
+  const admin = me.role === 'admin';
+  const change = async () => {
+    const err = await changePw(oldp, newp);
+    if (err) return notify(err);
+    setOldp('');
+    setNewp('');
+    notify('Password diperbarui.');
+  };
+  return (
+    <>
+      <Card ic="user" title="Profil">
+        <div className="body">
+          <div className="kvi">
+            <div>
+              <span>
+                <Ic n="user" s={18} />
+                Nama
+              </span>
+              <b>{me.nama}</b>
+            </div>
+            <div>
+              <span>
+                <Ic n="user" s={18} />
+                Username
+              </span>
+              <b>{uname(me)}</b>
+            </div>
+            <div>
+              <span>
+                <Ic n="mail" s={18} />
+                Email
+              </span>
+              <b>{me.email}</b>
+            </div>
+            <div>
+              <span>
+                <Ic n="building" s={18} />
+                Departemen
+              </span>
+              <b>{admin ? 'Administrator' : me.dept}</b>
+            </div>
+          </div>
+        </div>
+      </Card>
+      {!admin && (
+        <Card ic="gear" title="Ubah Password">
+          <div className="body grid">
+            <Field label="Password lama">
+              <input
+                type="password"
+                value={oldp}
+                onChange={(e) => setOldp(e.target.value)}
+              />
+            </Field>
+            <Field label="Password baru (min. 6 karakter)">
+              <input
+                type="password"
+                value={newp}
+                onChange={(e) => setNewp(e.target.value)}
+              />
+              <PwMeter n={newp} track="rgba(10,40,90,.15)" />
+            </Field>
+            <div>
+              <button className="pri" onClick={change}>
+                Simpan password
+              </button>
+            </div>
+          </div>
+        </Card>
+      )}
+      {admin && (
+        <DeptSettings
+          depts={depts}
+          setDepts={setDepts}
+          users={users}
+          setUsers={setUsers}
+          pos={pos}
+          setPos={setPos}
+          notify={notify}
+        />
+      )}
+      {admin && (
+        <NumberSettings
+          pos={pos}
+          cfg={numCfg}
+          setCfg={setNumCfg}
+          notify={notify}
+        />
+      )}
+      {admin && (
+        <BrandSettings brand={brand} setBrand={setBrand} notify={notify} />
+      )}
+    </>
+  );
+}
+
+/* ================= DASHBOARD ================= */
+const mkey = (d: Date) => d.getFullYear() * 12 + d.getMonth();
+const mlabel = (idx: number) =>
+  new Date(Math.floor(idx / 12), idx % 12, 1).toLocaleDateString('id-ID', {
+    month: 'short',
+    year: 'numeric',
+  });
+const MONTHS_ID = [
+  'Januari',
+  'Februari',
+  'Maret',
+  'April',
+  'Mei',
+  'Juni',
+  'Juli',
+  'Agustus',
+  'September',
+  'Oktober',
+  'November',
+  'Desember',
+];
+type PType = 'yearly' | 'semester' | 'quarterly' | 'monthly' | 'weekly';
+type PSel = { type: PType; year: number; n: number } | null;
+type PerSel = NonNullable<PSel>;
+const PTYPES: { k: PType; l: string }[] = [
+  { k: 'yearly', l: 'Annual / Yearly' },
+  { k: 'semester', l: 'Semester / Half-Yearly' },
+  { k: 'quarterly', l: 'Quarterly' },
+  { k: 'monthly', l: 'Monthly' },
+  { k: 'weekly', l: 'Weekly' },
+];
+const isoW1 = (y: number) => {
+  const j = new Date(y, 0, 4);
+  return new Date(y, 0, 4 - ((j.getDay() + 6) % 7));
+};
+const weeksIn = (y: number) =>
+  Math.round((isoW1(y + 1).getTime() - isoW1(y).getTime()) / (7 * 86400000));
+const pMax = (t: PType, y: number) =>
+  t === 'yearly'
+    ? 1
+    : t === 'semester'
+    ? 2
+    : t === 'quarterly'
+    ? 4
+    : t === 'monthly'
+    ? 12
+    : weeksIn(y);
+const pRange = (p: PerSel): { from: number; to: number } => {
+  const { type: t, year: y, n } = p;
+  if (t === 'yearly')
+    return {
+      from: new Date(y, 0, 1).getTime(),
+      to: new Date(y + 1, 0, 1).getTime(),
+    };
+  if (t === 'semester')
+    return {
+      from: new Date(y, (n - 1) * 6, 1).getTime(),
+      to: new Date(y, n * 6, 1).getTime(),
+    };
+  if (t === 'quarterly')
+    return {
+      from: new Date(y, (n - 1) * 3, 1).getTime(),
+      to: new Date(y, n * 3, 1).getTime(),
+    };
+  if (t === 'monthly')
+    return {
+      from: new Date(y, n, 1).getTime(),
+      to: new Date(y, n + 1, 1).getTime(),
+    };
+  const w = isoW1(y);
+  return {
+    from: new Date(
+      w.getFullYear(),
+      w.getMonth(),
+      w.getDate() + (n - 1) * 7
+    ).getTime(),
+    to: new Date(w.getFullYear(), w.getMonth(), w.getDate() + n * 7).getTime(),
+  };
+};
+const prevPer = (p: PerSel): PerSel => {
+  const { type: t, year: y, n } = p;
+  if (t === 'yearly') return { type: t, year: y - 1, n: 1 };
+  if (n > 1) return { type: t, year: y, n: n - 1 };
+  return { type: t, year: y - 1, n: pMax(t, y - 1) };
+};
+const fmtPD = (ms: number) =>
+  new Date(ms).toLocaleDateString('id-ID', { day: 'numeric', month: 'short' });
+const pItem = (t: PType, y: number, n: number) => {
+  if (t === 'yearly') return String(y);
+  if (t === 'semester')
+    return `Semester ${n} (${n === 1 ? 'Jan – Jun' : 'Jul – Des'})`;
+  if (t === 'quarterly')
+    return `Q${n} (${MONTHS_ID[(n - 1) * 3].slice(0, 3)} – ${MONTHS_ID[
+      n * 3 - 1
+    ].slice(0, 3)})`;
+  if (t === 'monthly') return MONTHS_ID[n];
+  const r = pRange({ type: t, year: y, n });
+  return `Minggu ${n} (${fmtPD(r.from)} – ${fmtPD(r.to - 86400000)})`;
+};
+const pLabel = (p: PerSel) => {
+  const { type: t, year: y, n } = p;
+  if (t === 'yearly') return `Tahun ${y}`;
+  if (t === 'semester') return `Semester ${n} ${y}`;
+  if (t === 'quarterly') return `Q${n} ${y}`;
+  if (t === 'monthly') return mlabel(y * 12 + n);
+  return `Minggu ${n} ${y}`;
+};
+const defN = (t: PType, y: number) => {
+  const now = new Date(),
+    max = pMax(t, y);
+  if (y !== now.getFullYear()) return 1;
+  if (t === 'yearly') return 1;
+  if (t === 'semester') return now.getMonth() < 6 ? 1 : 2;
+  if (t === 'quarterly') return Math.floor(now.getMonth() / 3) + 1;
+  if (t === 'monthly') return now.getMonth();
+  return Math.min(
+    max,
+    Math.max(
+      1,
+      Math.floor(
+        (new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime() -
+          isoW1(y).getTime()) /
+          (7 * 86400000)
+      ) + 1
+    )
+  );
+};
+const fixPer = (t: PType, y: number, n: number): PerSel => ({
+  type: t,
+  year: y,
+  n:
+    t === 'monthly'
+      ? Math.min(11, Math.max(0, n))
+      : Math.min(pMax(t, y), Math.max(1, n)),
+});
+const short = (n: number, d = 0) => {
+  const f = (x: number) =>
+    x.toLocaleString('id-ID', { maximumFractionDigits: d });
+  if (n >= 1e9) return `Rp ${f(n / 1e9)} M`;
+  if (n >= 1e6) return `Rp ${f(n / 1e6)} jt`;
+  if (n >= 1e3) return `Rp ${f(n / 1e3)} rb`;
+  return `Rp ${f(n)}`;
+};
+type Dl = { t: string; tone: 'good' | 'bad' | 'flat' };
+const dl = (
+  a: number,
+  b: number,
+  o: { pct?: boolean; upBad?: boolean }
+): Dl => {
+  const diff = a - b;
+  const sym = diff > 0 ? '↑' : diff < 0 ? '↓' : '→';
+  const tone = diff === 0 ? 'flat' : diff > 0 === !!o.upBad ? 'bad' : 'good';
+  if (!o.pct) return { t: `${sym} ${Math.abs(diff)}`, tone };
+  if (!b)
+    return a
+      ? { t: 'Baru', tone: o.upBad ? 'bad' : 'good' }
+      : { t: '→ 0%', tone: 'flat' };
+  return { t: `${sym} ${Math.abs(Math.round((diff / b) * 100))}%`, tone };
+};
+
+/** teks yang mengecil otomatis bila lebih lebar dari kotaknya, agar angka tampil penuh (ukuran dasar dari font induknya) */
+function Fit({ text, children }: { text: string; children: ReactNode }) {
+  const ghost = useRef<HTMLSpanElement>(null);
+  const [k, setK] = useState(1);
+  useLayoutEffect(() => {
+    const g = ghost.current,
+      host = g?.parentElement;
+    if (!g || !host) return;
+    const calc = () => {
+      const avail = host.clientWidth,
+        need = g.offsetWidth;
+      setK(
+        avail > 0 && need > avail
+          ? Math.max(0.4, Math.floor((avail / need) * 100) / 100)
+          : 1
+      );
+    };
+    calc();
+    const ro = new ResizeObserver(calc);
+    ro.observe(host);
+    return () => ro.disconnect();
+  }, [text]);
+  return (
+    <>
+      <span ref={ghost} className="fitg" aria-hidden="true">
+        {text}
+      </span>
+      <span style={{ fontSize: `${k * 100}%` }}>{children}</span>
+    </>
+  );
+}
+
+/** satu baris isi yang diperkecil otomatis (zoom) bila lebih lebar dari kotaknya, sehingga tidak terpotong */
+function FitBox({
+  children,
+  min = 0.45,
+}: {
+  children: ReactNode;
+  min?: number;
+}) {
+  const outer = useRef<HTMLDivElement>(null);
+  const inner = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const o = outer.current,
+      i = inner.current;
+    if (!o || !i) return;
+    const calc = () => {
+      i.style.zoom = '1';
+      const need = i.offsetWidth,
+        avail = o.clientWidth;
+      i.style.zoom =
+        need > avail && avail > 0
+          ? String(Math.max(min, Math.floor((avail / need) * 100) / 100))
+          : '1';
+    };
+    calc();
+    const ro = new ResizeObserver(calc);
+    ro.observe(o);
+    void document.fonts?.ready.then(calc);
+    return () => ro.disconnect();
+  });
+  return (
+    <div className="fitbox" ref={outer}>
+      <div className="fitin" ref={inner}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/** angka yang menghitung naik dari 0 saat muncul */
+function Num({ to, f }: { to: number; f: (n: number) => string }) {
+  const [v, setV] = useState(0);
+  useEffect(() => {
+    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+      setV(to);
+      return;
+    }
+    let raf = 0;
+    const t0 = performance.now();
+    const step = (t: number) => {
+      const k = Math.min(1, (t - t0) / 900);
+      setV(to * (1 - Math.pow(1 - k, 3)));
+      if (k < 1) raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+  }, [to]);
+  return <>{f(Math.round(v))}</>;
+}
+
+function DCard({
+  ic,
+  title,
+  sub,
+  right,
+  big,
+  children,
+}: {
+  ic: string;
+  title: string;
+  sub?: string;
+  right?: ReactNode;
+  big?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <div className="card dcard">
+      <div className={'dh' + (big ? ' big' : '')}>
+        <span className="dic">
+          <Ic n={ic} s={big ? 26 : 17} />
+        </span>
+        {sub ? (
+          <div className="dht2">
+            <h3>{title}</h3>
+            <p>{sub}</p>
+          </div>
+        ) : (
+          <h3>{title}</h3>
+        )}
+        {right && <span className="dr">{right}</span>}
+      </div>
+      <div className="db">{children}</div>
+    </div>
+  );
+}
+
+/** jalur batang dengan sudut atas membulat, dasar rata */
+const barPath = (x: number, y: number, w: number, h: number, r: number) => {
+  const rr = Math.max(0, Math.min(r, w / 2, h));
+  return `M${x},${y + h}V${y + rr}Q${x},${y} ${x + rr},${y}H${x + w - rr}Q${
+    x + w
+  },${y} ${x + w},${y + rr}V${y + h}Z`;
+};
+
+/** campur warna hex dengan putih (t = 0..1) */
+const lite = (hex: string, t: number) => {
+  const n = parseInt(hex.slice(1), 16);
+  const f = (v: number) => Math.round(v + (255 - v) * t);
+  return `rgb(${f((n >> 16) & 255)},${f((n >> 8) & 255)},${f(n & 255)})`;
+};
+
+/** grafik batang (nilai PO) + garis (jumlah PO) bergaya kaca berkilau. Batang tumbuh dari bawah, garis tergambar. */
+function TrendChart({
+  data,
+  sel,
+  onPick,
+  avgSub,
+}: {
+  data: { l: string; t: number; n: number; m: number }[];
+  sel: number | null;
+  onPick: (m: number | null) => void;
+  avgSub: string;
+}) {
+  const act = sel === null ? -1 : data.findIndex((d) => d.m === sel); // bar bulan yang sedang menjadi filter
+  const rest = act >= 0 ? act : data.length - 1;
+  const [hv, setHv] = useState(rest);
+  useEffect(() => {
+    setHv(rest);
+  }, [rest]);
+  const W = 640,
+    H = 300,
+    L = 70,
+    R = 44,
+    T = 42,
+    B = 32;
+  const pw = W - L - R,
+    ph = H - T - B;
+  // sumbu kiri: nilai PO
+  const mx = Math.max(...data.map((d) => d.t));
+  const raw = (mx > 0 ? mx : 4e6) / 4;
+  const ex = Math.pow(10, Math.floor(Math.log10(raw)));
+  const fr = raw / ex;
+  const step =
+    (fr <= 1 ? 1 : fr <= 2 ? 2 : fr <= 2.5 ? 2.5 : fr <= 5 ? 5 : 10) * ex;
+  const top = step * 4;
+  // sumbu kanan: jumlah PO (kelipatan bulat)
+  const nmx = Math.max(1, ...data.map((d) => d.n));
+  const nraw = nmx / 4;
+  const nex = Math.pow(10, Math.floor(Math.log10(nraw)));
+  const nfr = nraw / nex;
+  const nstep = Math.max(
+    1,
+    (nfr <= 1 ? 1 : nfr <= 2 ? 2 : nfr <= 5 ? 5 : 10) * nex
+  );
+  const mn = nstep * 4;
+  const bw = pw / data.length;
+  const bwid = Math.min(64, bw * 0.72);
+  const X = (i: number) => L + bw * (i + 0.5);
+  const Yt = (v: number) => T + ph - (v / top) * ph;
+  const Yn = (v: number) => T + ph - (v / mn) * ph;
+  const pts = data.map((d, i) => [X(i), Yn(d.n)] as const);
+  const path = pts
+    .map(([x, y], i) => {
+      if (!i) return `M${x},${y}`;
+      const py = pts[i - 1][1];
+      const mid = (pts[i - 1][0] + x) / 2;
+      return `C${mid},${py} ${mid},${y} ${x},${y}`;
+    })
+    .join('');
+  // ringkasan: tertinggi / rata-rata (total / jumlah bulan) / terendah (dari bulan yang ada PO-nya)
+  const nz = data.filter((d) => d.t > 0);
+  const hi = nz.length ? nz.reduce((a, b) => (b.t > a.t ? b : a)) : null;
+  const lo = nz.length ? nz.reduce((a, b) => (b.t < a.t ? b : a)) : null;
+  const tot = data.reduce((a, d) => a + d.t, 0);
+  const mLbl = (m: number) =>
+    new Date(Math.floor(m / 12), m % 12, 1).toLocaleDateString('id-ID', {
+      month: 'short',
+      year: 'numeric',
+    });
+  const cc = (c: string) => ({ '--c': c } as CSSProperties);
+  return (
+    <>
+      <svg
+        viewBox={`0 0 ${W} ${H}`}
+        className="trend"
+        role="group"
+        aria-label="Tren nilai PO. Klik bulan untuk memfilter dashboard"
+        onMouseLeave={() => setHv(rest)}
+      >
+        <defs>
+          <linearGradient id="tbA" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stopColor="#d9eaff" stopOpacity=".97" />
+            <stop offset="1" stopColor="#a6ccf8" stopOpacity=".6" />
+          </linearGradient>
+          <linearGradient id="tbS" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stopColor="#52a9f8" />
+            <stop offset="1" stopColor="#1456c8" />
+          </linearGradient>
+          <linearGradient id="tgl" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stopColor="#fff" stopOpacity=".85" />
+            <stop offset=".45" stopColor="#fff" stopOpacity=".14" />
+            <stop offset="1" stopColor="#fff" stopOpacity="0" />
+          </linearGradient>
+          <linearGradient id="tsd" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stopColor="#fff" stopOpacity=".6" />
+            <stop offset=".3" stopColor="#fff" stopOpacity="0" />
+            <stop offset=".85" stopColor="#fff" stopOpacity="0" />
+            <stop offset="1" stopColor="#fff" stopOpacity=".28" />
+          </linearGradient>
+          <linearGradient id="tpn" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stopColor="#fff" stopOpacity=".66" />
+            <stop offset="1" stopColor="#e6f1ff" stopOpacity=".2" />
+          </linearGradient>
+          <linearGradient id="tsh" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stopColor="#fff" stopOpacity="0" />
+            <stop offset=".5" stopColor="#fff" stopOpacity=".6" />
+            <stop offset="1" stopColor="#fff" stopOpacity="0" />
+          </linearGradient>
+          <linearGradient id="tpg" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stopColor="#fff" stopOpacity=".9" />
+            <stop offset="1" stopColor="#fff" stopOpacity=".55" />
+          </linearGradient>
+          <clipPath id="tclip">
+            <rect
+              x={L - 8}
+              y={T - 14}
+              width={pw + 16}
+              height={ph + 26}
+              rx={18}
+            />
+          </clipPath>
+          <filter id="tglow" x="-10%" y="-40%" width="120%" height="180%">
+            <feGaussianBlur stdDeviation="3.2" />
+          </filter>
+        </defs>
+
+        <text x={L - 8} y={16} className="axt">
+          Nilai PO (Rp Juta)
+        </text>
+        <text x={W - R + 14} y={16} textAnchor="end" className="axt">
+          Jumlah PO
+        </text>
+
+        {/* panel kaca di belakang plot */}
+        <rect
+          x={L - 8}
+          y={T - 14}
+          width={pw + 16}
+          height={ph + 26}
+          rx={18}
+          fill="url(#tpn)"
+          stroke="#fff"
+          strokeOpacity=".9"
+        />
+        <path
+          d={`M${L - 8},${T + 30}V${T + 4}Q${L - 8},${T - 14} ${L + 10},${
+            T - 14
+          }H${L + pw - 2}Q${L + pw + 8},${T - 14} ${L + pw + 8},${T + 4}V${
+            T + 30
+          }Q${L + pw / 2},${T + 8} ${L - 8},${T + 30}Z`}
+          fill="#fff"
+          opacity=".28"
+        />
+
+        {[0, 1, 2, 3, 4].map((k) => {
+          const y = T + ph - (ph * k) / 4;
+          return (
+            <g key={k}>
+              <line
+                x1={L}
+                x2={W - R}
+                y1={y}
+                y2={y}
+                stroke="#b9d3f0"
+                strokeOpacity={k ? 0.75 : 0.9}
+                strokeDasharray={k ? '3 4' : undefined}
+              />
+              <text x={L - 14} y={y + 3.5} textAnchor="end" className="ax">
+                {k ? short(step * k, 1) : 'Rp 0'}
+              </text>
+              <text x={W - R + 14} y={y + 3.5} className="ax">
+                {nstep * k}
+              </text>
+            </g>
+          );
+        })}
+
+        {data.map((d, i) => {
+          if (d.t <= 0) return null;
+          const x = X(i) - bwid / 2,
+            y = Yt(d.t),
+            h = T + ph - y,
+            on = i === hv || i === act;
+          const p = barPath(x, y, bwid, h, 10);
+          const tall = h >= 26;
+          let ly = tall ? y + 16 : y - 5;
+          if (tall && Math.abs(Yn(d.n) - (ly - 4)) < 13) ly = Yn(d.n) + 17;
+          ly = Math.min(ly, T + ph - 6);
+          return (
+            <g
+              key={'b' + i}
+              className="gbar"
+              style={{ animationDelay: `${i * 70}ms` }}
+            >
+              <path
+                d={p}
+                fill={on ? 'url(#tbS)' : 'url(#tbA)'}
+                stroke="#fff"
+                strokeOpacity=".85"
+                strokeWidth={1}
+              />
+              <path d={p} fill="url(#tgl)" opacity={on ? 0.5 : 1} />
+              <path d={p} fill="url(#tsd)" />
+              <text
+                x={X(i)}
+                y={ly}
+                textAnchor="middle"
+                className="bv"
+                fill={on && tall ? '#fff' : '#2a5ca8'}
+              >
+                {short(d.t, 1)}
+              </text>
+            </g>
+          );
+        })}
+
+        {/* kilau kaca yang menyapu panel */}
+        <g clipPath="url(#tclip)" style={{ pointerEvents: 'none' }}>
+          <rect
+            className="tshine"
+            x={L - 130}
+            y={T - 16}
+            width={90}
+            height={ph + 30}
+            fill="url(#tsh)"
+          />
+        </g>
+
+        <path
+          d={path}
+          className="gline"
+          pathLength={1}
+          fill="none"
+          stroke="#4d9cff"
+          strokeOpacity=".32"
+          strokeWidth={8}
+          strokeLinecap="round"
+          filter="url(#tglow)"
+        />
+        <path
+          d={path}
+          className="gline"
+          pathLength={1}
+          fill="none"
+          stroke="#1b4fbf"
+          strokeWidth={2.6}
+          strokeLinecap="round"
+        />
+        {pts.map(([x, y], i) => (
+          <g
+            key={'d' + i}
+            className="gdot"
+            style={{ animationDelay: `${500 + i * 120}ms` }}
+          >
+            <circle
+              cx={x}
+              cy={y}
+              r={i === hv ? 6.2 : 5}
+              fill="#1b4fbf"
+              stroke="#fff"
+              strokeWidth={2}
+            />
+            <circle
+              cx={x - 1.3}
+              cy={y - 1.5}
+              r={1.5}
+              fill="#fff"
+              opacity=".75"
+            />
+          </g>
+        ))}
+
+        {data.map((d, i) => {
+          const w = 30,
+            x = X(i) - w / 2,
+            y = Math.max(3, Yn(d.n) - 33),
+            on = i === hv;
+          return (
+            <g
+              key={'p' + i}
+              className="gtip"
+              style={{ animationDelay: `${700 + i * 90}ms` }}
+            >
+              <rect
+                x={x}
+                y={y}
+                width={w}
+                height={20}
+                rx={7}
+                fill="url(#tpg)"
+                stroke={on ? '#1b4fbf' : '#b4cff0'}
+                strokeWidth={on ? 1.4 : 1}
+              />
+              <text
+                x={x + w / 2}
+                y={y + 14}
+                textAnchor="middle"
+                className="tt3"
+              >
+                {d.n}
+              </text>
+            </g>
+          );
+        })}
+
+        {data.map((d, i) => (
+          <text
+            key={'x' + i}
+            x={X(i)}
+            y={H - 9}
+            textAnchor="middle"
+            className="ax"
+            style={i === act ? { fontWeight: 700, fill: '#0f5fc0' } : undefined}
+          >
+            {d.l}
+          </text>
+        ))}
+        {data.map((_, i) => (
+          <rect
+            key={'h' + i}
+            x={L + bw * i}
+            y={T - 14}
+            width={bw}
+            height={ph + 26}
+            fill="transparent"
+            style={{ cursor: 'pointer' }}
+            role="button"
+            tabIndex={0}
+            aria-pressed={i === act}
+            aria-label={`Filter bulan ${data[i].l}`}
+            onMouseEnter={() => setHv(i)}
+            onClick={() => onPick(data[i].m === sel ? null : data[i].m)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                onPick(data[i].m === sel ? null : data[i].m);
+              }
+            }}
+          />
+        ))}
+      </svg>
+      <div className="tstats">
+        <div className="ts">
+          <span className="tl">
+            <i style={cc('#22b573')} />
+            Tertinggi
+          </span>
+          <b>{hi ? short(hi.t, 1) : '—'}</b>
+          <small>{hi ? mLbl(hi.m) : '—'}</small>
+        </div>
+        <div className="ts">
+          <span className="tl">
+            <i style={cc('#f5b82e')} />
+            Rata-rata
+          </span>
+          <b>{short(tot / Math.max(1, data.length), 1)}</b>
+          <small>{avgSub}</small>
+        </div>
+        <div className="ts">
+          <span className="tl">
+            <i style={cc('#ef4a5a')} />
+            Terendah
+          </span>
+          <b>{lo ? short(lo.t, 1) : '—'}</b>
+          <small>{lo ? mLbl(lo.m) : '—'}</small>
+        </div>
+        <div className="ts tot">
+          <span className="tico">
+            <Ic n="chart" s={22} />
+          </span>
+          <span className="tb">
+            <span className="tl2">Total Nilai PO</span>
+            <b>{short(tot, 1)}</b>
+            <small>{data.length} Bulan</small>
+          </span>
+        </div>
+      </div>
+    </>
+  );
+}
+
+type StSeg = { l: string; n: number; c: string; d: string; ic: string };
+
+/** donut kaca: cincin tebal berkilau, label persen di luar cincin, total di tengah */
+function Donut({ segs, total }: { segs: StSeg[]; total: number }) {
+  const cx = 150,
+    cy = 140,
+    r = 76,
+    sw = 34;
+  const live = total > 0 ? segs.filter((x) => x.n > 0) : [];
+  let a0 = 0;
+  const arcs = live.map((x, i) => {
+    const len = (x.n / total) * 100;
+    const o = { ...x, i, from: a0, len, mid: a0 + len / 2 };
+    a0 += len;
+    return o;
+  });
+  const rot = `rotate(-90 ${cx} ${cy})`;
+  return (
+    <svg
+      viewBox="0 0 300 272"
+      className="donut2"
+      role="img"
+      aria-label="Status pengajuan PO"
+    >
+      <defs>
+        {arcs.map((a) => (
+          <linearGradient key={a.i} id={'dg' + a.i} x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stopColor={lite(a.c, 0.45)} />
+            <stop offset=".6" stopColor={a.c} />
+            <stop offset="1" stopColor={a.c} />
+          </linearGradient>
+        ))}
+        <linearGradient id="dgl" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stopColor="#fff" stopOpacity=".7" />
+          <stop offset=".5" stopColor="#fff" stopOpacity=".04" />
+          <stop offset="1" stopColor="#fff" stopOpacity=".2" />
+        </linearGradient>
+        <radialGradient id="dhalo" cx=".5" cy=".38" r=".75">
+          <stop offset="0" stopColor="#fff" stopOpacity=".7" />
+          <stop offset="1" stopColor="#cfe3fa" stopOpacity=".28" />
+        </radialGradient>
+        <radialGradient id="dcen" cx=".35" cy=".28" r=".95">
+          <stop offset="0" stopColor="#fff" stopOpacity=".98" />
+          <stop offset="1" stopColor="#d9e9fc" stopOpacity=".8" />
+        </radialGradient>
+        <linearGradient id="dcg" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stopColor="#fff" stopOpacity=".9" />
+          <stop offset="1" stopColor="#fff" stopOpacity="0" />
+        </linearGradient>
+        <clipPath id="dcc">
+          <circle cx={cx} cy={cy} r={r - sw / 2 - 3} />
+        </clipPath>
+        <filter id="dsb" x="-20%" y="-20%" width="140%" height="140%">
+          <feGaussianBlur stdDeviation="1.6" />
+        </filter>
+        <mask id="dmask">
+          <circle
+            cx={cx}
+            cy={cy}
+            r={r}
+            fill="none"
+            stroke="#fff"
+            strokeWidth={sw + 8}
+            pathLength={100}
+            className="dreveal"
+            transform={rot}
+          />
+        </mask>
+      </defs>
+      <circle
+        cx={cx}
+        cy={cy}
+        r={r + sw / 2 + 6}
+        fill="url(#dhalo)"
+        stroke="#fff"
+        strokeOpacity=".9"
+        strokeWidth={1.5}
+      />
+      <circle
+        cx={cx}
+        cy={cy}
+        r={r}
+        fill="none"
+        stroke={total > 0 ? '#fff' : '#d6e6f8'}
+        strokeOpacity={total > 0 ? 0.5 : 1}
+        strokeWidth={sw}
+      />
+      <g mask="url(#dmask)">
+        {arcs.map((a) => {
+          const d = Math.max(a.len - 0.9, 0.1);
+          return (
+            <circle
+              key={a.i}
+              cx={cx}
+              cy={cy}
+              r={r}
+              fill="none"
+              stroke={`url(#dg${a.i})`}
+              strokeWidth={sw}
+              pathLength={100}
+              strokeDasharray={`${d} ${100 - d}`}
+              strokeDashoffset={-a.from}
+              transform={rot}
+            />
+          );
+        })}
+        {total > 0 && (
+          <circle
+            cx={cx}
+            cy={cy}
+            r={r}
+            fill="none"
+            stroke="url(#dgl)"
+            strokeWidth={sw}
+          />
+        )}
+        <circle
+          cx={cx}
+          cy={cy}
+          r={r + sw / 2 - 1}
+          fill="none"
+          stroke="#fff"
+          strokeOpacity=".9"
+          strokeWidth={1.6}
+        />
+        <circle
+          cx={cx}
+          cy={cy}
+          r={r - sw / 2 + 1}
+          fill="none"
+          stroke="#fff"
+          strokeOpacity=".75"
+          strokeWidth={1.4}
+        />
+      </g>
+      {total > 0 && (
+        <g className="dspin" style={{ pointerEvents: 'none' }}>
+          <circle
+            cx={cx}
+            cy={cy}
+            r={r}
+            fill="none"
+            stroke="#fff"
+            strokeOpacity=".8"
+            strokeWidth={sw}
+            pathLength={100}
+            strokeDasharray="4 96"
+            filter="url(#dsb)"
+            transform={rot}
+          />
+        </g>
+      )}
+      <circle
+        cx={cx}
+        cy={cy}
+        r={r - sw / 2 - 3}
+        fill="url(#dcen)"
+        stroke="#fff"
+        strokeWidth={1.5}
+      />
+      <g clipPath="url(#dcc)">
+        <ellipse
+          cx={cx}
+          cy={cy - 30}
+          rx={44}
+          ry={24}
+          fill="url(#dcg)"
+          opacity=".7"
+        />
+      </g>
+      <text x={cx} y={cy + 8} className="dn">
+        {total}
+      </text>
+      <text x={cx} y={cy + 30} className="dl">
+        Total PO
+      </text>
+      {arcs.map((a) => {
+        const t = (a.mid / 100) * Math.PI * 2,
+          sn = Math.sin(t),
+          cs = Math.cos(t),
+          rl = r + sw / 2 + 17,
+          x = cx + rl * sn,
+          y = cy - rl * cs,
+          anc = sn > 0.25 ? 'start' : sn < -0.25 ? 'end' : 'middle',
+          y0 = cs > 0.5 ? y - 16 : cs < -0.5 ? y + 10 : y - 2;
+        return (
+          <g
+            key={'l' + a.i}
+            className="gtip"
+            style={{ animationDelay: `${900 + a.i * 120}ms` }}
+          >
+            <text x={x} y={y0} textAnchor={anc} className="dp" fill={a.c}>
+              {Math.round((a.n / total) * 100)}%
+            </text>
+            <text x={x} y={y0 + 13} textAnchor={anc} className="dq">
+              ({a.n} PO)
+            </text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+/** isi kartu Status Pengajuan PO: donut, legenda berikon, dan informasi tambahan */
+function StatusBody({
+  segs,
+  total,
+  info,
+}: {
+  segs: StSeg[];
+  total: number;
+  info: {
+    avg: string;
+    chip: Dl | null;
+    vs: string;
+    apprV: number;
+    waitV: number;
+    totV: number;
+  };
+}) {
+  const pc = (v: number) => (info.totV ? Math.round((v / info.totV) * 100) : 0);
+  return (
+    <>
+      <div className="stwrap">
+        <Donut segs={segs} total={total} />
+        <ul className="stleg">
+          {segs.map((x) => (
+            <li key={x.l}>
+              <i
+                className="dot"
+                style={{
+                  background: `radial-gradient(circle at 35% 30%, ${lite(
+                    x.c,
+                    0.55
+                  )}, ${x.c} 70%)`,
+                }}
+              />
+              <span className="lt">
+                <b>{x.l}</b>
+                <small>{x.d}</small>
+              </span>
+              <span className="lv">
+                <b>{x.n}</b>
+                <small>({total ? Math.round((x.n / total) * 100) : 0}%)</small>
+              </span>
+              <span
+                className="lic"
+                style={{
+                  color: x.c,
+                  background: `linear-gradient(145deg,${x.c}38,${x.c}14)`,
+                }}
+              >
+                <Ic n={x.ic} s={20} />
+              </span>
+            </li>
+          ))}
+        </ul>
+      </div>
+      <div className="sinfo">
+        <h4>
+          <span>
+            <Ic n="grid" s={15} />
+          </span>
+          Informasi Tambahan
+        </h4>
+        <div className="sgrid">
+          <div className="sc">
+            <div className="sh">
+              <span className="si">
+                <Ic n="clock" s={20} />
+              </span>
+              Rata-rata Waktu Approval
+            </div>
+            <b>{info.avg}</b>
+            <small>
+              {info.chip && (
+                <em className={'chip ' + info.chip.tone}>{info.chip.t}</em>
+              )}
+              {info.vs}
+            </small>
+          </div>
+          <div className="sc">
+            <div className="sh">
+              <span className="si">
+                <Ic n="fileList" s={20} />
+              </span>
+              Nilai PO Disetujui
+            </div>
+            <b>{short(info.apprV, 1)}</b>
+            <span className="pgb">
+              <i
+                style={{
+                  width: `${pc(info.apprV)}%`,
+                  background: 'linear-gradient(90deg,#4ddc9c,#16a263)',
+                }}
+              />
+            </span>
+            <small>{pc(info.apprV)}% dari total nilai PO</small>
+          </div>
+          <div className="sc">
+            <div className="sh">
+              <span className="si">
+                <Ic n="coins" s={20} />
+              </span>
+              Nilai PO Menunggu
+            </div>
+            <b>{short(info.waitV, 1)}</b>
+            <span className="pgb">
+              <i
+                style={{
+                  width: `${pc(info.waitV)}%`,
+                  background: 'linear-gradient(90deg,#ffd45e,#f0a014)',
+                }}
+              />
+            </span>
+            <small>{pc(info.waitV)}% dari total nilai PO</small>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function Dashboard({
+  list,
+  me,
+  admin,
+  per,
+  onPrint,
+  onAll,
+  onPer,
+  deptList,
+  cats: catList,
+}: {
+  onPer: (p: PSel) => void;
+  cats: Cat[];
+  deptList: string[];
+  list: PO[];
+  me: User;
+  admin: boolean;
+  per: PSel;
+  onPrint: (no: string) => void;
+  onAll: (f: string) => void;
+}) {
+  const [ctype, setCtype] = useState<'all' | CatType>('all');
+  const now = Date.now();
+  const inM = (p: PO, m: number) => mkey(new Date(p.iso)) === m;
+  const mi = per && per.type === 'monthly' ? per.year * 12 + per.n : null;
+  const inR = (p: PO, r: { from: number; to: number }) => {
+    const t = new Date(p.iso).getTime();
+    return t >= r.from && t < r.to;
+  };
+  const pp = per ? prevPer(per) : null;
+  const cur = per === null ? list : list.filter((p) => inR(p, pRange(per)));
+  const prv = pp === null ? [] : list.filter((p) => inR(p, pRange(pp)));
+  const sum = (a: PO[]) => ({
+    n: a.length,
+    appr: a.filter((p) => !p.rej && isAppr(p)).length,
+    rej: a.filter((p) => p.rej).length,
+    wait: a.filter(isWait).length,
+    v: a.reduce((x, p) => x + p.total, 0),
+  });
+  const c = sum(cur),
+    pv = sum(prv);
+  const waitAt = (p: PO, t: number) => {
+    if (new Date(p.iso).getTime() > t) return false;
+    const ap = Math.min(
+      p.trk?.appr ? new Date(p.trk.appr + 'T00:00:00').getTime() : Infinity,
+      p.doneAt ? new Date(p.doneAt).getTime() : Infinity
+    );
+    return ap > t && (p.rej ? new Date(p.rej).getTime() : Infinity) > t;
+  };
+  const wWeek = cur.filter((p) => waitAt(p, now - 7 * 86400000)).length;
+  const vs = pp === null ? 'Semua periode' : `vs ${pLabel(pp)}`;
+  // rata-rata waktu approval (hari) dari PO yang sudah disetujui
+  const apprTs = (p: PO) =>
+    Math.min(
+      p.trk?.appr ? new Date(p.trk.appr + 'T00:00:00').getTime() : Infinity,
+      p.doneAt ? new Date(p.doneAt).getTime() : Infinity
+    );
+  const avgAppr = (a: PO[]) => {
+    const xs = a
+      .filter((p) => !p.rej && isAppr(p))
+      .map((p) => (apprTs(p) - new Date(p.iso).getTime()) / 86400000)
+      .filter((x) => isFinite(x))
+      .map((x) => Math.max(0, x));
+    return xs.length ? xs.reduce((s, x) => s + x, 0) / xs.length : null;
+  };
+  const avgC = avgAppr(cur);
+  const avgP = pp === null ? null : avgAppr(prv);
+  let avgChip: Dl | null = null;
+  if (avgC !== null && avgP !== null && avgP > 0) {
+    const dd = Math.round(((avgC - avgP) / avgP) * 100);
+    avgChip = {
+      t: `${dd < 0 ? '▼' : dd > 0 ? '▲' : '▬'} ${dd > 0 ? '+' : ''}${dd}%`,
+      tone: dd < 0 ? 'good' : dd > 0 ? 'bad' : 'flat',
+    };
+  }
+  const apprV = cur
+    .filter((p) => !p.rej && isAppr(p))
+    .reduce((x, p) => x + p.total, 0);
+  const waitV = cur.filter(isWait).reduce((x, p) => x + p.total, 0);
+  const kpis: {
+    ic: string;
+    g: string;
+    l: string;
+    v: number;
+    f: (n: number) => string;
+    d: Dl | null;
+    sub: string;
+  }[] = [
+    {
+      ic: 'fileList',
+      g: 'linear-gradient(145deg,#3a96ee,#1a62c8)',
+      l: 'Total Pengajuan',
+      v: c.n,
+      f: String,
+      d: per === null ? null : dl(c.n, pv.n, { pct: true }),
+      sub: vs,
+    },
+    {
+      ic: 'clock',
+      g: 'linear-gradient(145deg,#ffc94d,#f09a14)',
+      l: 'Menunggu Approval',
+      v: c.wait,
+      f: String,
+      d: dl(c.wait, wWeek, { upBad: true }),
+      sub: 'dari minggu lalu',
+    },
+    {
+      ic: 'check',
+      g: 'linear-gradient(145deg,#3fd090,#16a263)',
+      l: 'Approved',
+      v: c.appr,
+      f: String,
+      d: per === null ? null : dl(c.appr, pv.appr, { pct: true }),
+      sub: vs,
+    },
+    {
+      ic: 'x',
+      g: 'linear-gradient(145deg,#ff7a86,#e03546)',
+      l: 'Rejected',
+      v: c.rej,
+      f: String,
+      d: per === null ? null : dl(c.rej, pv.rej, { upBad: true }),
+      sub: vs,
+    },
+    {
+      ic: 'coins',
+      g: 'linear-gradient(145deg,#a98bf5,#7048dc)',
+      l: 'Total Nilai PO',
+      v: c.v,
+      f: rp,
+      d: per === null ? null : dl(c.v, pv.v, { pct: true }),
+      sub: vs,
+    },
+  ];
+
+  // Jendela tren: kalau periode = semester, tampilkan tepat 6 bulan semester itu
+  // (S1 = Jan–Jun, S2 = Jul–Des); kalau tidak, jendela 6 bulan tetap berakhir di
+  // bulan ini, sehingga klik bar tidak menggeser grafik; bulan lama yang dipilih
+  // dari dropdown tetap tampil di awal jendela.
+  const nowK = mkey(new Date());
+  const sem = per && per.type === 'semester' ? per : null;
+  const base = sem
+    ? sem.year * 12 + (sem.n - 1) * 6 + 5
+    : mi === null || (mi >= nowK - 5 && mi <= nowK)
+    ? nowK
+    : mi < nowK - 5
+    ? mi + 5
+    : mi;
+  const trend = Array.from({ length: 6 }, (_, i) => {
+    const idx = base - 5 + i;
+    const a = list.filter((p) => inM(p, idx));
+    return {
+      l: new Date(Math.floor(idx / 12), idx % 12, 1).toLocaleDateString(
+        'id-ID',
+        { month: 'short' }
+      ),
+      t: a.reduce((x, p) => x + p.total, 0),
+      n: a.length,
+      m: idx,
+    };
+  });
+
+  const cm = new Map<string, number>();
+  const typeOf = new Map(catList.map((x) => [x.name, x.type] as const));
+  cur.forEach((p) =>
+    p.items.forEach((l) => {
+      if (
+        ctype !== 'all' &&
+        (!l.k || (typeOf.get(l.k) ?? guessType(l.k)) !== ctype)
+      )
+        return;
+      const k = l.k || 'Tanpa Kategori';
+      cm.set(k, (cm.get(k) ?? 0) + l.q * l.p);
+    })
+  );
+  const cats = [...cm].sort((a, b) => b[1] - a[1]).slice(0, 10);
+  const cmax = cats[0]?.[1] || 1;
+
+  const depts = admin ? deptList : [me.dept];
+  const dRows = depts
+    .map((d) => {
+      const a = cur.filter((p) => p.dept === d);
+      return { d, n: a.length, t: a.reduce((x, p) => x + p.total, 0) };
+    })
+    .sort((x, y) => y.t - x.t || x.d.localeCompare(y.d, 'id'));
+
+  const sm = new Map<string, { nama: string; n: number; t: number }>();
+  cur.forEach((p) => {
+    const k = p.v.nama.trim().toLowerCase();
+    const x = sm.get(k);
+    sm.set(k, { nama: p.v.nama, n: (x?.n ?? 0) + 1, t: (x?.t ?? 0) + p.total });
+  });
+  const sups = [...sm.values()].sort((a, b) => b.t - a.t).slice(0, 10);
+
+  const recent = [...cur]
+    .sort((a, b) => b.iso.localeCompare(a.iso))
+    .slice(0, 5);
+  const waiting = list
+    .filter(isWait)
+    .sort((a, b) => a.iso.localeCompare(b.iso))
+    .slice(0, 5);
+  const days = (iso: string) =>
+    Math.max(0, Math.floor((now - new Date(iso).getTime()) / 86400000));
+  const pill = (p: PO) =>
+    p.rej
+      ? ['Rejected', 's-rejected']
+      : isAppr(p)
+      ? ['Approved', 's-Done']
+      : ['Menunggu', 's-Open'];
+  const link = (txt: string, f: string) => (
+    <button type="button" className="vall" onClick={() => onAll(f)}>
+      {txt} <Ic n="right" s={13} />
+    </button>
+  );
+  const none = <div className="empty">Belum ada data pada periode ini.</div>;
+  const k = per ? `${per.type}-${per.year}-${per.n}` : 'all';
+  const nowY = new Date().getFullYear();
+  const minY = Math.min(
+    nowY - 1,
+    ...list.map((p) => new Date(p.iso).getFullYear()).filter((y) => isFinite(y))
+  );
+  const years = Array.from({ length: nowY - minY + 1 }, (_, i) => nowY - i);
+  const setYear = (v: string) => {
+    if (v === 'all') return onPer(null);
+    const y = Number(v);
+    onPer(
+      per
+        ? fixPer(per.type, y, per.n)
+        : { type: 'monthly', year: y, n: defN('monthly', y) }
+    );
+  };
+  const setType = (t: PType) => {
+    const y = per ? per.year : nowY;
+    onPer({ type: t, year: y, n: defN(t, y) });
+  };
+  const nOpts =
+    per && per.type !== 'yearly'
+      ? Array.from({ length: pMax(per.type, per.year) }, (_, i) => {
+          const n = per.type === 'monthly' ? i : i + 1;
+          return { n, l: pItem(per.type, per.year, n) };
+        })
+      : [];
+
+  return (
+    <div className="dash">
+      <div className="dhead">
+        <span className="dhic">
+          <Ic n="chart" s={26} />
+        </span>
+        <div className="dht">
+          <h2>PO Request Dashboard</h2>
+          <p>Monitoring Pengajuan PO secara Real-Time</p>
+        </div>
+        <div className="dper">
+          <Ic n="calendar" s={16} />
+          <span>Periode :</span>
+          <label className="dsel">
+            <select
+              value={per ? String(per.year) : 'all'}
+              onChange={(e) => setYear(e.target.value)}
+              aria-label="Tahun"
+            >
+              <option value="all">Semua periode</option>
+              {years.map((y) => (
+                <option key={y} value={y}>
+                  {y}
+                </option>
+              ))}
+            </select>
+            <Ic n="down" s={14} />
+          </label>
+          {per && (
+            <label className="dsel">
+              <select
+                value={per.type}
+                onChange={(e) => setType(e.target.value as PType)}
+                aria-label="Tipe periode"
+              >
+                {PTYPES.map((t) => (
+                  <option key={t.k} value={t.k}>
+                    {t.l}
+                  </option>
+                ))}
+              </select>
+              <Ic n="down" s={14} />
+            </label>
+          )}
+          {per && per.type !== 'yearly' && (
+            <label className="dsel">
+              <select
+                value={per.n}
+                onChange={(e) => onPer({ ...per, n: Number(e.target.value) })}
+                aria-label="Pilih periode"
+              >
+                {nOpts.map((o) => (
+                  <option key={o.n} value={o.n}>
+                    {o.l}
+                  </option>
+                ))}
+              </select>
+              <Ic n="down" s={14} />
+            </label>
+          )}
+        </div>
+        <div className="dupd">
+          <Ic n="clock" s={18} />
+          <span>
+            <small>Last Update</small>
+            <b>
+              {new Date(now).toLocaleDateString('id-ID', {
+                day: 'numeric',
+                month: 'short',
+                year: 'numeric',
+              })}{' '}
+              {new Date(now)
+                .toLocaleTimeString('id-ID', {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                })
+                .replace('.', ':')}{' '}
+              WIB
+            </b>
+          </span>
+        </div>
+      </div>
+      <div className="kpis" key={'k' + k}>
+        {kpis.map((x, i) => (
+          <div
+            className={'card kpi k' + (i + 1)}
+            key={x.l}
+            style={{ animationDelay: `${i * 70}ms` }}
+          >
+            <span className="kic" style={{ background: x.g }}>
+              <Ic n={x.ic} s={20} />
+            </span>
+            <div className="kb">
+              <small>{x.l}</small>
+              <b>
+                <Fit text={x.f(x.v)}>
+                  <Num to={x.v} f={x.f} />
+                </Fit>
+              </b>
+              <div className="kd">
+                {x.d && <em className={x.d.tone}>{x.d.t}</em>}
+                <span>{x.sub}</span>
+              </div>
+            </div>
+            <span className="kbars" aria-hidden="true">
+              <i />
+              <i />
+              <i />
+              <i />
+            </span>
+          </div>
+        ))}
+      </div>
+
+      <div className="drow dtop" key={'c' + k}>
+        <DCard
+          big
+          ic="chart"
+          title={
+            sem
+              ? `Tren Nilai PO (${pLabel(sem)})`
+              : 'Tren Nilai PO (6 Bulan Terakhir)'
+          }
+          sub="Perbandingan Nilai dan Jumlah PO per Bulan"
+          right={
+            <span className="lg2">
+              <span>
+                <i />
+                <em>
+                  Nilai PO<small>(Rp Juta)</small>
+                </em>
+              </span>
+              <span>
+                <i className="ln" />
+                <em>
+                  Jumlah PO<small>(Dokumen)</small>
+                </em>
+              </span>
+            </span>
+          }
+        >
+          <TrendChart
+            data={trend}
+            sel={mi}
+            avgSub={sem ? pLabel(sem) : '6 Bulan Terakhir'}
+            onPick={(m) =>
+              onPer(
+                m === null
+                  ? null
+                  : { type: 'monthly', year: Math.floor(m / 12), n: m % 12 }
+              )
+            }
+          />
+          <div className="trfoot">
+            <Ic n="filter" s={16} />
+            <span>
+              {per === null ? (
+                'Klik bar bulan untuk memfilter seluruh dashboard.'
+              ) : mi === null ? (
+                <>
+                  Filter aktif: <b>{pLabel(per)}</b>. Klik bar bulan untuk
+                  beralih ke filter bulanan.
+                </>
+              ) : (
+                <>
+                  Filter aktif: <b>{pLabel(per)}</b>. Klik bulan yang sama lagi
+                  untuk kembali ke semua periode.
+                </>
+              )}
+            </span>
+          </div>
+        </DCard>
+        <DCard
+          big
+          ic="clock"
+          title="Status Pengajuan PO"
+          sub="Total pengajuan pada periode yang dipilih"
+          right={
+            <label className="ppill">
+              <Ic n="calendar" s={16} />
+              <span>{per ? pLabel(per) : 'Semua periode'}</span>
+              {per && per.type !== 'yearly' && (
+                <>
+                  <Ic n="down" s={14} />
+                  <select
+                    value={per.n}
+                    onChange={(e) =>
+                      onPer({ ...per, n: Number(e.target.value) })
+                    }
+                    aria-label="Pilih periode"
+                  >
+                    {nOpts.map((o) => (
+                      <option key={o.n} value={o.n}>
+                        {o.l}
+                      </option>
+                    ))}
+                  </select>
+                </>
+              )}
+            </label>
+          }
+        >
+          <StatusBody
+            total={c.n}
+            segs={[
+              {
+                l: 'Approved',
+                n: c.appr,
+                c: '#22b573',
+                d: 'Telah disetujui dan diproses',
+                ic: 'check',
+              },
+              {
+                l: 'Menunggu Approval',
+                n: c.wait,
+                c: '#f5b82e',
+                d: 'Sedang dalam proses persetujuan',
+                ic: 'clock',
+              },
+              {
+                l: 'Rejected',
+                n: c.rej,
+                c: '#ef4a5a',
+                d: 'Tidak disetujui / dibatalkan',
+                ic: 'x',
+              },
+            ]}
+            info={{
+              avg:
+                avgC === null
+                  ? '—'
+                  : `${avgC.toLocaleString('id-ID', {
+                      maximumFractionDigits: 1,
+                    })} hari`,
+              chip: avgChip,
+              vs: pp === null ? 'Semua periode' : `dibanding ${pLabel(pp)}`,
+              apprV,
+              waitV,
+              totV: c.v,
+            }}
+          />
+        </DCard>
+      </div>
+
+      <div className="drow" key={'g' + k}>
+        <DCard ic="box" title="Top 10 Kategori Barang/Jasa">
+          <div className="cseg" role="tablist" aria-label="Filter tipe">
+            {(['all', 'Barang', 'Jasa'] as const).map((t) => (
+              <button
+                key={t}
+                role="tab"
+                aria-selected={ctype === t}
+                className={ctype === t ? 'on' : ''}
+                onClick={() => setCtype(t)}
+              >
+                {t === 'all' ? 'Semua' : t}
+              </button>
+            ))}
+          </div>
+          {!cats.length ? (
+            none
+          ) : (
+            <div className="ccols">
+              {cats.map(([n, v], i) => (
+                <div className="crow" key={n}>
+                  <span className="cn" title={n}>
+                    {n}
+                  </span>
+                  <span className="cb">
+                    <i
+                      style={{
+                        width: `${Math.max(4, (v / cmax) * 100)}%`,
+                        background: `linear-gradient(90deg,#0f5fc0,#2f9be0)`,
+                        opacity: Math.max(0.4, 1 - i * 0.07),
+                        animationDelay: `${i * 90}ms`,
+                      }}
+                    />
+                  </span>
+                  <span className="cv">{rp(v)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </DCard>
+      </div>
+
+      <div className="drow d2" key={'t' + k}>
+        <DCard ic="building" title="Pengajuan per Departemen">
+          <div className="tbl" style={{ maxHeight: 300, overflowY: 'auto' }}>
+            <table className="dtbl">
+              <thead>
+                <tr>
+                  <th>Departemen</th>
+                  <th>Jumlah PO</th>
+                  <th>Total Nilai</th>
+                  <th>Persentase</th>
+                </tr>
+              </thead>
+              <tbody>
+                {dRows.map((r, i) => {
+                  const pc = c.v ? Math.round((r.t / c.v) * 100) : 0;
+                  return (
+                    <tr key={r.d}>
+                      <td>
+                        <span className="dpn">
+                          <span className="dpi">
+                            <Ic n="users" s={14} />
+                          </span>
+                          {r.d}
+                        </span>
+                      </td>
+                      <td>{r.n}</td>
+                      <td className="num">{rp(r.t)}</td>
+                      <td>
+                        <div className="pc">
+                          <span className="cb">
+                            <i
+                              style={{
+                                width: `${pc}%`,
+                                background:
+                                  'linear-gradient(90deg,#1596d6,#40a8ef)',
+                                animationDelay: `${i * 70}ms`,
+                              }}
+                            />
+                          </span>
+                          <span>{pc}%</span>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </DCard>
+        <DCard
+          ic="users"
+          title="Top 10 Supplier (Nilai PO)"
+          right={link('Lihat Semua', '')}
+        >
+          {!sups.length ? (
+            none
+          ) : (
+            <div className="tbl">
+              <table className="dtbl">
+                <thead>
+                  <tr>
+                    <th>Supplier</th>
+                    <th>Jumlah PO</th>
+                    <th>Total Nilai</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sups.map((x, i) => (
+                    <tr key={x.nama}>
+                      <td>
+                        <span className="ell">
+                          <span className={'rk g' + (i + 1)}>{i + 1}</span>
+                          {x.nama}
+                        </span>
+                      </td>
+                      <td>{x.n}</td>
+                      <td className="num">{rp(x.t)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </DCard>
+      </div>
+
+      <div className="drow d2" key={'r' + k}>
+        <DCard
+          ic="fileList"
+          title="Pengajuan Terbaru"
+          right={link('Lihat Semua', '')}
+        >
+          {!recent.length ? (
+            none
+          ) : (
+            <div className="tbl">
+              <table className="dtbl">
+                <thead>
+                  <tr>
+                    <th>No. Pengajuan</th>
+                    <th>Tanggal</th>
+                    <th>Supplier</th>
+                    <th>Departemen</th>
+                    <th>Nilai</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {recent.map((p) => {
+                    const [t, cl] = pill(p);
+                    return (
+                      <tr key={p.no}>
+                        <td>
+                          <button
+                            type="button"
+                            className="lnk"
+                            onClick={() => onPrint(p.no)}
+                          >
+                            {p.no}
+                          </button>
+                        </td>
+                        <td>{fmt(p.iso)}</td>
+                        <td>
+                          <span className="ell">{p.v.nama}</span>
+                        </td>
+                        <td>{p.dept}</td>
+                        <td className="num">{rp(p.total)}</td>
+                        <td>
+                          <span className={'tag ' + cl}>{t}</span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </DCard>
+        <DCard
+          ic="clock"
+          title="Menunggu Approval"
+          right={link('Lihat Semua', 'Open')}
+        >
+          {!waiting.length ? (
+            <div className="empty">
+              Tidak ada pengajuan yang menunggu approval.
+            </div>
+          ) : (
+            <div className="tbl">
+              <table className="dtbl">
+                <thead>
+                  <tr>
+                    <th>No. Pengajuan</th>
+                    <th>Tanggal</th>
+                    <th>Departemen</th>
+                    <th>Nilai</th>
+                    <th>Lama Menunggu</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {waiting.map((p) => {
+                    const d = days(p.iso);
+                    return (
+                      <tr key={p.no}>
+                        <td>
+                          <button
+                            type="button"
+                            className="lnk"
+                            onClick={() => onPrint(p.no)}
+                          >
+                            {p.no}
+                          </button>
+                        </td>
+                        <td>{fmt(p.iso)}</td>
+                        <td>{p.dept}</td>
+                        <td className="num">{rp(p.total)}</td>
+                        <td>
+                          <span
+                            className={
+                              'lm ' + (d >= 4 ? 'c' : d >= 2 ? 'b' : 'a')
+                            }
+                          >
+                            {d === 0 ? 'Hari ini' : `${d} hari`}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </DCard>
+      </div>
+    </div>
+  );
+}
+
+/* ================= HALAMAN SEMUA PENGAJUAN (admin) ================= */
+const monthRange = () => {
+  const n = new Date();
+  return {
+    from: ymd(new Date(n.getFullYear(), n.getMonth(), 1)),
+    to: ymd(new Date(n.getFullYear(), n.getMonth() + 1, 0)),
+  };
+};
+const ymdLabel = (s: string, empty: string) =>
+  s
+    ? new Date(s + 'T00:00:00').toLocaleDateString('id-ID', {
+        day: '2-digit',
+        month: 'short',
+        year: 'numeric',
+      })
+    : empty;
+const poState = (p: PO) =>
+  p.rej ? 'Rejected' : p.status === 'Done' ? 'Done' : 'Open';
+/** Batas nilai PO: di atas Rp 10 juta wajib approve Managing Director. */
+const PO_LIMIT = 10_000_000;
+const isBig = (p: PO) => p.total > PO_LIMIT;
+
+/** tombol tanggal: teks berformat "01 Okt 2026", input date asli transparan di atasnya */
+function DateBtn({
+  v,
+  empty,
+  label,
+  onChange,
+}: {
+  v: string;
+  empty: string;
+  label: string;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <label className="ap-date">
+      <span>{ymdLabel(v, empty)}</span>
+      <input
+        type="date"
+        value={v}
+        aria-label={label}
+        onChange={(e) => onChange(e.target.value)}
+        onClick={(e) => {
+          try {
+            (
+              e.currentTarget as HTMLInputElement & { showPicker?: () => void }
+            ).showPicker?.();
+          } catch {
+            /* abaikan */
+          }
+        }}
+      />
+    </label>
+  );
+}
+
+/** menu tombol "···" pada baris tabel; dirender lewat portal agar tidak terpotong tabel */
+function RowMenu({
+  items,
+}: {
+  items: { l: string; f: () => void; cls?: string }[];
+}) {
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
+  useEffect(() => {
+    if (!pos) return;
+    const close = () => setPos(null);
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('resize', close);
+    return () => {
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('resize', close);
+    };
+  }, [pos]);
+  if (!items.length) return null;
+  return (
+    <>
+      <button
+        type="button"
+        className="ap-dots"
+        aria-label="Aksi lainnya"
+        aria-haspopup="menu"
+        aria-expanded={!!pos}
+        onClick={(e) => {
+          if (pos) return setPos(null);
+          const r = e.currentTarget.getBoundingClientRect();
+          const h = items.length * 36 + 14;
+          setPos({
+            x: Math.max(8, r.right - 172),
+            y:
+              r.bottom + h + 12 > window.innerHeight
+                ? Math.max(8, r.top - h - 6)
+                : r.bottom + 6,
+          });
+        }}
+      >
+        ···
+      </button>
+      {pos &&
+        createPortal(
+          <>
+            <div className="ap-mask" onClick={() => setPos(null)} />
+            <div
+              className="ap-menu"
+              role="menu"
+              style={{ left: pos.x, top: pos.y }}
+            >
+              {items.map((it) => (
+                <button
+                  key={it.l}
+                  type="button"
+                  role="menuitem"
+                  className={it.cls}
+                  onClick={() => {
+                    setPos(null);
+                    it.f();
+                  }}
+                >
+                  {it.l}
+                </button>
+              ))}
+            </div>
+          </>,
+          document.body
+        )}
+    </>
+  );
+}
+
+function AllPage({
+  list,
+  bps,
+  depts,
+  init,
+  onPrint,
+  onCopy,
+  onDone,
+  onReject,
+  onPoReject,
+  onReopen,
+  lockedOf,
+  onExport,
+  onViewForm,
+}: {
+  list: PO[];
+  bps: BP[];
+  depts: string[];
+  init: { dept: string; stat: string; q: string };
+  onPrint: (no: string) => void;
+  onCopy: (p: PO, all: boolean) => void;
+  onDone: (no: string) => void;
+  onReject: (no: string) => void;
+  onPoReject: (no: string) => void;
+  onReopen: (no: string) => void;
+  lockedOf: (p: PO) => boolean;
+  onExport: (l: PO[]) => void;
+  onViewForm?: (p: PO) => void; // admin: buka form isian PO (mode lihat saja)
+}) {
+  const fromLink = !!(init.dept || init.stat || init.q); // dibuka dari tautan "Lihat Semua"/pencarian: tampilkan semua periode
+  const def = monthRange();
+  const f0 = {
+    from: fromLink ? '' : def.from,
+    to: fromLink ? '' : def.to,
+    dept: init.dept,
+    by: '',
+    stat: init.stat,
+  };
+  const [dr, setDr] = useState(f0); // isian filter (belum diterapkan)
+  const [ap, setAp] = useState(f0); // filter yang sedang berlaku
+  const [q, setQ] = useState(init.q);
+  const [open, setOpen] = useState('');
+  const [lim, setLim] = useState<'' | 'atas' | 'bawah'>(''); // filter laporan nilai PO
+  const [sort, setSort] = useState<'' | 'asc' | 'desc'>('');
+  useEffect(() => {
+    setQ(init.q);
+  }, [init.q]);
+
+  const kw = q.trim().toLowerCase();
+  const hit = (p: PO) =>
+    !kw ||
+    (
+      p.no +
+      ' ' +
+      p.v.nama +
+      ' ' +
+      p.by +
+      ' ' +
+      p.items.map((i) => i.d).join(' ')
+    )
+      .toLowerCase()
+      .includes(kw);
+  const pass = (p: PO, f: typeof ap) =>
+    (!f.dept || p.dept === f.dept) &&
+    (!f.by || p.by === f.by) &&
+    (!f.stat || poState(p) === f.stat);
+  const inR = (p: PO, from: string, to: string) => {
+    const k = ymd(new Date(p.iso));
+    return (!from || k >= from) && (!to || k <= to);
+  };
+
+  const useRange = !kw; // pencarian kata kunci mencari di semua periode
+  const cur = list.filter(
+    (p) => pass(p, ap) && hit(p) && (!useRange || inR(p, ap.from, ap.to))
+  );
+  let prv: PO[] | null = null;
+  if (useRange && ap.from && ap.to) {
+    const t0 = new Date(ap.from + 'T00:00:00').getTime();
+    const len =
+      Math.round((new Date(ap.to + 'T00:00:00').getTime() - t0) / 86400000) + 1;
+    const pf = ymd(new Date(t0 - len * 86400000)),
+      pt = ymd(new Date(t0 - 86400000));
+    prv = list.filter((p) => pass(p, ap) && inR(p, pf, pt));
+  }
+  const delta = (a: number, b: number | null) => {
+    if (b === null) return null;
+    if (!b)
+      return a ? { t: 'Baru', tone: 'good' } : { t: '→ 0%', tone: 'flat' };
+    const pc = Math.round(((a - b) / b) * 100);
+    return pc > 0
+      ? { t: `↑ +${pc}%`, tone: 'good' }
+      : pc < 0
+      ? { t: `↓ -${Math.abs(pc)}%`, tone: 'bad' }
+      : { t: '→ 0%', tone: 'flat' };
+  };
+
+  const total = cur.reduce((x, p) => x + p.total, 0);
+  const nWait = cur.filter(isWait).length;
+  const kpis: {
+    l: string;
+    ic: ReactNode;
+    v: string;
+    badge?: [string, string];
+    d?: { t: string; tone: string } | null;
+    sub: string;
+    dIn?: 'val' | 'sub';
+  }[] = [
+    {
+      l: 'Total Pengajuan PO',
+      ic: <Ic n="fileList" s={22} />,
+      v: String(cur.length),
+      d: delta(cur.length, prv ? prv.length : null),
+      dIn: 'val',
+      sub: 'vs periode sebelumnya',
+    },
+    {
+      l: 'Jumlah Pembuat PO',
+      ic: <Ic n="users" s={22} />,
+      v: String(new Set(cur.map((p) => p.uid)).size),
+      badge: ['Aktif', 'b'],
+      sub: '',
+    },
+    {
+      l: 'Departemen',
+      ic: <Ic n="building" s={22} />,
+      v: String(new Set(cur.map((p) => p.dept)).size),
+      badge: ['Terlibat', 'b'],
+      sub: '',
+    },
+    {
+      l: 'Total Nilai PO',
+      ic: <span className="rpc">Rp</span>,
+      v: rp(total),
+      d: delta(total, prv ? prv.reduce((x, p) => x + p.total, 0) : null),
+      dIn: 'sub',
+      sub: 'vs periode sebelumnya',
+    },
+    {
+      l: 'Menunggu Approval',
+      ic: <Ic n="hourglass" s={22} />,
+      v: String(nWait),
+      badge: ['Open', 'y'],
+      sub: `dari ${cur.length} pengajuan`,
+    },
+  ];
+
+  // grafik: jumlah pembuat PO (unik) per departemen
+  const dm = new Map<string, Set<string>>();
+  cur.forEach((p) => {
+    if (!dm.has(p.dept)) dm.set(p.dept, new Set());
+    dm.get(p.dept)!.add(p.uid);
+  });
+  const chart = [...dm]
+    .map(([d, s]) => ({ d, n: s.size }))
+    .sort((x, y) => y.n - x.n || x.d.localeCompare(y.d, 'id'));
+  const mx = chart[0]?.n ?? 0;
+  const top = mx <= 4 ? 4 : Math.ceil(mx / 4) * 4;
+  const ticks = [0, 1, 2, 3, 4].map((i) => (top / 4) * i);
+  const shade = (i: number) => {
+    const k = chart.length > 1 ? i / (chart.length - 1) : 0;
+    const m = (a: number, b: number) => Math.round(a + (b - a) * k * 0.8);
+    return `linear-gradient(180deg,rgb(${m(59, 147)},${m(130, 197)},${m(
+      246,
+      253
+    )}),rgb(${m(29, 120)},${m(78, 175)},${m(216, 250)}))`;
+  };
+
+  // top 5 pembuat PO
+  const um = new Map<string, { nama: string; dept: string; n: number }>();
+  cur.forEach((p) => {
+    const x = um.get(p.uid);
+    um.set(p.uid, { nama: p.by, dept: p.dept, n: (x?.n ?? 0) + 1 });
+  });
+  const tops = [...um.values()]
+    .sort((x, y) => y.n - x.n || x.nama.localeCompare(y.nama, 'id'))
+    .slice(0, 5);
+  const tmax = tops[0]?.n || 1;
+
+  const big = cur.filter(isBig);
+  const small = cur.filter((p) => !isBig(p));
+  const sumOf = (l: PO[]) => l.reduce((x, p) => x + p.total, 0);
+  const rows = cur
+    .filter((p) => !lim || (lim === 'atas' ? isBig(p) : !isBig(p)))
+    .sort((a, b) =>
+      sort
+        ? (sort === 'asc' ? 1 : -1) * a.by.localeCompare(b.by, 'id') ||
+          b.iso.localeCompare(a.iso)
+        : b.iso.localeCompare(a.iso)
+    );
+  const pg = usePager(rows, 15);
+  const makers = [...new Set(list.map((p) => p.by))].sort((a, b) =>
+    a.localeCompare(b, 'id')
+  );
+  const none = <div className="empty">Belum ada data pada filter ini.</div>;
+  const reset = () => {
+    const z = { from: def.from, to: def.to, dept: '', by: '', stat: '' };
+    setDr(z);
+    setAp(z);
+    setQ('');
+    setOpen('');
+    setLim('');
+  };
+
+  return (
+    <div className="dash ap">
+      <div className="card ap-filter">
+        <div className="apf">
+          <div className="apf-f">
+            <label>Periode</label>
+            <div className="ap-range">
+              <Ic n="calendar" s={16} />
+              <DateBtn
+                v={dr.from}
+                empty="Awal"
+                label="Tanggal mulai"
+                onChange={(v) => setDr((x) => ({ ...x, from: v }))}
+              />
+              <span>–</span>
+              <DateBtn
+                v={dr.to}
+                empty="Akhir"
+                label="Tanggal akhir"
+                onChange={(v) => setDr((x) => ({ ...x, to: v }))}
+              />
+              <Ic n="calendar" s={16} />
+            </div>
+          </div>
+          <div className="apf-f">
+            <label>Departemen</label>
+            <select
+              value={dr.dept}
+              onChange={(e) => setDr((x) => ({ ...x, dept: e.target.value }))}
+            >
+              <option value="">Semua departemen</option>
+              {depts.map((d) => (
+                <option key={d}>{d}</option>
+              ))}
+            </select>
+          </div>
+          <div className="apf-f">
+            <label>Pembuat PO</label>
+            <select
+              value={dr.by}
+              onChange={(e) => setDr((x) => ({ ...x, by: e.target.value }))}
+            >
+              <option value="">Semua nama</option>
+              {makers.map((m) => (
+                <option key={m}>{m}</option>
+              ))}
+            </select>
+          </div>
+          <div className="apf-f">
+            <label>Status</label>
+            <select
+              value={dr.stat}
+              onChange={(e) => setDr((x) => ({ ...x, stat: e.target.value }))}
+            >
+              <option value="">Semua status</option>
+              {[...STATUSES, 'Rejected'].map((x) => (
+                <option key={x}>{x}</option>
+              ))}
+            </select>
+          </div>
+          <div className="apf-btns">
+            <button
+              type="button"
+              className="pri"
+              onClick={() => {
+                setAp(dr);
+                setOpen('');
+              }}
+            >
+              <Ic n="filter" s={15} />
+              Terapkan Filter
+            </button>
+            <button type="button" className="ap-reset" onClick={reset}>
+              <Ic n="reset" s={15} />
+              Reset
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="kpis ap-kpis">
+        {kpis.map((k) => (
+          <div className="card kpi ap-kpi" key={k.l}>
+            <span className="ap-kic">{k.ic}</span>
+            <div className="ap-kb">
+              <FitBox>
+                <small>{k.l}</small>
+              </FitBox>
+              <FitBox>
+                <div className="ap-kv">
+                  <b>{k.v}</b>
+                  {k.badge && (
+                    <em className={'ap-bdg ' + k.badge[1]}>{k.badge[0]}</em>
+                  )}
+                  {k.d && k.dIn === 'val' && (
+                    <em className={'ap-dl ' + k.d.tone}>{k.d.t}</em>
+                  )}
+                </div>
+              </FitBox>
+              {(k.sub || (k.d && k.dIn === 'sub')) && (
+                <FitBox>
+                  <span className="ap-ks">
+                    {k.d && k.dIn === 'sub' && (
+                      <em className={'ap-dl ' + k.d.tone}>{k.d.t}</em>
+                    )}
+                    {k.d && k.dIn === 'sub' && ' '}
+                    {k.sub}
+                  </span>
+                </FitBox>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="drow ap-row">
+        <DCard ic="chart" title="Jumlah Pembuat PO per Departemen">
+          {!chart.length ? (
+            none
+          ) : (
+            <div className="ap-chart">
+              <span className="ap-yt">Jumlah Pembuat PO</span>
+              <div className="ap-plot">
+                <div className="ap-yax">
+                  {[...ticks].reverse().map((t) => (
+                    <span key={t}>{t}</span>
+                  ))}
+                </div>
+                <div className="ap-area">
+                  {ticks.map((t) => (
+                    <i
+                      className="ap-grid"
+                      key={t}
+                      style={{ bottom: `${(t / top) * 100}%` }}
+                    />
+                  ))}
+                  <div className="ap-bars">
+                    {chart.map((r, i) => (
+                      <div
+                        className="ap-col"
+                        key={r.d}
+                        title={`${r.d}: ${r.n} pembuat PO`}
+                      >
+                        <i
+                          style={{
+                            height: `${(r.n / top) * 100}%`,
+                            background: shade(i),
+                            animationDelay: `${i * 60}ms`,
+                          }}
+                        >
+                          <b>{r.n}</b>
+                        </i>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <div className="ap-xl">
+                {chart.map((r) => (
+                  <span key={r.d} title={r.d}>
+                    {r.d}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </DCard>
+        <DCard ic="users" title="Top 5 Pembuat PO">
+          {!tops.length ? (
+            none
+          ) : (
+            <div className="ap-top">
+              <div className="ap-th">
+                <span>Nama</span>
+                <span>Jumlah Pengajuan</span>
+              </div>
+              {tops.map((t, i) => (
+                <div className="ap-tr" key={t.nama + i}>
+                  <span className="nm" title={`${t.nama} (${t.dept})`}>
+                    {t.nama} ({t.dept})
+                  </span>
+                  <span className="bt">
+                    <i
+                      style={{
+                        width: `${Math.max(6, (t.n / tmax) * 100)}%`,
+                        animationDelay: `${i * 80}ms`,
+                      }}
+                    />
+                  </span>
+                  <span className="ct">{t.n}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </DCard>
+      </div>
+
+      <div className="ap-lim">
+        {(
+          [
+            [
+              'atas',
+              'PO di Atas Rp 10 Juta',
+              big,
+              'Wajib approve Managing Director',
+            ],
+            [
+              'bawah',
+              'PO di Bawah Rp 10 Juta',
+              small,
+              'Tanpa approval Managing Director',
+            ],
+          ] as const
+        ).map(([k, t, l, sub]) => (
+          <button
+            type="button"
+            key={k}
+            className={'card ap-limc ' + k + (lim === k ? ' on' : '')}
+            title="Klik untuk menyaring tabel; klik lagi untuk menampilkan semua"
+            onClick={() => setLim(lim === k ? '' : k)}
+          >
+            <small>{t}</small>
+            <div className="ap-limv">
+              <b>{l.length}</b>
+              <span>PO</span>
+              <em>{rp(sumOf(l))}</em>
+            </div>
+            <span className="ap-lims">{sub}</span>
+          </button>
+        ))}
+      </div>
+
+      <DCard
+        ic="fileList"
+        title="Daftar Pengajuan PO"
+        right={
+          <button
+            type="button"
+            className="ap-exp"
+            onClick={() => onExport(rows)}
+          >
+            <Ic n="download" s={15} />
+            Ekspor CSV
+          </button>
+        }
+      >
+        {kw && (
+          <div className="info">
+            <span>
+              Hasil pencarian: <b>{q}</b> (semua periode)
+            </span>
+            <button type="button" className="ghost" onClick={() => setQ('')}>
+              Hapus pencarian
+            </button>
+          </div>
+        )}
+        {!rows.length ? (
+          none
+        ) : (
+          <div className="tbl">
+            <table className="ap-tbl">
+              <thead>
+                <tr>
+                  <th>No. Pengajuan</th>
+                  <th>Tanggal Submit</th>
+                  <th>Departemen</th>
+                  <th>
+                    <button
+                      type="button"
+                      className="ap-sort"
+                      title="Urutkan nama"
+                      onClick={() =>
+                        setSort(
+                          sort === '' ? 'asc' : sort === 'asc' ? 'desc' : ''
+                        )
+                      }
+                    >
+                      Pembuat PO{' '}
+                      <span className="ap-sa">
+                        {sort === 'asc' ? '↑' : sort === 'desc' ? '↓' : '⇅'}
+                      </span>
+                    </button>
+                  </th>
+                  <th>Vendor</th>
+                  <th>Kategori</th>
+                  <th>Pemohon</th>
+                  <th>Total</th>
+                  <th>Status</th>
+                  <th>Aksi</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pg.view.map((p) => {
+                  const st = poState(p),
+                    lk = lockedOf(p);
+                  const { bp, bi } = bpOfPo(bps, p);
+                  const items: { l: string; f: () => void; cls?: string }[] = [
+                    { l: 'Cetak PO', f: () => onPrint(p.no) },
+                    { l: 'Salin Vendor', f: () => onCopy(p, false) },
+                    { l: 'Salin Semua', f: () => onCopy(p, true) },
+                  ];
+                  if (onViewForm)
+                    items.push({ l: 'Lihat Form', f: () => onViewForm(p) });
+                  if (!lk && st === 'Open') {
+                    items.push({ l: 'Tandai Done', f: () => onDone(p.no) });
+                    items.push({
+                      l: 'Cancel Pengajuan',
+                      f: () => onReject(p.no),
+                      cls: 'cx',
+                    });
+                  }
+                  if (!lk && st !== 'Open' && !p.rejFinal)
+                    items.push({ l: 'Buka Lagi', f: () => onReopen(p.no) });
+                  if (!lk && !p.rejFinal)
+                    items.push({
+                      l: 'PO Reject',
+                      f: () => onPoReject(p.no),
+                      cls: 'cx',
+                    });
+                  return (
+                    <Fragment key={p.no}>
+                      <tr>
+                        <td>
+                          <button
+                            type="button"
+                            className="lnk"
+                            title="Lihat & cetak dokumen PO"
+                            onClick={() => onPrint(p.no)}
+                          >
+                            {p.no}
+                          </button>
+                          {lk && (
+                            <span
+                              className="tag s-wait"
+                              style={{ marginLeft: 6 }}
+                              title="Periode tahun ini terkunci"
+                            >
+                              🔒
+                            </span>
+                          )}
+                        </td>
+                        <td>{fmtDT(p.iso)}</td>
+                        <td className="dp">{p.dept}</td>
+                        <td>{p.by}</td>
+                        <td className="vd">
+                          {p.v.nama}
+                          <div
+                            className={
+                              'ap-bp ' +
+                              (!bi
+                                ? 'na'
+                                : bi.expired
+                                ? 'ex'
+                                : bi.soon
+                                ? 'so'
+                                : 'ak')
+                            }
+                            title={
+                              bp
+                                ? `${bp.kode} · ${bp.nama}`
+                                : 'Vendor ini belum ada di menu Data Supplier'
+                            }
+                          >
+                            <i />
+                            {!bp || !bi
+                              ? 'Belum terdaftar di Supplier BP'
+                              : bi.expired
+                              ? `BP Expired · ${ymdLabel(bp.exp, '')}`
+                              : bi.soon
+                              ? `BP Segera Exp · ${ymdLabel(bp.exp, '')} (${
+                                  bi.days
+                                } hari lagi)`
+                              : `BP Aktif · s/d ${ymdLabel(bp.exp, '')}`}
+                          </div>
+                        </td>
+                        <td>{p.items[0]?.k || 'Tanpa kategori'}</td>
+                        <td>{p.by}</td>
+                        <td className="tt">
+                          {rp(p.total)}
+                          <div
+                            className={'ap-nl ' + (isBig(p) ? 'big' : 'sm')}
+                            title={
+                              isBig(p)
+                                ? 'Nilai PO di atas Rp 10 juta: wajib ada approve Managing Director'
+                                : 'Nilai PO di bawah Rp 10 juta'
+                            }
+                          >
+                            {isBig(p) ? '> Rp 10 jt' : '≤ Rp 10 jt'}
+                          </div>
+                          {isBig(p) && (
+                            <div className="ap-nl-n">
+                              Noted: wajib approve Managing Director
+                            </div>
+                          )}
+                        </td>
+                        <td>
+                          <span
+                            className={
+                              'tag ' +
+                              (st === 'Rejected' ? 's-rejected' : 's-' + st)
+                            }
+                          >
+                            {st}
+                          </span>
+                          {st === 'Rejected' && p.rej && (
+                            <div className="note bad">
+                              {p.rejFinal ? 'PO Reject' : 'Ditolak'}{' '}
+                              {fmtDT(p.rej)}
+                              {p.rejWhy && (
+                                <>
+                                  <br />
+                                  {p.rejFinal
+                                    ? 'Keterangan reject'
+                                    : 'Alasan'}: {p.rejWhy}
+                                </>
+                              )}
+                              {p.rejFinal && (
+                                <>
+                                  <br />
+                                  <b>
+                                    {p.newNo
+                                      ? `Diganti PO baru: ${p.newNo}`
+                                      : 'Menunggu user membuat PO baru'}
+                                  </b>
+                                </>
+                              )}
+                            </div>
+                          )}
+                          {p.prevNo && (
+                            <div className="note">
+                              Pengganti PO reject {p.prevNo}
+                            </div>
+                          )}
+                          {st === 'Open' && p.resent && (
+                            <div className="note">
+                              Dikirim ulang {fmtDT(p.resent)}
+                            </div>
+                          )}
+                        </td>
+                        <td>
+                          <div className="ap-act">
+                            <button
+                              type="button"
+                              className="ap-det"
+                              aria-expanded={open === p.no}
+                              onClick={() => setOpen(open === p.no ? '' : p.no)}
+                            >
+                              Detail
+                            </button>
+                            <RowMenu items={items} />
+                          </div>
+                        </td>
+                      </tr>
+                      {open === p.no && (
+                        <tr>
+                          <td colSpan={10} className="detail">
+                            <div>
+                              <b>{p.v.nama}</b> · PIC {p.v.pic} · {p.v.telp}
+                              {p.v.fax && ` · Fax ${p.v.fax}`} · {p.v.email}
+                              <br />
+                              {p.v.alamat} · NPWP {p.v.npwp}
+                            </div>
+                            {p.pay && (
+                              <div>
+                                Pembayaran: {p.pay.bank} · {p.pay.cabang} · No.
+                                Rek {p.pay.rek} a.n. {p.pay.an}
+                              </div>
+                            )}
+                            <ul>
+                              {p.items.map((l, n) => (
+                                <li key={n}>
+                                  {l.d} — {l.q} {l.s} × {rp(l.p)} ={' '}
+                                  {rp(l.q * l.p)}
+                                </li>
+                              ))}
+                            </ul>
+                            <div>
+                              Subtotal {rp(p.sub)} · Discount {rp(p.disc)} ·
+                              Pajak {Math.round(p.rate * 100)}%
+                              {p.ong ? ` · Ongkir ${rp(p.ong)}` : ''} ·{' '}
+                              <b>Grand Total {rp(p.total)}</b>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+            <Pager page={pg.page} pages={pg.pages} onPage={pg.setPage} />
+          </div>
+        )}
+      </DCard>
+    </div>
+  );
+}
+
+/* ================= APLIKASI UTAMA ================= */
+type Nav = { k: string; l: string; ic: string; bd?: number };
+const META: Record<string, { ic: string; t: string; s: string; c: string }> = {
+  dash: {
+    ic: 'home',
+    t: 'Dashboard',
+    s: 'Ringkasan pengajuan Purchase Order.',
+    c: 'Dashboard',
+  },
+  form: {
+    ic: 'filePlus',
+    t: 'Form PO Request',
+    s: 'Lengkapi informasi berikut untuk membuat permintaan Purchase Order (PO).',
+    c: 'Buat PO Request',
+  },
+  riwayat: {
+    ic: 'fileList',
+    t: 'Riwayat Pengajuan',
+    s: 'Gunakan tombol Salin jika vendornya sama, lalu sesuaikan isiannya.',
+    c: 'Riwayat Pengajuan',
+  },
+  approval: {
+    ic: 'clock',
+    t: 'Menunggu Approval',
+    s: 'Pengajuan yang belum diproses menjadi PO.',
+    c: 'Menunggu Approval',
+  },
+  tracking: {
+    ic: 'truck',
+    t: 'Tracking PO',
+    s: 'Pantau tahapan PO dari dibuat sampai proses pembayaran.',
+    c: 'Tracking PO',
+  },
+  supplier: {
+    ic: 'users',
+    t: 'Data Supplier',
+    s: 'Daftar Supplier BP (Business Partner), status aktif dan tanggal expired.',
+    c: 'Data Supplier',
+  },
+  history: {
+    ic: 'clock',
+    t: 'Change History',
+    s: 'Riwayat perubahan data PO per akun: siapa, kapan, bagian, dan apa yang diubah.',
+    c: 'Change History',
+  },
+  notif: {
+    ic: 'bell',
+    t: 'Notifikasi',
+    s: 'Pemberitahuan status pengajuan Anda.',
+    c: 'Notifikasi',
+  },
+  kategori: {
+    ic: 'tag',
+    t: 'Master Kategori PO',
+    s: 'Pengelompokan kebutuhan barang dan jasa untuk pengajuan Purchase Order.',
+    c: 'Master Kategori PO',
+  },
+  barang: {
+    ic: 'box',
+    t: 'Daftar Barang',
+    s: 'Barang dan jasa yang pernah dipesan.',
+    c: 'Daftar Barang',
+  },
+  setting: {
+    ic: 'gear',
+    t: 'Pengaturan',
+    s: 'Profil, password, departemen, penomoran PO, dan tampilan aplikasi.',
+    c: 'Pengaturan',
+  },
+  all: {
+    ic: 'fileList',
+    t: 'Semua Pengajuan',
+    s: 'Seluruh pengajuan PO dari semua departemen.',
+    c: 'Semua Pengajuan',
+  },
+  doc: {
+    ic: 'file',
+    t: 'Dokumen PO',
+    s: 'Lihat dan cetak dokumen Purchase Order.',
+    c: 'Dokumen PO',
+  },
+  users: {
+    ic: 'users',
+    t: 'Verifikasi User',
+    s: 'Setujui atau tolak pendaftaran akun.',
+    c: 'Verifikasi User',
+  },
+};
+/** Kategori dikelola admin: tipe Barang/Jasa untuk filter dashboard; desc/ex = panduan bagi user; off = nonaktif (tidak bisa dipilih lagi, riwayat tetap utuh). */
+type CatType = 'Barang' | 'Jasa';
+type Cat = {
+  name: string;
+  type: CatType;
+  desc?: string;
+  ex?: string;
+  off?: boolean;
+};
+const guessType = (n: string): CatType =>
+  n.trim().toLowerCase() === 'jasa' ? 'Jasa' : 'Barang';
+const normCats = (l: (Cat | string)[]): Cat[] =>
+  l.map((c) => (typeof c === 'string' ? { name: c, type: guessType(c) } : c));
+const CAT_SEED: [string, CatType, string, string][] = [
+  [
+    'Alat Pelindung Diri (APD)',
+    'Barang',
+    'Perlengkapan keselamatan kerja',
+    'Safety shoes, helm, sarung tangan, masker',
+  ],
+  [
+    'Fire & Safety Equipment',
+    'Barang',
+    'Peralatan pemadam kebakaran dan keamanan',
+    'APAR, hydrant, fire alarm, safety sign',
+  ],
+  [
+    'Peralatan & Spare Part Mesin',
+    'Barang',
+    'Komponen dan spare part mesin produksi',
+    'Bearing, motor, sensor, belt, gearbox',
+  ],
+  [
+    'Peralatan Produksi',
+    'Barang',
+    'Peralatan kerja dan penunjang produksi',
+    'Tools, jig, fixture, peralatan kerja',
+  ],
+  [
+    'Material Produksi',
+    'Barang',
+    'Bahan baku dan material pendukung produksi',
+    'Bahan baku, chemical, material pendukung',
+  ],
+  [
+    'Maintenance & Engineering Supplies',
+    'Barang',
+    'Perlengkapan teknik dan maintenance',
+    'Kabel, lampu, pipa, valve, komponen listrik',
+  ],
+  [
+    'ATK & Perlengkapan Kantor',
+    'Barang',
+    'Alat tulis dan perlengkapan kantor',
+    'Kertas, tinta, alat tulis, stationery',
+  ],
+  [
+    'Furniture & Office Equipment',
+    'Barang',
+    'Perabot dan peralatan kantor',
+    'Meja, kursi, lemari, mesin kantor',
+  ],
+  [
+    'IT Hardware & Software',
+    'Barang',
+    'Perangkat IT dan lisensi software',
+    'Laptop, printer, perangkat jaringan, lisensi software',
+  ],
+  [
+    'General Affairs & Facility Supplies',
+    'Barang',
+    'Perlengkapan umum dan fasilitas kantor/pabrik',
+    'Perlengkapan kebersihan, sanitary, fasilitas umum',
+  ],
+  [
+    'Perbaikan & Maintenance Mesin',
+    'Jasa',
+    'Jasa perbaikan dan perawatan mesin',
+    'Perbaikan mesin, overhaul, preventive maintenance',
+  ],
+  [
+    'Perbaikan Gedung & Fasilitas',
+    'Jasa',
+    'Jasa perbaikan gedung dan fasilitas',
+    'Perbaikan AC, atap, plumbing, instalasi listrik',
+  ],
+  [
+    'Perizinan & Legalitas',
+    'Jasa',
+    'Pengurusan perizinan dan legalitas',
+    'Pengurusan izin, sertifikasi, perpanjangan izin',
+  ],
+  [
+    'Inspeksi, Kalibrasi & Sertifikasi',
+    'Jasa',
+    'Jasa inspeksi, kalibrasi dan sertifikasi',
+    'Kalibrasi alat ukur, riksa uji, inspeksi K3',
+  ],
+  [
+    'Jasa Fire & Safety',
+    'Jasa',
+    'Jasa perawatan dan inspeksi peralatan safety',
+    'Refill APAR, servis hydrant, inspeksi fire alarm',
+  ],
+  [
+    'Training & Development',
+    'Jasa',
+    'Pelatihan dan pengembangan karyawan',
+    'Pelatihan karyawan, sertifikasi kompetensi',
+  ],
+  [
+    'Konsultan & Professional Services',
+    'Jasa',
+    'Jasa konsultasi dan profesional',
+    'Konsultan ISO/IATF, audit eksternal, jasa hukum',
+  ],
+  [
+    'IT Services & Maintenance',
+    'Jasa',
+    'Jasa perbaikan dan pemeliharaan IT',
+    'Perbaikan komputer, maintenance server, dukungan IT',
+  ],
+  [
+    'Transportasi & Logistik',
+    'Jasa',
+    'Jasa transportasi dan pengiriman',
+    'Pengiriman barang, ekspedisi, sewa kendaraan',
+  ],
+  [
+    'Outsourcing & General Services',
+    'Jasa',
+    'Jasa tenaga kerja dan layanan umum',
+    'Cleaning service, security, pest control',
+  ],
+  [
+    'Event & Employee Engagement',
+    'Jasa',
+    'Kegiatan dan acara karyawan',
+    'Family gathering, penyelenggara acara, kegiatan karyawan',
+  ],
+];
+const DEF_CATS: Cat[] = CAT_SEED.map(([name, type, desc, ex]) => ({
+  name,
+  type,
+  desc,
+  ex,
+}));
+const CAT_VER = '3';
+/** Migrasi sekali: lengkapi daftar dengan 21 kategori baku. Kategori lama (ATK, Perlengkapan Kantor, Jasa) dinonaktifkan, bukan dihapus, agar riwayat PO tetap utuh. */
+const mergeCats = (raw: (Cat | string)[]): Cat[] => {
+  const cur = normCats(raw);
+  const LEGACY = ['atk', 'perlengkapan kantor', 'jasa'];
+  const out = cur.map((c) => {
+    const d = DEF_CATS.find(
+      (x) => x.name.toLowerCase() === c.name.toLowerCase()
+    );
+    if (d) return { ...c, desc: c.desc ?? d.desc, ex: c.ex ?? d.ex };
+    return LEGACY.includes(c.name.toLowerCase()) ? { ...c, off: true } : c;
+  });
+  DEF_CATS.forEach((d) => {
+    if (!out.some((c) => c.name.toLowerCase() === d.name.toLowerCase()))
+      out.push({ ...d });
+  });
+  return out;
+};
+const catMatch = (c: Cat, q: string) =>
+  !q.trim() ||
+  [c.name, c.type, c.desc ?? '', c.ex ?? ''].some((t) =>
+    t.toLowerCase().includes(q.trim().toLowerCase())
+  );
+
+/* ================= DATA DUMMY 6 BULAN (dimuat otomatis sekali saat pertama dijalankan) ================= */
+/** Data contoh (akun demo + PO dummy). Untuk produksi HARUS false: akun demo memakai password yang sudah umum diketahui. */
+const SEED_DEMO = false;
+const DEMO_USERS: User[] = [
+  {
+    id: 'demo-acc',
+    nama: 'Maya Anggraini',
+    email: 'maya.anggraini@argapura.com',
+    pass: 'demo123',
+    dept: 'Accounting',
+    role: 'user',
+    status: 'approved',
+  },
+  {
+    id: 'demo-abd',
+    nama: 'Rizky Firmansyah',
+    email: 'rizky.firmansyah@argapura.com',
+    pass: 'demo123',
+    dept: 'Automotive Business Development',
+    role: 'user',
+    status: 'approved',
+  },
+  {
+    id: 'demo-bd',
+    nama: 'Andreas Wibowo',
+    email: 'andreas.wibowo@argapura.com',
+    pass: 'demo123',
+    dept: 'Business Development',
+    role: 'user',
+    status: 'approved',
+  },
+  {
+    id: 'demo-enp',
+    nama: 'Bagus Setiawan',
+    email: 'bagus.setiawan@argapura.com',
+    pass: 'demo123',
+    dept: 'Engineering & Project',
+    role: 'user',
+    status: 'approved',
+  },
+  {
+    id: 'demo-fac',
+    nama: 'Siti Rahayu',
+    email: 'siti.rahayu@argapura.com',
+    pass: 'demo123',
+    dept: 'Facility & Service',
+    role: 'user',
+    status: 'approved',
+  },
+  {
+    id: 'demo-fin',
+    nama: 'Dewi Lestari',
+    email: 'dewi.lestari@argapura.com',
+    pass: 'demo123',
+    dept: 'Finance',
+    role: 'user',
+    status: 'approved',
+  },
+  {
+    id: 'demo-gs',
+    nama: 'Rina Kartika',
+    email: 'rina.kartika@argapura.com',
+    pass: 'demo123',
+    dept: 'General Sales',
+    role: 'user',
+    status: 'approved',
+  },
+  {
+    id: 'demo-it',
+    nama: 'Fajar Nugroho',
+    email: 'fajar.nugroho@argapura.com',
+    pass: 'demo123',
+    dept: 'IT/Digital Transform',
+    role: 'user',
+    status: 'approved',
+  },
+  {
+    id: 'demo-ops',
+    nama: 'Hendra Kusuma',
+    email: 'hendra.kusuma@argapura.com',
+    pass: 'demo123',
+    dept: 'Operation Support',
+    role: 'user',
+    status: 'approved',
+  },
+  {
+    id: 'demo-prd',
+    nama: 'Agus Prasetyo',
+    email: 'agus.prasetyo@argapura.com',
+    pass: 'demo123',
+    dept: 'Production',
+    role: 'user',
+    status: 'approved',
+  },
+  {
+    id: 'demo-pur',
+    nama: 'Budi Santoso',
+    email: 'budi.santoso@argapura.com',
+    pass: 'demo123',
+    dept: 'Purchasing & Supplier Management',
+    role: 'user',
+    status: 'approved',
+  },
+  {
+    id: 'demo-qa',
+    nama: 'Nur Aini',
+    email: 'nur.aini@argapura.com',
+    pass: 'demo123',
+    dept: 'QA/QC',
+    role: 'user',
+    status: 'approved',
+  },
+  {
+    id: 'demo-scm',
+    nama: 'Dimas Pratama',
+    email: 'dimas.pratama@argapura.com',
+    pass: 'demo123',
+    dept: 'Supply Chain',
+    role: 'user',
+    status: 'approved',
+  },
+  {
+    id: 'demo-tal',
+    nama: 'Putri Handayani',
+    email: 'putri.handayani@argapura.com',
+    pass: 'demo123',
+    dept: 'Talent',
+    role: 'user',
+    status: 'approved',
+  },
+  {
+    id: 'demo-tec',
+    nama: 'Eko Saputro',
+    email: 'eko.saputro@argapura.com',
+    pass: 'demo123',
+    dept: 'Technical',
+    role: 'user',
+    status: 'approved',
+  },
+  {
+    id: 'demo-new',
+    nama: 'Andi Wijaya',
+    email: 'andi.wijaya@argapura.com',
+    pass: 'demo123',
+    dept: 'General Sales',
+    role: 'user',
+    status: 'pending',
+  },
+];
+const DEMO_VENDORS: { v: Vendor; pay: Pay }[] = [
+  {
+    v: {
+      nama: 'PT Sinar Jaya Abadi',
+      alamat:
+        'Jl. Industri Raya No. 12, Kawasan Industri Jatake, Tangerang 15136',
+      npwp: '01.234.567.8-415.000',
+      telp: '021-5901234',
+      fax: '021-5901235',
+      pic: 'Hendra Gunawan',
+      email: 'sales@sinarjaya.co.id',
+    },
+    pay: {
+      rek: '1234567890',
+      bank: 'BCA',
+      cabang: 'KCP Tangerang',
+      an: 'PT Sinar Jaya Abadi',
+    },
+  },
+  {
+    v: {
+      nama: 'CV Mitra Karya Sejahtera',
+      alamat: 'Jl. Raya Bekasi KM 21 No. 45, Cakung, Jakarta Timur 13910',
+      npwp: '02.345.678.9-009.000',
+      telp: '021-4601122',
+      fax: '',
+      pic: 'Lestari Wulandari',
+      email: 'order@mitrakarya.id',
+    },
+    pay: {
+      rek: '0987654321',
+      bank: 'Mandiri',
+      cabang: 'Cakung',
+      an: 'CV Mitra Karya Sejahtera',
+    },
+  },
+  {
+    v: {
+      nama: 'PT Global Office Supplies',
+      alamat:
+        'Gedung Graha Niaga Lt. 3, Jl. Jend. Sudirman Kav. 58, Jakarta Selatan 12190',
+      npwp: '03.456.789.0-062.000',
+      telp: '021-5250088',
+      fax: '021-5250089',
+      pic: 'Michael Tanuwijaya',
+      email: 'cs@globaloffice.co.id',
+    },
+    pay: {
+      rek: '5560012345',
+      bank: 'BNI',
+      cabang: 'Sudirman',
+      an: 'PT Global Office Supplies',
+    },
+  },
+  {
+    v: {
+      nama: 'PT Safety Indo Perkasa',
+      alamat: 'Jl. Cibitung Industri Blok C-7, Cibitung, Bekasi 17520',
+      npwp: '04.567.890.1-435.000',
+      telp: '021-8830456',
+      fax: '',
+      pic: 'Darmawan Putra',
+      email: 'penjualan@safetyindo.com',
+    },
+    pay: {
+      rek: '7788990011',
+      bank: 'BCA',
+      cabang: 'KCU Bekasi',
+      an: 'PT Safety Indo Perkasa',
+    },
+  },
+  {
+    v: {
+      nama: 'CV Berkah Teknik',
+      alamat: 'Jl. Kapuk Kamal Raya No. 8, Cengkareng, Jakarta Barat 11720',
+      npwp: '05.678.901.2-034.000',
+      telp: '021-5410987',
+      fax: '',
+      pic: 'Yusuf Hidayat',
+      email: 'berkahteknik@gmail.com',
+    },
+    pay: {
+      rek: '1400099887766',
+      bank: 'Mandiri',
+      cabang: 'Cengkareng',
+      an: 'CV Berkah Teknik',
+    },
+  },
+  {
+    v: {
+      nama: 'PT Cahaya Packaging Nusantara',
+      alamat: 'Kawasan MM2100 Blok K-3, Cikarang Barat, Bekasi 17530',
+      npwp: '06.789.012.3-413.000',
+      telp: '021-8981234',
+      fax: '021-8981235',
+      pic: 'Susanti Wijaya',
+      email: 'marketing@cahayapack.co.id',
+    },
+    pay: {
+      rek: '3300445566',
+      bank: 'BRI',
+      cabang: 'Cikarang',
+      an: 'PT Cahaya Packaging Nusantara',
+    },
+  },
+  {
+    v: {
+      nama: 'UD Maju Bersama',
+      alamat: 'Jl. Raya Cileungsi No. 77, Bogor 16820',
+      npwp: '07.890.123.4-434.000',
+      telp: '021-82490011',
+      fax: '',
+      pic: 'Slamet Riyadi',
+      email: 'majubersama.ud@yahoo.com',
+    },
+    pay: {
+      rek: '6677889900',
+      bank: 'BNI',
+      cabang: 'Cileungsi',
+      an: 'Slamet Riyadi',
+    },
+  },
+  {
+    v: {
+      nama: 'PT Triputra Logistik',
+      alamat: 'Jl. Pluit Selatan Raya No. 21, Penjaringan, Jakarta Utara 14440',
+      npwp: '08.901.234.5-071.000',
+      telp: '021-6612345',
+      fax: '021-6612346',
+      pic: 'Aditya Pratama',
+      email: 'ops@triputralogistik.co.id',
+    },
+    pay: {
+      rek: '8800112233',
+      bank: 'BCA',
+      cabang: 'Pluit',
+      an: 'PT Triputra Logistik',
+    },
+  },
+];
+const DEMO_CATALOG: { k: string; d: string; s: string; p: number }[] = [
+  {
+    k: 'Alat Pelindung Diri (APD)',
+    d: 'Sarung tangan katun',
+    s: 'Box',
+    p: 85000,
+  },
+  {
+    k: 'Alat Pelindung Diri (APD)',
+    d: 'Helm safety proyek',
+    s: 'Pcs',
+    p: 65000,
+  },
+  { k: 'Alat Pelindung Diri (APD)', d: 'Masker N95', s: 'Box', p: 195000 },
+  { k: 'Alat Pelindung Diri (APD)', d: 'Sepatu safety', s: 'Pcs', p: 285000 },
+  { k: 'Alat Pelindung Diri (APD)', d: 'Kacamata safety', s: 'Pcs', p: 35000 },
+  { k: 'Alat Pelindung Diri (APD)', d: 'Earplug busa', s: 'Box', p: 75000 },
+  { k: 'ATK', d: 'Kertas HVS A4 80 gr', s: 'Rim', p: 52000 },
+  { k: 'ATK', d: 'Bolpoin hitam', s: 'Box', p: 38000 },
+  { k: 'ATK', d: 'Spidol whiteboard', s: 'Box', p: 62000 },
+  { k: 'ATK', d: 'Map folder plastik', s: 'Box', p: 45000 },
+  { k: 'ATK', d: 'Tinta printer original', s: 'Pcs', p: 145000 },
+  { k: 'ATK', d: 'Stapler dan isi', s: 'Set', p: 48000 },
+  {
+    k: 'Perlengkapan Kantor',
+    d: 'Kursi kerja ergonomis',
+    s: 'Unit',
+    p: 850000,
+  },
+  {
+    k: 'Perlengkapan Kantor',
+    d: 'Lemari arsip besi 4 pintu',
+    s: 'Unit',
+    p: 1650000,
+  },
+  {
+    k: 'Perlengkapan Kantor',
+    d: 'Dispenser air galon bawah',
+    s: 'Unit',
+    p: 725000,
+  },
+  {
+    k: 'Perlengkapan Kantor',
+    d: 'Papan nama ruangan akrilik',
+    s: 'Pcs',
+    p: 120000,
+  },
+  {
+    k: 'Perlengkapan Kantor',
+    d: 'Tempat sampah stainless',
+    s: 'Pcs',
+    p: 95000,
+  },
+  { k: 'Peralatan Produksi', d: 'Bearing 6205', s: 'Pcs', p: 78000 },
+  { k: 'Peralatan Produksi', d: 'Oli hidrolik 20 liter', s: 'Pcs', p: 640000 },
+  { k: 'Peralatan Produksi', d: 'V-belt tipe B', s: 'Pcs', p: 95000 },
+  { k: 'Peralatan Produksi', d: 'Mata bor HSS set', s: 'Set', p: 380000 },
+  { k: 'Peralatan Produksi', d: 'Kabel power 3x2.5 mm', s: 'Meter', p: 18500 },
+  { k: 'Peralatan Produksi', d: 'Roller conveyor', s: 'Unit', p: 1250000 },
+  { k: 'Jasa', d: 'Jasa servis AC', s: 'Jasa', p: 450000 },
+  { k: 'Jasa', d: 'Jasa kalibrasi timbangan', s: 'Jasa', p: 1500000 },
+  { k: 'Jasa', d: 'Jasa pengiriman barang', s: 'Jasa', p: 850000 },
+  { k: 'Jasa', d: 'Jasa maintenance genset', s: 'Jasa', p: 3200000 },
+  { k: 'Jasa', d: 'Jasa pest control', s: 'Jasa', p: 2750000 },
+];
+/** Nama kategori baru untuk data dummy (pool per departemen tetap memakai kategori lama di atas). */
+const DEMO_K: Record<string, string> = {
+  'Kursi kerja ergonomis': 'Furniture & Office Equipment',
+  'Lemari arsip besi 4 pintu': 'Furniture & Office Equipment',
+  'Bearing 6205': 'Peralatan & Spare Part Mesin',
+  'V-belt tipe B': 'Peralatan & Spare Part Mesin',
+  'Oli hidrolik 20 liter': 'Material Produksi',
+  'Kabel power 3x2.5 mm': 'Maintenance & Engineering Supplies',
+  'Jasa servis AC': 'Perbaikan Gedung & Fasilitas',
+  'Jasa kalibrasi timbangan': 'Inspeksi, Kalibrasi & Sertifikasi',
+  'Jasa pengiriman barang': 'Transportasi & Logistik',
+  'Jasa maintenance genset': 'Perbaikan & Maintenance Mesin',
+  'Jasa pest control': 'Outsourcing & General Services',
+};
+const DEMO_KGRP: Record<string, string> = {
+  ATK: 'ATK & Perlengkapan Kantor',
+  'Perlengkapan Kantor': 'General Affairs & Facility Supplies',
+};
+const demoK = (c: { k: string; d: string }) =>
+  DEMO_K[c.d] ?? DEMO_KGRP[c.k] ?? c.k;
+const DEPT_CATS: Record<string, string[]> = {
+  Accounting: ['ATK', 'Perlengkapan Kantor', 'Jasa'],
+  'Automotive Business Development': ['ATK', 'Perlengkapan Kantor', 'Jasa'],
+  'Business Development': ['ATK', 'Perlengkapan Kantor', 'Jasa'],
+  'Engineering & Project': [
+    'Peralatan Produksi',
+    'Alat Pelindung Diri (APD)',
+    'Jasa',
+  ],
+  'Facility & Service': [
+    'Perlengkapan Kantor',
+    'Jasa',
+    'Alat Pelindung Diri (APD)',
+    'ATK',
+  ],
+  Finance: ['ATK', 'Perlengkapan Kantor', 'Jasa'],
+  'General Sales': ['ATK', 'Perlengkapan Kantor', 'Jasa'],
+  'IT/Digital Transform': ['Perlengkapan Kantor', 'Jasa', 'ATK'],
+  'Operation Support': [
+    'Peralatan Produksi',
+    'Alat Pelindung Diri (APD)',
+    'Jasa',
+    'ATK',
+  ],
+  Production: ['Peralatan Produksi', 'Alat Pelindung Diri (APD)', 'Jasa'],
+  'Purchasing & Supplier Management': [
+    'ATK',
+    'Perlengkapan Kantor',
+    'Peralatan Produksi',
+    'Jasa',
+  ],
+  'QA/QC': ['Alat Pelindung Diri (APD)', 'Peralatan Produksi', 'Jasa', 'ATK'],
+  'Supply Chain': ['Peralatan Produksi', 'Jasa', 'ATK', 'Perlengkapan Kantor'],
+  Talent: ['ATK', 'Perlengkapan Kantor', 'Alat Pelindung Diri (APD)', 'Jasa'],
+  Technical: ['Peralatan Produksi', 'Alat Pelindung Diri (APD)', 'Jasa'],
+};
+const DEMO_NOTES = [
+  '',
+  '',
+  '',
+  'Mohon dikirim sebelum akhir minggu.',
+  'Barang diambil di gudang pusat.',
+  'Sertakan faktur pajak saat penagihan.',
+  'Kirim ke pabrik Cikarang.',
+];
+
+/** Buat PO contoh untuk 6 bulan terakhir (hasil selalu sama setiap kali dijalankan). seqBase = nomor urut terakhir per tahun yang sudah ada. */
+function makeDemoPOs(seqBase: Record<number, number>): PO[] {
+  let st = 20261027;
+  const rnd = () => {
+    st = (st + 0x6d2b79f5) | 0;
+    let t = Math.imul(st ^ (st >>> 15), 1 | st);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const pick = <T>(a: T[]): T => a[Math.floor(rnd() * a.length)];
+  const now = new Date();
+  const today = ymd(now);
+  const users = DEMO_USERS.filter((u) => u.status === 'approved');
+  const dates: Date[] = [];
+  for (let off = 5; off >= 0; off--) {
+    const b = new Date(now.getFullYear(), now.getMonth() - off, 1);
+    const maxDay =
+      off === 0
+        ? now.getDate()
+        : new Date(b.getFullYear(), b.getMonth() + 1, 0).getDate();
+    const n =
+      off === 0 ? 14 + Math.floor(rnd() * 5) : 22 + Math.floor(rnd() * 9);
+    for (let i = 0; i < n; i++) {
+      let d = new Date(
+        b.getFullYear(),
+        b.getMonth(),
+        1 + Math.floor(rnd() * maxDay),
+        8 + Math.floor(rnd() * 9),
+        Math.floor(rnd() * 60)
+      );
+      if (d.getTime() > now.getTime())
+        d = new Date(now.getTime() - Math.floor(rnd() * 3 * 3600000));
+      dates.push(d);
+    }
+  }
+  dates.sort((x, y) => x.getTime() - y.getTime());
+  const seq: Record<number, number> = { ...seqBase };
+  const keys: TKey[] = ['appr', 'supp', 'hoSend', 'hoRecv', 'recv', 'pay'];
+  const gaps = [
+    [1, 3],
+    [1, 3],
+    [1, 3],
+    [2, 4],
+    [2, 5],
+    [3, 7],
+  ];
+  return dates.map((d) => {
+    const u = pick(users);
+    const ven = pick(DEMO_VENDORS);
+    const pool = DEMO_CATALOG.filter((c) =>
+      (DEPT_CATS[u.dept] ?? []).includes(c.k)
+    );
+    const cnt = Math.min(pool.length, 1 + Math.floor(rnd() * 4));
+    const items: Line[] = [...pool]
+      .sort(() => rnd() - 0.5)
+      .slice(0, cnt)
+      .map((c) => {
+        const q =
+          c.p < 100000
+            ? 5 + Math.floor(rnd() * 56)
+            : c.p < 500000
+            ? 2 + Math.floor(rnd() * 14)
+            : c.p < 2e6
+            ? 1 + Math.floor(rnd() * 6)
+            : 1 + Math.floor(rnd() * 3);
+        return {
+          d: c.d,
+          q,
+          s: c.s,
+          p: Math.round((c.p * (0.95 + rnd() * 0.12)) / 500) * 500,
+          k: demoK(c),
+        };
+      });
+    const sub = items.reduce((a, l) => a + l.q * l.p, 0);
+    const disc =
+      rnd() < 0.3 ? Math.round((sub * (0.02 + rnd() * 0.03)) / 1000) * 1000 : 0;
+    const rate = rnd() < 0.5 ? 0.11 : 0.12;
+    const ong = rnd() < 0.4 ? (5 + Math.floor(rnd() * 26)) * 5000 : 0;
+    const y = d.getFullYear();
+    seq[y] = (seq[y] ?? 0) + 1;
+    const po: PO = {
+      no: `${String(seq[y]).padStart(3, '0')}/AGP-PO/${PO_CODE}/${
+        ROMAN[d.getMonth()]
+      }/${y}`,
+      iso: d.toISOString(),
+      dept: u.dept,
+      uid: u.id,
+      by: u.nama,
+      v: { ...ven.v },
+      pay: { ...ven.pay },
+      items,
+      sub,
+      rate,
+      disc,
+      ong,
+      total: calc(sub, rate, disc, ong).total,
+      note: pick(DEMO_NOTES),
+      status: 'Open',
+    };
+    const age = Math.floor((now.getTime() - d.getTime()) / 86400000);
+    if (age >= 2 && rnd() < 0.07) {
+      po.rej = new Date(
+        Math.min(
+          now.getTime(),
+          d.getTime() + (1 + Math.floor(rnd() * 2)) * 86400000
+        )
+      ).toISOString();
+      return po;
+    }
+    const stop =
+      age > 10 && rnd() < 0.05
+        ? 0
+        : age > 14 && rnd() < 0.22
+        ? 1 + Math.floor(rnd() * 5)
+        : 6;
+    let cur = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    const trk: Partial<Record<TKey, string>> = {};
+    for (let i = 0; i < stop; i++) {
+      cur = new Date(
+        cur.getFullYear(),
+        cur.getMonth(),
+        cur.getDate() +
+          gaps[i][0] +
+          Math.floor(rnd() * (gaps[i][1] - gaps[i][0] + 1))
+      );
+      const k = ymd(cur);
+      if (k > today) break;
+      trk[keys[i]] = k;
+    }
+    po.trk = trk;
+    if (trk.appr) {
+      po.status = 'Done';
+      const at = new Date(trk.appr + 'T09:00:00');
+      po.doneAt = (at.getTime() > now.getTime() ? now : at).toISOString();
+    }
+    return po;
+  });
+}
+
+/** PO contoh dengan 44 item (lebih dari 14 baris) untuk menguji tampilan PO dua kolom. Dimuat sekali. */
+const REF_ITEMS: [string, number, string, number][] = [
+  ['Amplop coklat A4 excecutive', 1, 'Pack', 38000],
+  ['Baterai alkaline AA (isi 2)', 6, 'Set', 18000],
+  ['Baterai alkaline AAA (isi 2)', 6, 'Set', 18000],
+  ['Binder clip 111 joyko', 4, 'Pcs', 6000],
+  ['Binder clip 107 joyko', 11, 'Pack', 4000],
+  ['Binder clip 155 joyko', 6, 'Pack', 10000],
+  ['Binder clip 260 joyko', 2, 'Pack', 20000],
+  ['Buku HC paperline folio 100', 3, 'Pcs', 20000],
+  ['Kertas CF K-2/2 paperprint', 6, 'Dus', 180000],
+  ['Cutter L-500 kenko', 1, 'Pcs', 17000],
+  ['Gunting kecil kenko', 3, 'Pcs', 8000],
+  ['Isi staples kangaro no 10', 3, 'Box', 40000],
+  ['Kertas FC A4 70 gr lk copy', 38, 'Rim', 40000],
+  ['Kertas FC F4 75 gr lk copy', 1, 'Rim', 46000],
+  ['Kertas FC A3 75 gr sidu', 2, 'Rim', 90000],
+  ['Post it mark & note', 1, 'Pad', 12000],
+  ['Stiker label tom & jery 121', 3, 'Pad', 7000],
+  ['Lem stick 21 gr bantex', 4, 'Pad', 8500],
+  ['Clear holder F4 daichi', 1, 'Set', 35000],
+  ['Map clear holder A4 daichi', 1, 'Set', 35000],
+  ['Map clear holder A4 bantex', 1, 'Set', 22000],
+  ['Map clear holder F4 bantex BF', 1, 'Set', 24000],
+  ['Ordner bindex 717 hitam', 7, 'Pcs', 27000],
+  ['Paper clip no 1 joyko', 1, 'Box', 35000],
+  ['Pembolong kertas 30', 1, 'Pcs', 22000],
+  ['Refill epson Lq 2180', 1, 'Pcs', 95000],
+  ['Laminating A4 toho', 1, 'Pack', 110000],
+  ['Laminating A3 toho', 3, 'Pack', 210000],
+  ['Ballpoint Q-Gel joyko biru', 2, 'Lusin', 43000],
+  ['Ballpoint Q-Gel joyko hitam', 2, 'Lusin', 43000],
+  ['Ballpoint standar Ae 7 biru', 1, 'Lusin', 21000],
+  ['Ballpoint standar Ae 7 hitam zirqon', 5, 'Lusin', 21000],
+  ['Ballpoint joyko Q Gel merah', 1, 'Lusin', 43000],
+  ['Pus pin kenko', 1, 'Pack', 6000],
+  ['Spidol snowman W/B biru', 3, 'Lusin', 90000],
+  ['Spidol snowman W/B hitam', 2, 'Lusin', 90000],
+  ['Spidol snowman marker hitam', 9, 'Pcs', 7000],
+  ['Stabilo bantex 23 sky blue', 4, 'Pcs', 6000],
+  ['Stabilo joyco hijau', 14, 'Pcs', 6000],
+  ['Stabilo bantex 19 pink', 4, 'Pcs', 6000],
+  ['Ink spidol snowman whiteboard hitam', 5, 'Pcs', 18000],
+  ['Stapler max HD 10', 1, 'Pcs', 20000],
+  ['Tinta stamp piramida biru', 1, 'Pcs', 12500],
+  ['Tip ex kenko kertas', 8, 'Pcs', 8500],
+];
+const makeRefPO = (taken: Set<string>): PO => {
+  const lines: Line[] = REF_ITEMS.map(([d, q, s, p]) => ({
+    d,
+    q,
+    s,
+    p,
+    k: 'ATK & Perlengkapan Kantor',
+  }));
+  const sub = lines.reduce((a, l) => a + l.q * l.p, 0);
+  return {
+    no: uniqueNo('176/AGP-PO/' + PO_CODE + '/X/2026', taken),
+    iso: new Date(2026, 9, 28, 10, 0).toISOString(),
+    dept: 'Purchasing & Supplier Management',
+    uid: 'dummy-ref',
+    by: 'Nesa',
+    v: {
+      nama: 'PT. SURYA JAYA WINATA',
+      alamat:
+        'Jl. Tarum Barat 3 no 29 Cikarang Baru, Jayamukti,\nCikarang Pusat Kab. Bekasi Jawa Barat',
+      npwp: '610937604021000',
+      telp: '021 2218 8713',
+      fax: '',
+      pic: 'Nanik Susilowati',
+      email: 'n_anik05@yahoo.com',
+    },
+    pay: {
+      rek: '8730915617',
+      bank: 'BCA',
+      cabang: 'KCP METRO JABABEKA',
+      an: 'PT. SURYA JAYA WINATA',
+    },
+    items: lines,
+    sub,
+    rate: 0.11,
+    disc: 0,
+    ong: 0,
+    total: calc(sub, 0.11, 0, 0).total,
+    status: 'Open',
+  };
+};
+
+/* =====================================================================
+   SINKRON GOOGLE SHEETS  —  tempel BLOK INI di App.tsx, tepat SEBELUM baris
+   "export default function App() {"
+   Lalu ikuti langkah 3-4 di PETUNJUK.md (panggil useSheetSync di dalam App).
+   ===================================================================== */
+
+const ENV_ =
+  (import.meta as unknown as { env?: Record<string, string> }).env ?? {};
+// Taruh URL & token di file .env (VITE_SHEET_URL, VITE_SHEET_TOKEN), lalu HAPUS nilai cadangan di bawah. Token lama sudah terlanjur terbuka: ganti token baru di Code.gs.
+const SHEET_URL: string =
+  ENV_.VITE_SHEET_URL ||
+  'https://script.google.com/macros/s/AKfycbwUQI5PJkgXKLFgoxV4jI_GzNHg5zS14RjMbcTH9TMHpPgUR-vbJoCKLcORK0Zxmkk6/exec'; // URL hasil Deploy Apps Script
+const SHEET_TOKEN: string = ENV_.VITE_SHEET_TOKEN || 'argapura-PO-Agp2026'; // sama persis dengan TOKEN di Code.gs
+const SHEET_POLL_MS = 20000; // aplikasi membaca ulang sheet tiap 20 detik
+
+type STable = Record<string, string>[];
+type STables = Record<string, STable>;
+type SyncData = {
+  users: User[];
+  depts: Dept[];
+  cats: Cat[];
+  bps: BP[];
+  pos: PO[];
+  hist: Hist[];
+  numCfg: NumCfg;
+  theme: number;
+  seen: string[];
+  brand: Brand;
+};
+
+const sv_ = (x: unknown) => (x === undefined || x === null ? '' : String(x));
+/** angka dari sel sheet: menerima 1.500.000 / 1500000 / 1,5 / "Rp 1.500" */
+const sn_ = (x: string, d = 0) => {
+  let t = String(x ?? '')
+    .replace(/rp/i, '')
+    .replace(/\s/g, '');
+  if (!t) return d;
+  if (/^\d{1,3}(\.\d{3})+(,\d+)?$/.test(t))
+    t = t.replace(/\./g, '').replace(',', '.');
+  else t = t.replace(',', '.');
+  const v = Number(t);
+  return Number.isFinite(v) ? v : d;
+};
+const sb_ = (x: string) => /^(1|true|ya|y|yes)$/i.test(String(x).trim());
+const so_ = (x: string) => (x && x.trim() ? x.trim() : undefined);
+/** Logo & background disimpan di sheet "Tampilan" (dipecah per 40.000 karakter karena batas 50.000 per sel) agar sama untuk semua user. */
+const BRAND_CHUNK = 40000;
+const BRAND_IMG = ['logo', 'bg', 'side'] as const;
+const brandHas = (b: Brand) => !!(b.logo || b.bg || b.side);
+function brandRows(b: Brand): STable {
+  const out: STable = [];
+  BRAND_IMG.forEach((k) => {
+    const v = b[k] || '';
+    for (let i = 0, n = 0; i < v.length; i += BRAND_CHUNK, n++)
+      out.push({
+        kunci: k,
+        urut: String(n),
+        nilai: '~' + v.slice(i, i + BRAND_CHUNK),
+      });
+  });
+  out.push({ kunci: 'glass', urut: '0', nilai: String(b.glass) });
+  out.push({
+    kunci: 'sideBox',
+    urut: '0',
+    nilai: b.sideBox === false ? 'FALSE' : 'TRUE',
+  });
+  return out;
+}
+function brandFrom(rows: STable | undefined, cur: Brand): Brand {
+  if (!rows || !rows.length) return cur; // sheet belum punya data tampilan: pertahankan yang ada
+  const out: Brand = { ...BRAND0 };
+  BRAND_IMG.forEach((k) => {
+    out[k] = rows
+      .filter((r) => (r.kunci ?? '').trim() === k)
+      .sort((a, b) => Number(a.urut) - Number(b.urut))
+      .map((r) => String(r.nilai ?? '').replace(/^~/, ''))
+      .join('');
+  });
+  const gl = rows.find((r) => (r.kunci ?? '').trim() === 'glass');
+  out.glass = gl ? Math.min(100, Math.max(0, sn_(gl.nilai, 50))) : 50;
+  const sb = rows.find((r) => (r.kunci ?? '').trim() === 'sideBox');
+  out.sideBox = sb ? sb_(sb.nilai) : undefined;
+  return out;
+}
+const escH = (x: string) =>
+  x.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+/** Kirim email lewat Apps Script (MailApp). Mengembalikan true bila terkirim. */
+async function sendMail(to: string, subject: string, html: string) {
+  try {
+    const r = await fetch(SHEET_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ token: SHEET_TOKEN, mail: { to, subject, html } }),
+    });
+    const j = await r.json();
+    return !!j.ok;
+  } catch {
+    return false;
+  }
+}
+const mailShell = (title: string, body: string) =>
+  `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;border:1px solid #d3e2f2;border-radius:12px;overflow:hidden"><div style="background:#0f5fc0;color:#fff;padding:14px 18px;font-weight:700">PO Request System · PT Argapura</div><div style="padding:18px;color:#12284a;font-size:14px;line-height:1.6"><h3 style="margin:0 0 10px">${title}</h3>${body}<p style="margin-top:18px"><a href="${location.origin}" style="background:#0f5fc0;color:#fff;padding:9px 16px;border-radius:8px;text-decoration:none;font-weight:600">Buka aplikasi</a></p><p style="color:#5b6f8c;font-size:12px;margin-top:18px">Email otomatis, mohon tidak dibalas.</p></div></div>`;
+const mailActivated = (u: User) =>
+  mailShell(
+    'Akun Anda sudah aktif',
+    `<p>Halo <b>${escH(
+      u.nama
+    )}</b>,</p><p>Akun Anda telah diaktifkan oleh admin. Silakan masuk memakai username <b>${escH(
+      uname(u)
+    )}</b> dan password yang Anda daftarkan.</p>`
+  );
+const mailReset = (u: User, tmp: string) =>
+  mailShell(
+    'Password direset oleh admin',
+    `<p>Halo <b>${escH(
+      u.nama
+    )}</b>,</p><p>Password akun Anda direset. Masuk dengan:</p><p>Username: <b>${escH(
+      uname(u)
+    )}</b><br/>Password sementara: <b>${escH(
+      tmp
+    )}</b></p><p>Segera ganti password setelah masuk (menu Profil &rarr; Ganti Password).</p>`
+  );
+const TRK_KEYS: TKey[] = ['appr', 'supp', 'hoSend', 'hoRecv', 'recv', 'pay'];
+
+/** state aplikasi -> baris-baris sheet */
+function toTables(d: SyncData): STables {
+  const po: STable = [],
+    items: STable = [];
+  d.pos.forEach((p) => {
+    const r: Record<string, string> = {
+      no: p.no,
+      iso: p.iso,
+      dept: p.dept,
+      uid: p.uid,
+      by: p.by,
+      v_nama: p.v.nama,
+      v_alamat: p.v.alamat,
+      v_npwp: p.v.npwp,
+      v_telp: p.v.telp,
+      v_fax: p.v.fax,
+      v_pic: p.v.pic,
+      v_email: p.v.email,
+      pay_rek: p.pay?.rek ?? '',
+      pay_bank: p.pay?.bank ?? '',
+      pay_cabang: p.pay?.cabang ?? '',
+      pay_an: p.pay?.an ?? '',
+      sub: sv_(p.sub),
+      rate: sv_(p.rate),
+      disc: sv_(p.disc),
+      ong: sv_(p.ong ?? 0),
+      total: sv_(p.total),
+      status: p.status,
+      doneAt: p.doneAt ?? '',
+      note: p.note ?? '',
+      rej: p.rej ?? '',
+      rejWhy: p.rejWhy ?? '',
+      rejFinal: p.rejFinal ? '1' : '',
+      newNo: p.newNo ?? '',
+      prevNo: p.prevNo ?? '',
+      resent: p.resent ?? '',
+      suppLink: p.suppLink ?? '',
+      printN: sv_(p.printN ?? ''),
+      printAt: p.printAt ?? '',
+      printOk: p.printOk ?? '',
+    };
+    TRK_KEYS.forEach((k) => {
+      r['trk_' + k] = p.trk?.[k] ?? '';
+    });
+    po.push(r);
+    p.items.forEach((l) =>
+      items.push({
+        no: p.no,
+        d: l.d,
+        q: sv_(l.q),
+        s: l.s,
+        p: sv_(l.p),
+        k: l.k ?? '',
+      })
+    );
+  });
+  return {
+    Users: d.users.map((u) => ({
+      id: u.id,
+      username: u.username ?? '',
+      nama: u.nama,
+      email: u.email,
+      pass: u.pass,
+      dept: u.dept,
+      role: u.role,
+      status: u.status,
+    })),
+    Departemen: d.depts.map((x) => ({ nama: x.nama })),
+    Kategori: d.cats.map((c) => ({
+      name: c.name,
+      type: c.type,
+      desc: c.desc ?? '',
+      ex: c.ex ?? '',
+      off: c.off ? 'TRUE' : '',
+    })),
+    Supplier_BP: d.bps.map((b) => ({
+      id: b.id,
+      kode: b.kode,
+      nama: b.nama,
+      exp: toSheetD(b.exp),
+    })),
+    PO: po,
+    PO_Items: items,
+    Change_History: d.hist.map((h) => ({
+      id: h.id,
+      iso: h.iso,
+      uid: h.uid,
+      by: h.by,
+      dept: h.dept,
+      no: h.no,
+      what: h.what,
+    })),
+    Penomoran: Object.keys(d.numCfg)
+      .sort()
+      .map((y) => ({
+        tahun: y,
+        nomor_awal:
+          d.numCfg[y].start === undefined ? '' : String(d.numCfg[y].start),
+        terkunci:
+          d.numCfg[y].locked === undefined
+            ? ''
+            : d.numCfg[y].locked
+            ? 'TRUE'
+            : 'FALSE',
+      })),
+    Pengaturan: [{ kunci: 'tema', nilai: String(d.theme) }],
+    Notif_Dibaca: d.seen.map((k) => ({ kunci: k })),
+    Tampilan: brandRows(d.brand),
+  };
+}
+
+/** baris-baris sheet -> state aplikasi (total PO dihitung ulang dari item, jadi mengubah item/harga di sheet ikut menyesuaikan) */
+function fromTables(t: STables, cur: SyncData): SyncData {
+  const g = (n: string) => t[n] ?? [];
+  const users: User[] = g('Users')
+    .filter((r) => r.email.trim())
+    .map((r) => ({
+      id: r.id.trim() || 'u-' + hash32(r.email.toLowerCase()).toString(36),
+      username: so_((r.username ?? '').toLowerCase()),
+      nama: r.nama,
+      email: r.email.trim().toLowerCase(),
+      pass: r.pass,
+      dept: r.dept,
+      role: r.role.trim().toLowerCase() === 'admin' ? 'admin' : 'user',
+      status:
+        (['pending', 'approved', 'rejected'] as const).find(
+          (s) => s === r.status.trim().toLowerCase()
+        ) ?? 'pending',
+    }));
+  const depts: Dept[] = g('Departemen')
+    .filter((r) => r.nama.trim())
+    .map((r) => ({ nama: r.nama.trim() }));
+  const cats: Cat[] = g('Kategori')
+    .filter((r) => r.name.trim())
+    .map((r) => ({
+      name: r.name.trim(),
+      type: r.type.trim().toLowerCase() === 'jasa' ? 'Jasa' : 'Barang',
+      desc: r.desc,
+      ex: r.ex,
+      off: sb_(r.off) || undefined,
+    }));
+  const bps: BP[] = g('Supplier_BP')
+    .filter((r) => r.nama.trim())
+    .map((r) => ({
+      id: r.id.trim() || 'bp-' + hash32(r.kode + r.nama).toString(36),
+      kode: r.kode,
+      nama: r.nama,
+      exp: parseExp(r.exp) ?? r.exp,
+    }));
+  const byNo = new Map<string, Line[]>();
+  g('PO_Items').forEach((r) => {
+    if (!r.no.trim()) return;
+    const a = byNo.get(r.no.trim()) ?? [];
+    a.push({ d: r.d, q: sn_(r.q), s: r.s, p: sn_(r.p), k: r.k });
+    byNo.set(r.no.trim(), a);
+  });
+  const pos: PO[] = g('PO')
+    .filter((r) => r.no.trim())
+    .map((r) => {
+      const items = byNo.get(r.no.trim()) ?? [];
+      const sub = items.reduce((a, l) => a + l.q * l.p, 0);
+      const rate = sn_(r.rate, 0.11),
+        disc = sn_(r.disc),
+        ong = sn_(r.ong);
+      const trk: Partial<Record<TKey, string>> = {};
+      TRK_KEYS.forEach((k) => {
+        const x = so_(r['trk_' + k]);
+        if (x) trk[k] = x;
+      });
+      return {
+        no: r.no.trim(),
+        iso: r.iso,
+        dept: r.dept,
+        uid: r.uid,
+        by: r.by,
+        v: {
+          nama: r.v_nama,
+          alamat: r.v_alamat,
+          npwp: r.v_npwp,
+          telp: r.v_telp,
+          fax: r.v_fax,
+          pic: r.v_pic,
+          email: r.v_email,
+        },
+        pay: {
+          rek: r.pay_rek,
+          bank: r.pay_bank,
+          cabang: r.pay_cabang,
+          an: r.pay_an,
+        },
+        items,
+        sub,
+        rate,
+        disc,
+        ong,
+        total: calc(sub, rate, disc, ong).total,
+        status: r.status.trim().toLowerCase() === 'done' ? 'Done' : 'Open',
+        doneAt: so_(r.doneAt),
+        note: r.note || undefined,
+        rej: so_(r.rej),
+        rejWhy: so_(r.rejWhy),
+        rejFinal:
+          r.rejFinal === '1' || r.rejFinal === 'true' ? true : undefined,
+        newNo: so_(r.newNo),
+        prevNo: so_(r.prevNo),
+        resent: so_(r.resent),
+        suppLink: so_(r.suppLink),
+        printN: sn_(r.printN, 0) || undefined,
+        printAt: so_(r.printAt),
+        printOk: so_(r.printOk),
+        trk: Object.keys(trk).length ? trk : undefined,
+      } as PO;
+    });
+  const hist: Hist[] = g('Change_History')
+    .filter((r) => r.iso.trim())
+    .map((r) => ({
+      id: r.id.trim() || 'h-' + hash32(r.iso + r.by + r.what).toString(36),
+      iso: r.iso,
+      uid: r.uid,
+      by: r.by,
+      dept: r.dept,
+      no: r.no,
+      what: r.what,
+    }));
+  const numCfg: NumCfg = {};
+  g('Penomoran')
+    .filter((r) => /^\d{4}$/.test(r.tahun.trim()))
+    .forEach((r) => {
+      const st = r.nomor_awal.trim() ? sn_(r.nomor_awal) : undefined;
+      const lk = r.terkunci.trim() ? sb_(r.terkunci) : undefined;
+      numCfg[r.tahun.trim()] = {
+        start: st && st > 0 ? Math.round(st) : undefined,
+        locked: lk,
+      };
+    });
+  const tm = g('Pengaturan').find((r) => r.kunci.trim() === 'tema');
+  return {
+    users: users.length ? users : cur.users,
+    depts: depts.length ? depts : cur.depts,
+    cats,
+    bps,
+    pos,
+    hist,
+    numCfg,
+    theme: tm ? sn_(tm.nilai, cur.theme) : cur.theme,
+    seen: g('Notif_Dibaca')
+      .map((r) => r.kunci)
+      .filter(Boolean),
+    brand: brandFrom(t.Tampilan, cur.brand),
+  };
+}
+
+/** Hook sinkron dua arah. Gambar (logo/background) TIDAK ikut: tetap tersimpan di aplikasi (po_brand). */
+function useSheetSync(
+  d: SyncData,
+  set: {
+    users: (v: User[]) => void;
+    depts: (v: Dept[]) => void;
+    cats: (v: Cat[]) => void;
+    bps: (v: BP[]) => void;
+    pos: (v: PO[]) => void;
+    hist: (v: Hist[]) => void;
+    numCfg: (v: NumCfg) => void;
+    theme: (v: number) => void;
+    seen: (v: string[]) => void;
+    brand: (v: Brand) => void;
+  }
+) {
+  const [ok, setOk] = useState(false);
+  const [kick, setKick] = useState(0); // memicu kirim ulang (mis. tampilan admin yang belum ada di sheet)
+  const brandKicked = useRef(false);
+  const [status, setStatus] = useState<'' | 'sync' | 'saved' | 'error'>('');
+  const last = useRef(''); // isi sheet terakhir yang diketahui sama dengan aplikasi
+  const busy = useRef(false);
+  const cur = useRef(d);
+  cur.current = d;
+  const setters = useRef(set);
+  setters.current = set;
+  const tables = useMemo(
+    () => toTables(d),
+    [
+      d.users,
+      d.depts,
+      d.cats,
+      d.bps,
+      d.pos,
+      d.hist,
+      d.numCfg,
+      d.theme,
+      d.seen,
+      d.brand,
+    ]
+  ); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const push = async (t: STables, key: string) => {
+    busy.current = true;
+    setStatus('sync');
+    try {
+      const r = await fetch(SHEET_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ token: SHEET_TOKEN, tables: t }),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error || 'gagal');
+      last.current = key;
+      setStatus('saved');
+    } catch {
+      setStatus('error');
+    } finally {
+      busy.current = false;
+    }
+  };
+
+  const pull = async (first: boolean) => {
+    if (busy.current) return;
+    busy.current = true;
+    try {
+      const r = await fetch(
+        SHEET_URL + '?token=' + encodeURIComponent(SHEET_TOKEN),
+        { cache: 'no-store' }
+      );
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error || 'gagal');
+      const remote = j.data as STables;
+      const sheetEmpty = Object.values(remote).every((x) => !x.length);
+      if (sheetEmpty) {
+        // sheet masih kosong: isi dengan data aplikasi saat ini (data dummy)
+        busy.current = false;
+        if (first) {
+          const t = toTables(cur.current);
+          await push(t, JSON.stringify(t));
+        }
+        setOk(true);
+        return;
+      }
+      const st = fromTables(remote, cur.current);
+      const norm = JSON.stringify(toTables(st));
+      if (norm !== last.current) {
+        const localDirty =
+          JSON.stringify(toTables(cur.current)) !== last.current;
+        if (first || !localDirty) {
+          // sheet berubah & tidak ada perubahan lokal yang belum terkirim: ikuti sheet
+          last.current = norm;
+          const s = setters.current;
+          s.users(st.users);
+          s.depts(st.depts);
+          s.cats(st.cats);
+          s.bps(st.bps);
+          s.pos(st.pos);
+          s.hist(st.hist);
+          s.numCfg(st.numCfg);
+          s.theme(st.theme);
+          s.seen(st.seen);
+          s.brand(st.brand);
+        }
+      }
+      // sheet belum menyimpan logo/background tetapi aplikasi ini punya: kirim sekali agar user lain ikut melihat
+      if (
+        !brandKicked.current &&
+        !(remote.Tampilan && remote.Tampilan.length) &&
+        brandHas(cur.current.brand)
+      ) {
+        brandKicked.current = true;
+        last.current = '';
+        setKick((k) => k + 1);
+      }
+      setStatus('saved');
+      setOk(true);
+    } catch {
+      setStatus('error');
+    } finally {
+      busy.current = false;
+    }
+  };
+
+  useEffect(() => {
+    void pull(true);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!ok) return;
+    const tick = () => {
+      if (!document.hidden) void pull(false);
+    };
+    const id = window.setInterval(tick, SHEET_POLL_MS);
+    document.addEventListener('visibilitychange', tick);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', tick);
+    };
+  }, [ok]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    // kirim perubahan aplikasi ke sheet (ditunda 1,5 dtk agar tidak terlalu sering)
+    if (!ok) return;
+    const key = JSON.stringify(tables);
+    if (key === last.current) return;
+    const id = window.setTimeout(() => {
+      if (!busy.current) void push(tables, key);
+    }, 1500);
+    return () => clearTimeout(id);
+  }, [tables, ok, kick]); // eslint-disable-line react-hooks/exhaustive-deps
+  return status;
+}
+
+export default function App() {
+  const [users, setUsers] = useLS<User[]>('po_users', [ADMIN]);
+  const [pos, setPos] = useLS<PO[]>('po_list', []);
+  const [sid, setSid] = useLS<string>('po_session', '');
+  const [brand, setBrand] = useLS<Brand>('po_brand', BRAND0);
+  const [catsRaw, setCatsRaw] = useLS<(Cat | string)[]>('po_cats', DEF_CATS); // data lama (string[]) otomatis dikonversi
+  useEffect(() => {
+    try {
+      if (localStorage.getItem('po_cats_v') === CAT_VER) return;
+      setCatsRaw((raw) => mergeCats(raw));
+      localStorage.setItem('po_cats_v', CAT_VER);
+    } catch {
+      /* abaikan */
+    }
+  }, [setCatsRaw]);
+  const cats = normCats(catsRaw);
+  const setCats = (f: (c: Cat[]) => Cat[]) =>
+    setCatsRaw((raw) => f(normCats(raw)));
+  const [bps, setBps] = useLS<BP[]>('po_bp', DEF_BP);
+  const [numCfg, setNumCfg] = useLS<NumCfg>('po_numcfg', {});
+  const [depts, setDepts] = useLS<Dept[]>('po_depts', DEF_DEPTS);
+  const deptNames = deptSort(depts);
+  const [seen, setSeen] = useLS<string[]>('po_seen', []);
+  const [hist, setHist] = useLS<Hist[]>('po_hist', []);
+  const [page, setPage] = useState('');
+  const [draft, setDraft] = useState<Draft | null>(null);
+  const [fk, setFk] = useState(0);
+  const [fixedNo, setFixedNo] = useState<string | null>(null); // nomor PO yang sedang diperbaiki/dilihat (null = pengajuan baru)
+  const [formRO, setFormRO] = useState(false); // form mode lihat saja (admin)
+  const [toast, setToast] = useState('');
+  const [fDept, setFDept] = useState('');
+  const [gq, setGq] = useState('');
+  const [gdraft, setGdraft] = useState('');
+  const [fStat, setFStat] = useState('');
+  const [viewNo, setViewNo] = useState('');
+  const [prevPg, setPrevPg] = useState(''); // halaman sebelum membuka Dokumen PO (untuk tombol Kembali)
+  const [backTo, setBackTo] = useState(''); // halaman asal dokumen PO (mis. "tracking"); kosong = dibuka langsung, tanpa tombol kembali
+  const [mdOpen, setMdOpen] = useState(true);
+  /* Mode HP/tablet: sidebar menjadi drawer geser (dibuka lewat tombol hamburger) */
+  const [navOpen, setNavOpen] = useState(false);
+  /* Desktop: sidebar tertutup (ikon saja); terbuka ke kanan saat kursor/fokus berada di sidebar */
+  const [sideHov, setSideHov] = useState(false);
+  useEffect(() => {
+    // Pastikan browser HP memakai lebar layar asli (bukan tampilan desktop yang diperkecil) dan aman dari poni/notch iPhone
+    let m = document.querySelector<HTMLMetaElement>('meta[name="viewport"]');
+    if (!m) {
+      m = document.createElement('meta');
+      m.name = 'viewport';
+      document.head.appendChild(m);
+    }
+    m.content = 'width=device-width, initial-scale=1, viewport-fit=cover';
+  }, []);
+  useEffect(() => {
+    setNavOpen(false);
+  }, [sid]);
+  useEffect(() => {
+    if (!navOpen) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden'; // halaman di belakang drawer tidak ikut bergulir
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setNavOpen(false);
+    };
+    const onSize = () => {
+      if (window.innerWidth > 900) setNavOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('resize', onSize);
+    return () => {
+      document.body.style.overflow = prev;
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('resize', onSize);
+    };
+  }, [navOpen]);
+  /* Sidebar: pill indikator menu aktif yang meluncur mulus ke menu yang dipilih */
+  const navRef = useRef<HTMLElement>(null);
+  const [pill, setPill] = useState<{ t: number; h: number } | null>(null);
+  const [pillAnim, setPillAnim] = useState(false);
+  useLayoutEffect(() => {
+    const measure = () => {
+      const el = navRef.current?.querySelector<HTMLElement>('.nv.on');
+      setPill(el ? { t: el.offsetTop, h: el.offsetHeight } : null);
+    };
+    measure();
+    const raf = requestAnimationFrame(() => setPillAnim(true)); // transisi aktif setelah posisi awal terpasang (tanpa animasi saat pertama muat)
+    window.addEventListener('resize', measure);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener('resize', measure);
+    };
+  }, [page, mdOpen, sid, sideHov]);
+  const [um, setUm] = useState(false);
+  const [pwOpen, setPwOpen] = useState(false); // modal ganti password
+  const [uq, setUq] = useState('');
+  const [uPg, setUPg] = useState(1);
+  const uRows = users
+    .filter(
+      (u) =>
+        u.id !== ADMIN.id &&
+        (!uq.trim() ||
+          (u.nama + ' ' + uname(u) + ' ' + u.email + ' ' + u.dept)
+            .toLowerCase()
+            .includes(uq.trim().toLowerCase()))
+    )
+    .sort(
+      (a, b) => Number(b.status === 'pending') - Number(a.status === 'pending')
+    );
+  const uPages = Math.max(1, Math.ceil(uRows.length / 15));
+  const uPgSafe = Math.min(uPg, uPages);
+  const [per, setPer] = useState<PSel>(() => {
+    const d = new Date();
+    return { type: 'monthly', year: d.getFullYear(), n: d.getMonth() };
+  });
+  const [themeG, setThemeG] = useLS<number>('po_theme', 0); // tema bawaan sistem: diatur admin, tersimpan
+  useSheetSync(
+    { users, depts, cats, bps, pos, hist, numCfg, theme: themeG, seen, brand },
+    {
+      users: setUsers,
+      depts: setDepts,
+      cats: setCatsRaw,
+      bps: setBps,
+      pos: setPos,
+      hist: setHist,
+      numCfg: setNumCfg,
+      theme: setThemeG,
+      seen: setSeen,
+      brand: setBrand as (v: Brand) => void,
+    }
+  );
+  const [themeU, setThemeU] = useState<number | null>(null); // tema sementara user: tidak disimpan, hilang saat keluar / muat ulang
+  const [thOpen, setThOpen] = useState(false);
+  const [thPrev, setThPrev] = useState<{ g: number; u: number | null }>({
+    g: 0,
+    u: null,
+  }); // tema sebelum popover dibuka, untuk tombol Kembali
+
+  // Pastikan akun admin selalu sesuai dengan data ADMIN di atas (menimpa data lama di browser)
+  useEffect(() => {
+    setUsers((l) => {
+      const a = l.find((u) => u.id === 'admin');
+      if (!a) return [ADMIN, ...l];
+      // jaga identitas/hak akses admin, tetapi JANGAN menimpa password yang sudah diganti
+      return a.username === ADMIN.username &&
+        a.role === 'admin' &&
+        a.status === 'approved' &&
+        a.pass
+        ? l
+        : l.map((u) =>
+            u.id === 'admin'
+              ? {
+                  ...ADMIN,
+                  email: u.email || ADMIN.email,
+                  pass: u.pass || ADMIN.pass,
+                }
+              : u
+          );
+    });
+  }, [setUsers]);
+
+  // Data contoh (user + PO 6 bulan) dengan daftar departemen baru, dimuat satu kali. Data contoh lama (id "demo-") dibuang dan dibuat ulang.
+  // Data asli tidak dihapus; nama departemen versi lama pada data asli dipindah ke departemen baru (lihat LEGACY_DEPT).
+  // Nomor PO lama yang memakai kode departemen diseragamkan menjadi kode GA. Untuk memuat ulang: hapus kunci "po_seed_v3" di localStorage.
+  useEffect(() => {
+    try {
+      if (localStorage.getItem('po_seed_v3')) return;
+      localStorage.setItem('po_seed_v3', '1');
+      localStorage.setItem('po_seed_v2', '1');
+      localStorage.setItem('po_seed_v1', '1');
+    } catch {
+      return;
+    }
+    const known = new Set(DEF_DEPTS.map((d) => d.nama));
+    const fix = (d: string) =>
+      !known.has(d) && LEGACY_DEPT[d] ? LEGACY_DEPT[d] : d;
+    const fixNo = (n: string) =>
+      n.replace(/^(\d+\/AGP-PO\/)[^/]+(\/)/, `$1${PO_CODE}$2`);
+    setUsers((l) => {
+      const keep = l
+        .filter((u) => !u.id.startsWith('demo-'))
+        .map((u) => ({ ...u, dept: fix(u.dept) }));
+      return [
+        ...keep,
+        ...(SEED_DEMO
+          ? DEMO_USERS.filter((d) => !keep.some((u) => u.email === d.email))
+          : []),
+      ];
+    });
+    setPos((l) => {
+      const keep = l
+        .filter((x) => !x.uid.startsWith('demo-'))
+        .map((x) => ({ ...x, no: fixNo(x.no), dept: fix(x.dept) }));
+      const base: Record<number, number> = {};
+      keep.forEach((x) => {
+        const m = /^(\d+)\/AGP-PO\/[^/]+\/[^/]+\/(\d{4})$/.exec(x.no);
+        if (m)
+          base[Number(m[2])] = Math.max(base[Number(m[2])] ?? 0, Number(m[1]));
+      });
+      return SEED_DEMO ? [...keep, ...makeDemoPOs(base)] : keep;
+    });
+  }, [setUsers, setPos]);
+
+  // PO contoh 44 item (meniru PO PDF contoh) dimuat satu kali. Muat ulang: hapus kunci "po_seed_ref_v1" di localStorage.
+  useEffect(() => {
+    try {
+      if (localStorage.getItem('po_seed_ref_v1')) return;
+      localStorage.setItem('po_seed_ref_v1', '1');
+    } catch {
+      return;
+    }
+    if (!SEED_DEMO) return;
+    setPos((l) =>
+      l.some((x) => x.uid === 'dummy-ref')
+        ? l
+        : [makeRefPO(new Set(l.map((x) => x.no))), ...l]
+    );
+  }, [setPos]);
+
+  // Data contoh Change History (dummy) untuk admin: dibuat sekali dari data contoh user & PO yang ada. Muat ulang: hapus kunci "po_hist_seed_v1".
+  useEffect(() => {
+    if (!pos.some((x) => x.uid.startsWith('demo-'))) return;
+    try {
+      if (localStorage.getItem('po_hist_seed_v1')) return;
+      localStorage.setItem('po_hist_seed_v1', '1');
+    } catch {
+      return;
+    }
+    const seed = makeDemoHist(pos, users);
+    setHist((l) =>
+      [...l, ...seed].sort((a, b) => b.iso.localeCompare(a.iso)).slice(0, 1000)
+    );
+  }, [pos, users, setHist]);
+
+  const me = users.find((u) => u.id === sid && u.status === 'approved');
+
+  // Akun demo yang sudah terlanjur ada: dinonaktifkan saat admin login (password demo sudah umum diketahui). Admin bisa mengaktifkan kembali bila perlu.
+  useEffect(() => {
+    if (SEED_DEMO || !me || me.role !== 'admin') return;
+    if (!users.some((u) => u.id.startsWith('demo-') && u.status !== 'rejected'))
+      return;
+    setUsers((l) =>
+      l.map((u) =>
+        u.id.startsWith('demo-') && u.status !== 'rejected'
+          ? { ...u, status: 'rejected' }
+          : u
+      )
+    );
+    notify('Akun demo (password umum) otomatis dinonaktifkan demi keamanan.');
+  }, [me?.id, users]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Admin login: password lama (teks biasa) milik semua akun di-hash sekali jalan, sehingga tidak ada lagi password terbaca di sheet.
+  useEffect(() => {
+    if (
+      !me ||
+      me.role !== 'admin' ||
+      !users.some((u) => u.pass && !isHashed(u.pass))
+    )
+      return;
+    let off = false;
+    void (async () => {
+      try {
+        const m = new Map<string, string>();
+        for (const u of users)
+          if (u.pass && !isHashed(u.pass)) m.set(u.id, await hashPw(u.pass));
+        if (!off && m.size)
+          setUsers((l) =>
+            l.map((u) => (m.has(u.id) ? { ...u, pass: m.get(u.id)! } : u))
+          );
+      } catch {
+        /* abaikan */
+      }
+    })();
+    return () => {
+      off = true;
+    };
+  }, [me?.id, me?.role, users, setUsers]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Login dengan password default/lemah: modal ganti password dibuka otomatis
+  useEffect(() => {
+    if (me && WEAK_LOGIN) {
+      WEAK_LOGIN = false;
+      setPwOpen(true);
+      notify(
+        'Password Anda masih default/lemah. Segera ganti dengan password baru (min. 8 karakter).'
+      );
+    }
+  }, [me?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* Auto-logout: bila sudah login dan tidak ada gerakan kursor / klik / ketikan / scroll / sentuhan selama IDLE_MS, otomatis keluar. */
+  useEffect(() => {
+    if (!me) return;
+    let t = 0;
+    const out = () => {
+      try {
+        sessionStorage.setItem('po_idle', '1');
+      } catch {
+        /* abaikan */
+      }
+      setSid('');
+      setPage('');
+      setThemeU(null);
+      setThOpen(false);
+      setUm(false);
+    };
+    const reset = () => {
+      clearTimeout(t);
+      t = window.setTimeout(out, IDLE_MS);
+    };
+    const evs = [
+      'mousemove',
+      'mousedown',
+      'keydown',
+      'wheel',
+      'scroll',
+      'touchstart',
+      'touchmove',
+      'pointerdown',
+    ];
+    evs.forEach((e) =>
+      window.addEventListener(e, reset, { passive: true, capture: true })
+    );
+    reset();
+    return () => {
+      clearTimeout(t);
+      evs.forEach((e) => window.removeEventListener(e, reset, true));
+    };
+  }, [me?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Catat siapa mengubah apa, kapan, pada PO mana (maks. 1000 baris terakhir disimpan)
+  const logH = (no: string, what: string) => {
+    if (!me) return;
+    setHist((l) =>
+      [
+        {
+          id: newId('h-'),
+          iso: new Date().toISOString(),
+          uid: me.id,
+          by: me.nama,
+          dept: me.dept,
+          no,
+          what,
+        },
+        ...l,
+      ].slice(0, 1000)
+    );
+  };
+  const notify = (m: string) => {
+    setToast(m);
+    window.setTimeout(() => setToast(''), 2300);
+  };
+
+  const hue = me?.role === 'admin' ? themeG : themeU ?? themeG;
+  if (!me)
+    return (
+      <>
+        <style>{themed(css, themeG)}</style>
+        <Auth
+          tint={themeG !== 0}
+          brand={brand}
+          depts={deptNames}
+          users={users}
+          setUsers={setUsers}
+          onLogin={(id) => {
+            setSid(id);
+            setPage('');
+          }}
+        />
+      </>
+    );
+
+  const admin = me.role === 'admin';
+  // Halaman khusus admin: user biasa tidak memiliki menu ini dan tidak bisa membukanya (diarahkan ke Buat PO Request)
+  const cur0 = page || (admin ? 'dash' : 'form');
+  const cur = !admin && ADMIN_ONLY.has(cur0) ? 'form' : cur0;
+  const pending = users.filter((u) => u.status === 'pending').length;
+  const scope = admin ? pos : pos.filter((p) => sameDept(p.dept, me.dept));
+  const mine = pos.filter((p) => p.uid === me.id);
+  const openCnt = scope.filter(isWait).length;
+  const unread = mine.filter(
+    (p) =>
+      (p.status === 'Done' || !!p.rej) && !seen.includes(notifKey(me.id, p))
+  ).length;
+  const match = (p: PO, k: string) =>
+    !k.trim() ||
+    (
+      p.no +
+      ' ' +
+      p.v.nama +
+      ' ' +
+      p.by +
+      ' ' +
+      p.items.map((i) => i.d).join(' ')
+    )
+      .toLowerCase()
+      .includes(k.trim().toLowerCase());
+
+  const main: Nav[] = admin
+    ? [
+        { k: 'dash', l: 'Dashboard', ic: 'home' },
+        { k: 'all', l: 'Semua Pengajuan', ic: 'fileList', bd: openCnt },
+        { k: 'doc', l: 'Dokumen PO', ic: 'file' },
+        { k: 'tracking', l: 'Tracking PO', ic: 'truck' },
+        { k: 'users', l: 'Verifikasi User', ic: 'user', bd: pending },
+        { k: 'supplier', l: 'Data Supplier', ic: 'users' },
+        { k: 'history', l: 'Change History', ic: 'clock' },
+      ]
+    : [
+        { k: 'dash', l: 'Dashboard', ic: 'home' },
+        { k: 'form', l: 'Buat PO Request', ic: 'filePlus' },
+        { k: 'riwayat', l: 'Riwayat Pengajuan', ic: 'fileList' },
+        { k: 'approval', l: 'Menunggu Approval', ic: 'clock', bd: openCnt },
+        { k: 'tracking', l: 'Tracking PO', ic: 'truck' },
+        { k: 'supplier', l: 'Data Supplier', ic: 'users' },
+        { k: 'notif', l: 'Notifikasi', ic: 'bell', bd: unread },
+      ];
+  const master: Nav[] = [
+    { k: 'kategori', l: 'Kategori Barang/Jasa', ic: 'box' },
+    { k: 'supplier', l: 'Data Supplier', ic: 'users' },
+    { k: 'barang', l: 'Daftar Barang', ic: 'box' },
+  ];
+
+  const go = (k: string) => {
+    setBackTo('');
+    setPrevPg(cur);
+    if (k === 'form') {
+      setFixedNo(null); // form baru dari sidebar, bukan perbaikan/lihat
+      setFormRO(false);
+    }
+    setPage(k);
+    setUm(false);
+    setNavOpen(false);
+    window.scrollTo({ top: 0 });
+  };
+  // Isian form dari PO yang sudah ada (dipakai Edit PO & Lihat Form): vendor,
+  // pembayaran, item (+kategori di k), pajak/discount/ongkir/catatan & tanggal awal.
+  const fillDraft = (p: PO): Draft => ({
+    v: { ...p.v },
+    pay: { ...(p.pay ?? EMPTY_PAY) },
+    items: p.items.map((l) =>
+      newItem({
+        d: l.d,
+        q: String(l.q),
+        s: l.s,
+        p: String(l.p),
+        k: l.k ?? '',
+      })
+    ),
+    disc: String(p.disc),
+    ong: String(p.ong ?? ''),
+    rate: String(p.rate),
+    note: p.note ?? '',
+    iso: p.iso,
+  });
+  // User: perbaiki PO yang ditolak — form terbuka terisi data PO lama, nomor tetap sama.
+  const editPo = (p: PO) => {
+    if (admin) return notify('Edit pengajuan hanya tersedia untuk akun user.');
+    if (p.rejFinal)
+      return notify('PO Reject (final) tidak bisa diedit. Buat PO baru.');
+    setDraft(fillDraft(p));
+    setFixedNo(p.no);
+    setFormRO(false);
+    setFk((k) => k + 1);
+    setPage('form');
+    notify(
+      'Perbaiki isian yang salah, lalu kirim ulang. Nomor pengajuan tetap sama.'
+    );
+  };
+  // User: PO sudah di-reject final -> buka form baru terisi data lama; nomor PO baru (bertambah) dibuat otomatis.
+  const newFromRejected = (p: PO) => {
+    if (admin)
+      return notify('Pembuatan PO baru hanya tersedia untuk akun user.');
+    if (p.uid !== me.id || !p.rejFinal || p.newNo) return;
+    setFixedNo(null);
+    setFormRO(false);
+    setDraft({ ...fillDraft(p), iso: undefined, prev: p.no });
+    setFk((k) => k + 1);
+    setPage('form');
+    notify(
+      `PO ${p.no} sudah di-reject. Periksa isian, lalu kirim sebagai PO baru (nomor baru dibuat otomatis).`
+    );
+  };
+  // Admin: lihat isian form pengajuan secara lengkap (mode lihat saja).
+  const viewForm = (p: PO) => {
+    if (!admin) return;
+    setDraft(fillDraft(p));
+    setFixedNo(p.no);
+    setFormRO(true);
+    setFk((k) => k + 1);
+    setPage('form');
+  };
+  const copy = (p: PO, all: boolean) => {
+    if (admin) return notify('Salin pengajuan hanya tersedia untuk akun user.');
+    setFixedNo(null);
+    setFormRO(false);
+    setDraft({
+      v: { ...p.v },
+      pay: { ...(p.pay ?? EMPTY_PAY) },
+      items: all
+        ? p.items.map((l) =>
+            newItem({
+              d: l.d,
+              q: String(l.q),
+              s: l.s,
+              p: String(l.p),
+              k: l.k ?? '',
+            })
+          )
+        : [newItem()],
+    });
+    setFk((k) => k + 1);
+    setPage('form');
+    notify(
+      all
+        ? 'Vendor, pembayaran & item disalin. Sesuaikan isian, nomor pengajuan baru dibuat otomatis.'
+        : 'Data vendor & pembayaran disalin. Lengkapi item barang.'
+    );
+  };
+  const useSupplier = (r: SupRow) => {
+    setFixedNo(null);
+    setFormRO(false);
+    setDraft({
+      v: { ...r.v },
+      pay: { ...(r.pay ?? EMPTY_PAY) },
+      items: [newItem()],
+    });
+    setFk((k) => k + 1);
+    setPage('form');
+    notify('Data supplier disalin. Lengkapi item barang.');
+  };
+  const useBarang = (r: ItemRow) => {
+    setFixedNo(null);
+    setFormRO(false);
+    setDraft({
+      v: EMPTY,
+      pay: EMPTY_PAY,
+      items: [newItem({ d: r.d, s: r.s, p: String(r.p), k: r.k })],
+    });
+    setFk((k) => k + 1);
+    setPage('form');
+    notify('Barang ditambahkan ke form. Isi qty dan data vendor.');
+  };
+  // admin: buka halaman Dokumen PO dengan nomor terpilih; user: tampil popup dokumen
+  const openDoc = (no: string) => {
+    setBackTo('');
+    setViewNo(no);
+    if (admin) {
+      if (cur !== 'doc') setPrevPg(cur);
+      setPage('doc');
+    }
+  };
+  // dari Tracking PO: sama seperti openDoc, tetapi mengingat asalnya agar ada tombol Kembali
+  const openDocFromTracking = (no: string) => {
+    setViewNo(no);
+    if (admin) {
+      if (cur !== 'doc') setPrevPg(cur);
+      setPage('doc');
+    }
+  };
+  const backPg = prevPg && prevPg !== 'doc' ? prevPg : 'all';
+  const backFromDoc = () => {
+    setBackTo('');
+    setPage(backPg);
+    window.scrollTo({ top: 0 });
+  };
+  // periode tahun yang terkunci: PO pada tahun itu tidak bisa diubah (approve, tolak, buka lagi, tracker)
+  const lockedOf = (p: PO) => lockedYear(numCfg, new Date(p.iso).getFullYear());
+  const guard = (no: string) => {
+    const p = pos.find((x) => x.no === no);
+    if (!p || !lockedOf(p)) return false;
+    notify(
+      `Periode ${new Date(
+        p.iso
+      ).getFullYear()} terkunci. Buka kunci di Pengaturan untuk mengubah.`
+    );
+    return true;
+  };
+  const markDone = (no: string) => {
+    if (guard(no)) return;
+    const p0 = pos.find((x) => x.no === no);
+    if (p0) {
+      const { bp, bi } = bpOfPo(bps, p0);
+      if (
+        (!bp || !bi || bi.expired) &&
+        !window.confirm(`${bpWhy(bps, p0)}.\n\nTetap tandai Done?`)
+      )
+        return;
+    }
+    logH(no, 'Status PO ditandai Done (PO di-approve)');
+    setPos((l) =>
+      l.map((p) =>
+        p.no === no
+          ? {
+              ...p,
+              status: 'Done',
+              doneAt: new Date().toISOString(),
+              trk: { ...p.trk, appr: p.trk?.appr ?? ymd(new Date()) },
+            }
+          : p
+      )
+    );
+    notify('Ditandai Done. User melihat: PO sudah bisa dicetak.');
+  };
+  // Catat setiap cetak PO. Cetak pertama: tombol berubah merah. Cetak berikutnya hanya lewat izin admin dan tercatat di riwayat.
+  const markPrinted = (no: string) => {
+    const p0 = pos.find((x) => x.no === no);
+    if (!p0) return;
+    const n = (p0.printN ?? 0) + 1;
+    logH(
+      no,
+      n === 1
+        ? 'PO dicetak (cetak pertama)'
+        : `Cetak ulang PO — dicetak lebih dari satu kali (cetak ke-${n}${
+            me?.role === 'admin' ? '' : ', diizinkan admin'
+          })`
+    );
+    setPos((l) =>
+      l.map((p) =>
+        p.no === no
+          ? {
+              ...p,
+              printN: n,
+              printAt: new Date().toISOString(),
+              printOk: undefined,
+            }
+          : p
+      )
+    );
+  };
+  const allowReprint = (no: string) => {
+    const p0 = pos.find((x) => x.no === no);
+    if (!p0 || me?.role !== 'admin') return;
+    logH(
+      no,
+      `Admin mengizinkan cetak ulang PO (sudah dicetak ${p0.printN ?? 0}×)`
+    );
+    setPos((l) =>
+      l.map((p) =>
+        p.no === no ? { ...p, printOk: new Date().toISOString() } : p
+      )
+    );
+    notify('Cetak ulang diizinkan. User bisa mencetak PO ini satu kali lagi.');
+  };
+  const setTrk = (no: string, k: TKey, v: string) => {
+    if (guard(no)) return;
+    const old = pos.find((x) => x.no === no)?.trk?.[k];
+    if ((old ?? '') === v) return;
+    const lbl = TSTEPS.find((x) => x.k === k)?.l ?? k;
+    logH(
+      no,
+      v
+        ? old
+          ? `${lbl}: tanggal diubah ${fmtD(old)} → ${fmtD(v)}`
+          : `${lbl}: tanggal diisi ${fmtD(v)}`
+        : `${lbl}: tanggal dihapus (sebelumnya ${old ? fmtD(old) : '-'})`
+    );
+    setPos((l) =>
+      l.map((p) => {
+        if (p.no !== no) return p;
+        const trk = { ...p.trk };
+        if (v) trk[k] = v;
+        else delete trk[k];
+        return k === 'supp' && !v
+          ? { ...p, trk, suppLink: undefined }
+          : { ...p, trk };
+      })
+    );
+    notify(v ? 'Tracker diperbarui.' : 'Tanggal tahap dihapus.');
+  };
+  const reopen = (no: string) => {
+    if (guard(no)) return;
+    if (pos.find((x) => x.no === no)?.rejFinal)
+      return notify(
+        'PO Reject (final) tidak bisa dibuka lagi. User membuat PO baru.'
+      );
+    logH(no, 'Status PO dibuka kembali (Open)');
+    setPos((l) =>
+      l.map((p) =>
+        p.no === no
+          ? {
+              ...p,
+              status: 'Open',
+              doneAt: undefined,
+              rej: undefined,
+              rejWhy: undefined,
+            }
+          : p
+      )
+    );
+  };
+  const reject = (no: string) => {
+    if (guard(no)) return;
+    const p0 = pos.find((x) => x.no === no);
+    if (!p0) return;
+    const why = window.prompt(
+      'Alasan penolakan (dikirim ke user sebagai notifikasi):',
+      bpWhy(bps, p0)
+    );
+    if (why === null) return;
+    const reason = why.trim() || 'Ditolak oleh admin';
+    logH(no, `Pengajuan ditolak (Rejected): ${reason}`);
+    setPos((l) =>
+      l.map((p) =>
+        p.no === no
+          ? { ...p, rej: new Date().toISOString(), rejWhy: reason }
+          : p
+      )
+    );
+    notify('Pengajuan ditolak. User menerima notifikasi beserta alasannya.');
+  };
+  /** Admin: PO Reject (final). PO lama terkunci (tidak bisa diedit/dikirim ulang/dibuka lagi), user membuat PO baru dengan nomor baru. */
+  const poReject = (no: string) => {
+    if (guard(no)) return;
+    const p0 = pos.find((x) => x.no === no);
+    if (!p0 || p0.rejFinal) return;
+    const why = window.prompt(
+      `PO Reject ${no}\nPO ini tidak bisa diedit lagi dan user harus membuat PO baru (nomor baru).\n\nKeterangan reject (wajib diisi):`,
+      p0.rejWhy ?? ''
+    );
+    if (why === null) return;
+    const reason = why.trim();
+    if (!reason) return notify('Keterangan reject wajib diisi.');
+    logH(
+      no,
+      `PO Reject (final): ${reason}. User membuat PO baru dengan nomor baru.`
+    );
+    setPos((l) =>
+      l.map((p) =>
+        p.no === no
+          ? {
+              ...p,
+              rej: new Date().toISOString(),
+              rejWhy: reason,
+              rejFinal: true,
+              status: 'Open',
+              doneAt: undefined,
+            }
+          : p
+      )
+    );
+    notify('PO di-reject. User menerima notifikasi untuk membuat PO baru.');
+  };
+  /** User pembuat PO: lanjutkan PO yang ditolak tanpa membuat ulang; status kembali menunggu admin. */
+  const resend = (p: PO) => {
+    if (p.uid !== me.id || !p.rej || p.rejFinal || guard(p.no)) return;
+    if (
+      !window.confirm(
+        'Kirim ulang pengajuan ini ke admin? PO yang sama akan diproses kembali.'
+      )
+    )
+      return;
+    logH(
+      p.no,
+      'Pengajuan dikirim ulang oleh user (dilanjutkan setelah ditolak)'
+    );
+    setPos((l) =>
+      l.map((x) =>
+        x.no === p.no
+          ? {
+              ...x,
+              rej: undefined,
+              rejWhy: undefined,
+              resent: new Date().toISOString(),
+            }
+          : x
+      )
+    );
+    notify('Pengajuan dikirim ulang. Admin akan memprosesnya kembali.');
+  };
+  const setUserStatus = (id: string, s: User['status']) => {
+    const u = users.find((x) => x.id === id);
+    if (!u || u.status === s) return;
+    setUsers((l) => l.map((x) => (x.id === id ? { ...x, status: s } : x)));
+    const act =
+      s === 'approved'
+        ? u.status === 'pending'
+          ? 'Approve anggota baru'
+          : 'Aktifkan kembali akun'
+        : u.status === 'approved'
+        ? 'Nonaktifkan akun'
+        : 'Reject pendaftaran';
+    logH('-', `${act}: ${u.nama} (${u.email})`);
+    if (s === 'approved')
+      void sendMail(
+        u.email,
+        'Akun PO Request System sudah aktif',
+        mailActivated(u)
+      ).then((ok) =>
+        notify(
+          ok
+            ? `Akun ${u.nama} aktif. Email notifikasi terkirim ke ${u.email}.`
+            : `Akun ${u.nama} aktif, tetapi email notifikasi gagal terkirim.`
+        )
+      );
+  };
+  /** Ganti password akun sendiri. Mengembalikan pesan error, atau "" bila berhasil. */
+  const changePw = async (o: string, n: string) => {
+    if (!(await verifyPw(o, me.pass))) return 'Password lama salah.';
+    if (n.length < 8) return 'Password baru minimal 8 karakter.';
+    if (n === o) return 'Password baru harus berbeda dari password lama.';
+    if (PW_WEAK.includes(n.toLowerCase()))
+      return 'Password terlalu mudah ditebak.';
+    const h = await hashPw(n);
+    setUsers((l) => l.map((u) => (u.id === me.id ? { ...u, pass: h } : u)));
+    WEAK_LOGIN = false;
+    logH('-', 'Ganti password akun sendiri');
+    return '';
+  };
+  /** Admin: ubah hak akses (role) akun. Admin = akses penuh semua menu; User = menu terbatas. Akun admin utama & akun sendiri tidak bisa diubah. */
+  const setUserRole = (u: User, role: User['role']) => {
+    if (u.role === role || u.id === ADMIN.id || u.id === me.id) return;
+    const lbl = (r: User['role']) => (r === 'admin' ? 'Admin' : 'User');
+    const msg =
+      role === 'admin'
+        ? `Jadikan ${u.nama} sebagai Admin?\nAkun ini akan mendapat akses penuh: Semua Pengajuan, Verifikasi User, Change History, dan Pengaturan.`
+        : `Ubah ${u.nama} menjadi User biasa?\nAkses Semua Pengajuan, Verifikasi User, Change History, dan Pengaturan akan dicabut.`;
+    if (!window.confirm(msg)) return;
+    setUsers((l) => l.map((x) => (x.id === u.id ? { ...x, role } : x)));
+    logH(
+      '-',
+      `Ubah hak akses ${u.nama} (${u.email}): ${lbl(u.role)} → ${lbl(role)}`
+    );
+    notify(`Hak akses ${u.nama} diubah menjadi ${lbl(role)}.`);
+  };
+  /** Admin: reset password user menjadi password sementara (ditampilkan di tabel agar bisa diberikan ke user). */
+  const resetPw = async (u: User) => {
+    if (
+      !window.confirm(
+        `Reset password ${u.nama}? Password akan diganti dengan password sementara.`
+      )
+    )
+      return;
+    const tmp = tmpPw();
+    const th = await hashPw(tmp);
+    setUsers((l) => l.map((x) => (x.id === u.id ? { ...x, pass: th } : x)));
+    logH('-', `Reset password akun ${u.nama} (${u.email})`);
+    notify(`Password ${u.nama} direset: ${tmp}`);
+    void sendMail(
+      u.email,
+      'Password akun PO Request System direset',
+      mailReset(u, tmp)
+    ).then((ok) =>
+      notify(
+        ok
+          ? `Password ${u.nama} direset: ${tmp}. Email terkirim ke ${u.email}.`
+          : `Password ${u.nama} direset: ${tmp}. Email GAGAL terkirim, berikan password ini secara manual.`
+      )
+    );
+  };
+  const readOne = (no: string) => {
+    const p = pos.find((x) => x.no === no);
+    if (!p) return;
+    const k = notifKey(me.id, p);
+    setSeen((l) => (l.includes(k) ? l : [...l, k]));
+  };
+  const readAll = () =>
+    setSeen((l) => [
+      ...new Set([...l, ...mine.map((p) => notifKey(me.id, p))]),
+    ]);
+  const viewAll = (f: string) => {
+    if (admin) {
+      setFStat(f);
+      setFDept('');
+      setGq('');
+      setGdraft('');
+      go('all');
+    } else go(f === 'Open' ? 'approval' : 'riwayat');
+  };
+  const submitSearch = () => {
+    setGq(gdraft);
+    setPage(admin ? 'all' : 'riwayat');
+  };
+
+  const exportCsv = (list: PO[] = pos) => {
+    const rows = [
+      [
+        'No Pengajuan',
+        'Waktu Submit',
+        'Departemen',
+        'Pemohon',
+        'Vendor',
+        'NPWP',
+        'Bank',
+        'No Rekening',
+        'Kantor Cabang',
+        'Atas Nama',
+        'Deskripsi',
+        'Kategori',
+        'Qty',
+        'Satuan',
+        'Harga',
+        'Total Item',
+        'Pajak',
+        'Discount',
+        'Ongkir',
+        'Grand Total',
+        'Status',
+        'Waktu Done',
+        'Kategori Nilai',
+        'Keterangan Reject',
+      ],
+    ];
+    list.forEach((p) =>
+      p.items.forEach((l) =>
+        rows.push([
+          p.no,
+          fmtDT(p.iso),
+          p.dept,
+          p.by,
+          p.v.nama,
+          p.v.npwp,
+          p.pay?.bank ?? '',
+          p.pay?.rek ?? '',
+          p.pay?.cabang ?? '',
+          p.pay?.an ?? '',
+          l.d,
+          l.k ?? '',
+          String(l.q),
+          l.s,
+          String(l.p),
+          String(l.q * l.p),
+          `${Math.round(p.rate * 100)}%`,
+          String(p.disc),
+          String(p.ong ?? 0),
+          String(p.total),
+          p.status === 'Done' ? 'Done' : p.rej ? 'Rejected' : 'Open',
+          p.doneAt ? fmtDT(p.doneAt) : '',
+          isBig(p)
+            ? 'Di atas Rp 10 juta (approve Managing Director)'
+            : 'Di bawah Rp 10 juta',
+          p.rejFinal
+            ? `PO Reject: ${p.rejWhy ?? ''}${
+                p.newNo ? ` (diganti ${p.newNo})` : ''
+              }`
+            : p.rejWhy ?? '',
+        ])
+      )
+    );
+    const csv = rows
+      .map((r) =>
+        r
+          .map(
+            (c) =>
+              `"${(/^[=+\-@\t\r]/.test(c) ? "'" + c : c).replace(/"/g, '""')}"`
+          )
+          .join(',')
+      )
+      .join('\n');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob(['﻿' + csv], { type: 'text/csv' }));
+    a.download = 'pengajuan-po.csv';
+    a.click();
+  };
+
+  const viewPo = pos.find((p) => p.no === viewNo && sameDept(p.dept, me.dept));
+  const meta = META[cur] ?? META.dash;
+  const initials =
+    me.nama
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((w) => w[0]?.toUpperCase())
+      .join('') || 'U';
+  const bellN = admin ? pending + openCnt : unread;
+  const nv = (n: Nav, sub = false) => (
+    <button
+      key={n.l + n.k}
+      className={
+        'nv' + (cur === n.k && !(sub && n.k === 'supplier') ? ' on' : '')
+      }
+      onClick={() => go(n.k)}
+    >
+      <Ic n={n.ic} s={sub ? 15 : 17} />
+      <span>{n.l}</span>
+      {!!n.bd && <em className="bd">{n.bd}</em>}
+    </button>
+  );
+
+  return (
+    <>
+      <style>{themed(css, hue)}</style>
+      <div className={'shell' + (sideHov ? ' sidehov' : '')}>
+        <div
+          className={'navmask' + (navOpen ? ' show' : '')}
+          onClick={() => setNavOpen(false)}
+          aria-hidden="true"
+        />
+        <aside
+          className={
+            'side' + (navOpen ? ' open' : '') + (sideHov ? ' hov' : '')
+          }
+          id="sidenav"
+          onMouseEnter={() => setSideHov(true)}
+          onMouseLeave={() => setSideHov(false)}
+          onFocus={() => setSideHov(true)}
+          onBlur={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null))
+              setSideHov(false);
+          }}
+        >
+          {/* bagian atas: logo, warna mengikuti background dashboard */}
+          <div className="stop">
+            <div className={'brand' + (brand.sideBox ?? true ? '' : ' nobox')}>
+              <SideLogo src={brand.side} box={brand.sideBox} />
+              <b>PO REQUEST SYSTEM</b>
+            </div>
+          </div>
+          {/* panel biru berisi menu */}
+          <div className="spanel">
+            <SideFx />
+            <button
+              type="button"
+              className="sclose"
+              aria-label="Tutup menu"
+              onClick={() => setNavOpen(false)}
+            >
+              <Ic n="x" s={18} />
+            </button>
+            <nav className="navlist" aria-label="Menu utama" ref={navRef}>
+              {pill && (
+                <span
+                  className={'navpill' + (pillAnim ? ' go' : '')}
+                  style={{
+                    transform: `translateY(${pill.t}px)`,
+                    height: pill.h,
+                  }}
+                  aria-hidden="true"
+                />
+              )}
+              {main.map((n) => nv(n))}
+              <div className="sep" />
+              <button
+                className="nv grp"
+                onClick={() => setMdOpen((x) => !x)}
+                aria-expanded={mdOpen}
+              >
+                <span>Master Data</span>
+                <Ic n={mdOpen ? 'up' : 'down'} s={14} />
+              </button>
+              {mdOpen && (
+                <div className="sub">{master.map((n) => nv(n, true))}</div>
+              )}
+              <div className="sep" />
+              {admin && nv({ k: 'setting', l: 'Pengaturan', ic: 'gear' })}
+              <button
+                className="nv out"
+                onClick={() => {
+                  setSid('');
+                  setPage('');
+                  setThemeU(null);
+                  setThOpen(false);
+                }}
+              >
+                <Ic n="logout" s={17} />
+                <span>Keluar</span>
+              </button>
+            </nav>
+          </div>
+        </aside>
+
+        <div className="main">
+          <header className="top">
+            <button
+              type="button"
+              className="burger"
+              aria-label="Buka menu"
+              aria-controls="sidenav"
+              aria-expanded={navOpen}
+              onClick={() => setNavOpen((x) => !x)}
+            >
+              <svg
+                width="22"
+                height="22"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                aria-hidden="true"
+              >
+                <path d="M4 7h16M4 12h16M4 17h16" />
+              </svg>
+            </button>
+            <div className="ttl">
+              <b>PO Request System</b>
+              <small>PT Argapura</small>
+            </div>
+            <div className="gs ifld">
+              <span className="ico">
+                <Ic n="search" s={16} />
+              </span>
+              <input
+                value={gdraft}
+                onChange={(e) => {
+                  setGdraft(e.target.value);
+                  if (!e.target.value) setGq('');
+                }}
+                onKeyDown={(e) => e.key === 'Enter' && submitSearch()}
+                placeholder="Cari nomor PO, supplier, atau item..."
+                aria-label="Pencarian PO"
+              />
+            </div>
+            <span className="sp" />
+            <div className="thmw">
+              <button
+                className="bell"
+                aria-label="Tema warna"
+                title="Tema warna"
+                aria-expanded={thOpen}
+                onClick={() => {
+                  if (!thOpen) setThPrev({ g: themeG, u: themeU });
+                  setThOpen((x) => !x);
+                }}
+              >
+                <Ic n="palette" s={18} />
+              </button>
+              {thOpen && (
+                <>
+                  <div className="thm" role="dialog" aria-label="Tema warna">
+                    <b>Tema Warna</b>
+                    <p className="mute small">
+                      Panel tetap terbuka sampai Anda menekan Kembali.{' '}
+                      {admin
+                        ? 'Perubahan disimpan dan berlaku untuk seluruh sistem (semua user).'
+                        : 'Perubahan hanya berlaku sementara di sesi ini. Setelah keluar atau muat ulang, tampilan kembali ke tema yang ditetapkan admin.'}
+                    </p>
+                    <div className="sw">
+                      {THEMES.map((t) => (
+                        <button
+                          key={t.n}
+                          type="button"
+                          className={hue === t.d ? 'on' : ''}
+                          title={t.n}
+                          aria-label={t.n}
+                          aria-pressed={hue === t.d}
+                          style={{
+                            background: `linear-gradient(135deg,${rotHex(
+                              '#0a3a8e',
+                              t.d
+                            )},${rotHex('#1e7fe0', t.d)} 55%,${rotHex(
+                              '#40e2ee',
+                              t.d
+                            )})`,
+                          }}
+                          onClick={() => {
+                            if (admin) setThemeG(t.d);
+                            else setThemeU(t.d);
+                            notify(
+                              admin
+                                ? `Tema "${t.n}" diterapkan ke seluruh sistem.`
+                                : `Tema "${t.n}" aktif untuk sesi ini saja.`
+                            );
+                          }}
+                        />
+                      ))}
+                    </div>
+                    <label htmlFor="hue">Geser warna kustom</label>
+                    <input
+                      id="hue"
+                      type="range"
+                      min={-180}
+                      max={180}
+                      step={2}
+                      value={hue === GRAY ? 0 : hue}
+                      onChange={(e) => {
+                        const v = Number(e.target.value);
+                        if (admin) setThemeG(v);
+                        else setThemeU(v);
+                      }}
+                    />
+                    <div className="thact">
+                      <button
+                        type="button"
+                        className="back"
+                        onClick={() => setThOpen(false)}
+                      >
+                        <Ic n="left" s={14} /> Kembali
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost"
+                        disabled={
+                          hue === (admin ? thPrev.g : thPrev.u ?? thPrev.g)
+                        }
+                        onClick={() => {
+                          if (admin) setThemeG(thPrev.g);
+                          else setThemeU(thPrev.u);
+                          notify('Perubahan tema dibatalkan.');
+                        }}
+                      >
+                        Batalkan
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+            <button
+              className="bell"
+              aria-label="Notifikasi"
+              onClick={() => go(admin ? (pending ? 'users' : 'all') : 'notif')}
+            >
+              <Ic n="bell" s={18} />
+              {bellN > 0 && <i className="rd" />}
+            </button>
+            <div className="me">
+              <button
+                className="mebtn"
+                onClick={() => setUm((x) => !x)}
+                aria-expanded={um}
+              >
+                <span className="av">{initials}</span>
+                <span className="mn">
+                  <b>{me.nama}</b>
+                  <small>{admin ? 'Administrator' : me.dept}</small>
+                </span>
+                <Ic n="down" s={14} />
+              </button>
+              {um && (
+                <>
+                  <div className="umask" onClick={() => setUm(false)} />
+                  <div className="umenu">
+                    {!admin && (
+                      <button
+                        onClick={() => {
+                          setUm(false);
+                          setPwOpen(true);
+                        }}
+                      >
+                        <Ic n="user" s={18} />
+                        Ganti Password
+                      </button>
+                    )}
+                    {admin && (
+                      <button onClick={() => go('setting')}>
+                        <Ic n="gear" s={18} />
+                        Pengaturan
+                      </button>
+                    )}
+                    <button
+                      onClick={() => {
+                        setSid('');
+                        setPage('');
+                        setThemeU(null);
+                        setThOpen(false);
+                        setUm(false);
+                      }}
+                    >
+                      <Ic n="logout" s={18} />
+                      Keluar
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </header>
+
+          <div className="crumb">
+            <button
+              type="button"
+              className="chome"
+              aria-label="Beranda"
+              onClick={() => go('')}
+            >
+              <Ic n="home" s={16} />
+            </button>
+            <Ic n="right" s={14} />
+            <span>{meta.c}</span>
+            {meta.c !== meta.t && (
+              <>
+                <Ic n="right" s={14} />
+                <b>{meta.t}</b>
+              </>
+            )}
+          </div>
+
+          {cur !== 'dash' && (
+            <div className="card hero">
+              <span className="hico">
+                <Ic n={meta.ic} s={22} />
+              </span>
+              <div>
+                <h1>{meta.t}</h1>
+                <p>{meta.s}</p>
+              </div>
+              <svg
+                className="wave"
+                viewBox="0 0 600 120"
+                preserveAspectRatio="none"
+                aria-hidden="true"
+              >
+                <defs>
+                  <linearGradient id="wg" x1="0" x2="1">
+                    <stop offset="0" stopColor="#7fe6f2" stopOpacity="0" />
+                    <stop offset=".5" stopColor="#35b6ea" stopOpacity=".55" />
+                    <stop offset="1" stopColor="#0f5fc0" stopOpacity=".8" />
+                  </linearGradient>
+                </defs>
+                {[0, 1, 2, 3, 4].map((i) => (
+                  <path
+                    key={i}
+                    d={`M0 ${100 - i * 4} C150 ${10 + i * 6} 300 ${
+                      150 - i * 10
+                    } 600 ${20 + i * 8}`}
+                    fill="none"
+                    stroke="url(#wg)"
+                    strokeWidth={2 + i * 1.5}
+                    opacity={0.35 + i * 0.12}
+                  />
+                ))}
+              </svg>
+            </div>
+          )}
+          <section key={cur} className="pg">
+            {cur === 'form' && (
+              <Form
+                key={fk}
+                me={me}
+                pos={pos}
+                draft={draft}
+                cats={cats}
+                bps={bps}
+                cfg={numCfg}
+                notify={notify}
+                fixedNo={fixedNo}
+                readOnly={formRO}
+                onBack={
+                  formRO || fixedNo
+                    ? () => {
+                        setDraft(null);
+                        setFixedNo(null);
+                        setFormRO(false);
+                        setPage(formRO ? 'all' : 'riwayat');
+                      }
+                    : undefined
+                }
+                onSubmit={(p0) => {
+                  if (fixedNo) {
+                    // Perbaikan PO ditolak: PO yang sama diperbarui (nomor tetap),
+                    // status penolakan dibersihkan, tercatat sebagai kirim ulang.
+                    const p = {
+                      ...p0,
+                      no: fixedNo,
+                      rej: undefined,
+                      rejWhy: undefined,
+                      resent: new Date().toISOString(),
+                    };
+                    setPos((l) => l.map((x) => (x.no === fixedNo ? p : x)));
+                    logH(
+                      fixedNo,
+                      'Pengajuan diperbaiki & dikirim ulang oleh user (setelah ditolak)'
+                    );
+                    setDraft(null);
+                    setFixedNo(null);
+                    setFormRO(false);
+                    setPage('riwayat');
+                    setViewNo(fixedNo);
+                    notify(
+                      `Perbaikan terkirim: ${fixedNo}. Admin akan memprosesnya kembali.`
+                    );
+                    return;
+                  }
+                  const no = uniqueNo(p0.no, new Set(pos.map((x) => x.no)));
+                  const p = no === p0.no ? p0 : { ...p0, no };
+                  setPos((l) => [
+                    p,
+                    ...l.map((x) =>
+                      p.prevNo && x.no === p.prevNo ? { ...x, newNo: p.no } : x
+                    ),
+                  ]);
+                  logH(
+                    p.no,
+                    p.prevNo
+                      ? `Pengajuan PO baru dibuat sebagai pengganti PO reject ${p.prevNo} (${p.v.nama}, ${p.items.length} item)`
+                      : `Pengajuan PO baru dibuat (${p.v.nama}, ${p.items.length} item)`
+                  );
+                  if (p.prevNo)
+                    logH(p.prevNo, `PO reject digantikan PO baru ${p.no}`);
+                  setDraft(null);
+                  setPage('riwayat');
+                  setViewNo(p.no);
+                  notify(
+                    no === p0.no
+                      ? `Request terkirim: ${p.no}`
+                      : `Request terkirim: ${p.no} (nomor disesuaikan agar unik)`
+                  );
+                }}
+              />
+            )}
+
+            {cur === 'riwayat' && (
+              <Card ic="fileList" title={`Riwayat Pengajuan — ${me.dept}`}>
+                <div className="body">
+                  {gq && (
+                    <div className="info">
+                      <span>
+                        Filter pencarian: <b>{gq}</b>
+                      </span>
+                      <button
+                        className="ghost"
+                        onClick={() => {
+                          setGq('');
+                          setGdraft('');
+                        }}
+                      >
+                        Hapus filter
+                      </button>
+                    </div>
+                  )}
+                  <PoTable
+                    list={pos.filter(
+                      (p) => sameDept(p.dept, me.dept) && match(p, gq)
+                    )}
+                    onCopy={copy}
+                    onPrint={openDoc}
+                    onResend={resend}
+                    resendOf={(p) => p.uid === me.id}
+                    lockedOf={lockedOf}
+                    onEdit={editPo}
+                    onNewFrom={newFromRejected}
+                    aksiLabel="Keterangan"
+                  />
+                </div>
+              </Card>
+            )}
+
+            {cur === 'approval' && (
+              <Card ic="clock" title="Pengajuan Menunggu Diproses">
+                <div className="body">
+                  <PoTable
+                    list={scope.filter(isWait)}
+                    onCopy={copy}
+                    onPrint={openDoc}
+                  />
+                </div>
+              </Card>
+            )}
+
+            {cur === 'tracking' && (
+              <TrackingPage
+                list={scope}
+                me={me}
+                onPrint={openDocFromTracking}
+                onSet={setTrk}
+                notify={notify}
+                lockedOf={lockedOf}
+              />
+            )}
+            {cur === 'supplier' && (
+              <>
+                <BPPage
+                  bps={bps}
+                  setBps={setBps}
+                  canEdit={admin}
+                  notify={notify}
+                />
+                <SupplierPage
+                  list={scope}
+                  onUse={admin ? undefined : useSupplier}
+                />
+              </>
+            )}
+            {cur === 'barang' && (
+              <BarangPage list={scope} onUse={admin ? undefined : useBarang} />
+            )}
+            {cur === 'kategori' && (
+              <KategoriPage
+                cats={cats}
+                setCats={setCats}
+                setPos={setPos}
+                list={scope}
+                canEdit={admin}
+                notify={notify}
+              />
+            )}
+            {cur === 'history' && (
+              <HistoryPage
+                admin={admin}
+                rows={
+                  admin
+                    ? hist
+                    : hist.filter((h) => {
+                        if (h.uid === me.id) return true;
+                        const x = pos.find((y) => y.no === h.no);
+                        return (
+                          !!x && (x.uid === me.id || sameDept(x.dept, me.dept))
+                        );
+                      })
+                }
+              />
+            )}
+            {cur === 'notif' && (
+              <NotifPage
+                list={mine}
+                seen={seen}
+                me={me.id}
+                onRead={readOne}
+                onReadAll={readAll}
+                onPrint={openDoc}
+                onResend={resend}
+                onNewFrom={newFromRejected}
+                lockedOf={lockedOf}
+              />
+            )}
+            {cur === 'setting' && (
+              <>
+                <SettingsPage
+                  changePw={changePw}
+                  me={me}
+                  setUsers={setUsers}
+                  brand={brand}
+                  setBrand={setBrand}
+                  notify={notify}
+                  pos={pos}
+                  numCfg={numCfg}
+                  setNumCfg={setNumCfg}
+                  depts={depts}
+                  setDepts={setDepts}
+                  setPos={setPos}
+                  users={users}
+                />
+                {admin && (
+                  <IntegrityCard
+                    users={users}
+                    pos={pos}
+                    hist={hist}
+                    setUsers={setUsers}
+                    setPos={setPos}
+                    setHist={setHist}
+                    notify={notify}
+                  />
+                )}
+              </>
+            )}
+
+            {cur === 'dash' && (
+              <Dashboard
+                list={scope}
+                me={me}
+                admin={admin}
+                per={per}
+                onPrint={openDoc}
+                onAll={viewAll}
+                onPer={setPer}
+                deptList={deptNames}
+                cats={cats}
+              />
+            )}
+
+            {cur === 'all' && (
+              <AllPage
+                list={pos}
+                bps={bps}
+                depts={deptNames}
+                init={{ dept: fDept, stat: fStat, q: gq }}
+                onPrint={openDoc}
+                onCopy={copy}
+                onDone={markDone}
+                onAllowReprint={allowReprint}
+                onReject={reject}
+                onPoReject={poReject}
+                onReopen={reopen}
+                lockedOf={lockedOf}
+                onExport={exportCsv}
+                onViewForm={admin ? viewForm : undefined}
+              />
+            )}
+
+            {cur === 'doc' &&
+              (() => {
+                const all = [...pos].sort((a, b) => b.iso.localeCompare(a.iso));
+                const sel = all.find((p) => p.no === viewNo) ?? all[0];
+                return (
+                  <Card ic="file" title="Dokumen PO">
+                    <div className="body">
+                      {sel ? (
+                        <PoViewer
+                          po={sel}
+                          list={all}
+                          onPick={setViewNo}
+                          onBack={backFromDoc}
+                          admin
+                          onPrinted={markPrinted}
+                          backLabel={
+                            'Kembali ke ' +
+                            (META[backPg]?.c ?? 'Semua Pengajuan')
+                          }
+                        />
+                      ) : (
+                        <div className="empty">Belum ada PO yang dibuat.</div>
+                      )}
+                    </div>
+                  </Card>
+                );
+              })()}
+
+            {cur === 'users' && (
+              <Card ic="users" title="Verifikasi User">
+                <div className="body">
+                  <div className="bar">
+                    <div className="ifld grow">
+                      <span className="ico">
+                        <Ic n="search" s={18} />
+                      </span>
+                      <input
+                        value={uq}
+                        onChange={(e) => {
+                          setUq(e.target.value);
+                          setUPg(1);
+                        }}
+                        placeholder="Cari nama / email / departemen..."
+                      />
+                    </div>
+                  </div>
+                  <div className="tbl utbl">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Nama</th>
+                          <th>Username</th>
+                          <th>Email</th>
+                          <th>Password</th>
+                          <th>Departemen</th>
+                          <th>Status</th>
+                          <th>Keterangan</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {uRows
+                          .slice((uPgSafe - 1) * 15, uPgSafe * 15)
+                          .map((u) => (
+                            <tr key={u.id}>
+                              <td>{u.nama}</td>
+                              <td>{uname(u)}</td>
+                              <td>{u.email}</td>
+                              <td>
+                                <span className="pwcell">
+                                  <code title="Password disimpan terenkripsi (hash) dan tidak bisa dilihat. Gunakan Reset untuk membuat password sementara.">
+                                    ••••••••
+                                  </code>
+                                </span>
+                              </td>
+                              <td>{u.dept}</td>
+                              <td>
+                                <span className={'tag s-' + u.status}>
+                                  {u.status}
+                                </span>
+                              </td>
+                              <td>
+                                <select
+                                  className="actsel"
+                                  value=""
+                                  disabled={u.id === me.id}
+                                  title={
+                                    u.id === me.id
+                                      ? 'Akun sendiri tidak dapat diubah'
+                                      : 'Pilih tindakan'
+                                  }
+                                  aria-label={'Tindakan untuk ' + u.nama}
+                                  onChange={(e) => {
+                                    const v = e.target.value;
+                                    if (v === 'approve')
+                                      setUserStatus(u.id, 'approved');
+                                    else if (v === 'reject')
+                                      setUserStatus(u.id, 'rejected');
+                                    else if (v === 'reset') resetPw(u);
+                                    else if (v === 'role-user')
+                                      setUserRole(u, 'user');
+                                    else if (v === 'role-admin')
+                                      setUserRole(u, 'admin');
+                                  }}
+                                >
+                                  <option value="">Pilih tindakan…</option>
+                                  <optgroup label="Status Akun &amp; Password">
+                                    {u.status !== 'approved' && (
+                                      <option value="approve">Approve</option>
+                                    )}
+                                    {u.status !== 'rejected' && (
+                                      <option value="reject">
+                                        {u.status === 'approved'
+                                          ? 'Deactivate'
+                                          : 'Reject'}
+                                      </option>
+                                    )}
+                                    <option value="reset">
+                                      Reset Password
+                                    </option>
+                                  </optgroup>
+                                  <optgroup label="Hak Akses (Rule)">
+                                    <option
+                                      value="role-user"
+                                      disabled={u.role === 'user'}
+                                    >
+                                      {u.role === 'user'
+                                        ? '✓ User (saat ini)'
+                                        : 'Jadikan User'}
+                                    </option>
+                                    <option
+                                      value="role-admin"
+                                      disabled={u.role === 'admin'}
+                                    >
+                                      {u.role === 'admin'
+                                        ? '✓ Admin (saat ini)'
+                                        : 'Jadikan Admin'}
+                                    </option>
+                                  </optgroup>
+                                </select>
+                              </td>
+                            </tr>
+                          ))}
+                        {!users.some((u) => u.id !== ADMIN.id) && (
+                          <tr>
+                            <td colSpan={7} className="empty">
+                              Belum ada user terdaftar.
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                    <Pager page={uPgSafe} pages={uPages} onPage={setUPg} />
+                  </div>
+                </div>
+              </Card>
+            )}
+          </section>
+        </div>
+      </div>
+      {!admin && viewPo && (
+        <div
+          className="modal"
+          onClick={(e) => e.target === e.currentTarget && setViewNo('')}
+        >
+          <PoViewer
+            po={viewPo}
+            onClose={() => setViewNo('')}
+            canPrint={viewPo.status === 'Done'}
+            onPrinted={markPrinted}
+          />
+        </div>
+      )}
+      {pwOpen && (
+        <PwModal
+          onSubmit={changePw}
+          onClose={() => setPwOpen(false)}
+          notify={notify}
+        />
+      )}
+      {toast && <div id="toast">{toast}</div>}
+    </>
+  );
+}
+
+/** Kekuatan password mengikuti acuan gambar: Lemah <6 karakter, Sedang 6-8 karakter,
+ *  Kuat >8 karakter + huruf & angka, Sangat Kuat >8 karakter + huruf besar, huruf kecil, angka & simbol. */
+/** Daftar level kekuatan password (dipakai meter & legenda). */
+const PWLEVELS = [
+  { lvl: 'Lemah', desc: 'Kurang dari 6 karakter', color: '#f87171' },
+  { lvl: 'Sedang', desc: '6–8 karakter (huruf atau angka)', color: '#fbbf24' },
+  {
+    lvl: 'Kuat',
+    desc: 'Lebih dari 8 karakter (dengan kombinasi huruf dan angka)',
+    color: '#2dd4bf',
+  },
+  {
+    lvl: 'Sangat Kuat',
+    desc: 'Lebih dari 8 karakter (dengan kombinasi huruf besar, huruf kecil, angka dan simbol (contoh: @ $ % & *))',
+    color: '#34d399',
+  },
+];
+
+function pwStrength(n: string): {
+  lvl: string;
+  desc: string;
+  color: string;
+  filled: number;
+} {
+  const hasUpper = /[A-Z]/.test(n);
+  const hasLower = /[a-z]/.test(n);
+  const hasDigit = /\d/.test(n);
+  const hasSym = /[^A-Za-z0-9]/.test(n);
+  if (!n) return { lvl: '', desc: '', color: '', filled: 0 };
+  if (n.length < 6) return { ...PWLEVELS[0], filled: 1 };
+  if (n.length > 8 && hasUpper && hasLower && hasDigit && hasSym)
+    return { ...PWLEVELS[3], filled: 4 };
+  if (n.length > 8 && (hasUpper || hasLower) && hasDigit)
+    return { ...PWLEVELS[2], filled: 3 };
+  return { ...PWLEVELS[1], filled: 2 };
+}
+
+/** Meter kekuatan password + keterangan level (dipakai modal & kartu pengaturan user). */
+function PwMeter({ n, track }: { n: string; track?: string }) {
+  const st = pwStrength(n);
+  if (!n) return null;
+  return (
+    <>
+      <div className="pwstr">
+        <span className="bars">
+          {[1, 2, 3, 4].map((k) => (
+            <i
+              key={k}
+              style={{
+                background:
+                  k <= st.filled ? st.color : track || 'rgba(255,255,255,.22)',
+                boxShadow: k <= st.filled ? `0 0 8px ${st.color}` : undefined,
+              }}
+            />
+          ))}
+        </span>
+        <small style={{ color: st.color }}>{st.lvl}</small>
+      </div>
+      <div className="pwdesc">{st.desc}</div>
+      <div className="pwlegend">
+        {PWLEVELS.map((lv) => (
+          <div
+            key={lv.lvl}
+            style={
+              lv.lvl === st.lvl
+                ? { boxShadow: `inset 0 0 0 1.5px ${lv.color}` }
+                : undefined
+            }
+          >
+            <b style={{ color: lv.color }}>{lv.lvl}</b>
+            <small>{lv.desc}</small>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+/** Modal ganti password (menu kanan atas). */
+function PwModal({
+  onSubmit,
+  onClose,
+  notify,
+}: {
+  onSubmit: (o: string, n: string) => Promise<string>;
+  onClose: () => void;
+  notify: (m: string) => void;
+}) {
+  const [o, setO] = useState('');
+  const [n, setN] = useState('');
+  const [c, setC] = useState('');
+  const [show, setShow] = useState(false);
+  const [err, setErr] = useState('');
+  const save = async () => {
+    if (!o || !n || !c) return setErr('Lengkapi semua isian.');
+    if (n !== c) return setErr('Konfirmasi password baru tidak sama.');
+    const e = await onSubmit(o, n);
+    if (e) return setErr(e);
+    notify('Password berhasil diganti.');
+    onClose();
+  };
+  const t = show ? 'text' : 'password';
+  return (
+    <div
+      className="modal"
+      onClick={(e) => e.target === e.currentTarget && onClose()}
+    >
+      <div
+        className="pwbox lux"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Ganti Password"
+      >
+        <span className="sheen" aria-hidden="true" />
+        <svg
+          className="pworn"
+          viewBox="0 0 400 520"
+          preserveAspectRatio="none"
+          aria-hidden="true"
+        >
+          <defs>
+            <linearGradient id="pwg" x1="0" y1="0" x2="1" y2="0">
+              <stop offset="0" stopColor="#7fe3ff" stopOpacity="0" />
+              <stop offset=".5" stopColor="#bfeaff" stopOpacity=".55" />
+              <stop offset="1" stopColor="#ffffff" stopOpacity="0" />
+            </linearGradient>
+          </defs>
+          <path
+            d="M-20 470 C 80 410, 180 520, 300 450 S 400 420, 440 450"
+            fill="none"
+            stroke="url(#pwg)"
+            strokeWidth="1.6"
+          />
+          <path
+            d="M-20 495 C 100 440, 200 540, 320 470 S 410 450, 440 475"
+            fill="none"
+            stroke="url(#pwg)"
+            strokeWidth="1"
+            opacity=".7"
+          />
+          <circle
+            cx="352"
+            cy="58"
+            r="64"
+            fill="none"
+            stroke="#bfeaff"
+            strokeOpacity=".22"
+          />
+          <circle
+            cx="352"
+            cy="58"
+            r="42"
+            fill="none"
+            stroke="#bfeaff"
+            strokeOpacity=".16"
+          />
+        </svg>
+        <div className="pwhead">
+          <span className="pwlock">
+            <Ic n="lock" s={26} />
+          </span>
+          <h3>Ganti Password</h3>
+          <p>Amankan akun Anda dengan password baru.</p>
+          <div className="pwdiv">
+            <i />
+            <em />
+            <i />
+          </div>
+        </div>
+        <Field label="Password lama">
+          <input
+            type={t}
+            value={o}
+            onChange={(e) => {
+              setO(e.target.value);
+              setErr('');
+            }}
+            autoFocus
+          />
+        </Field>
+        <Field label="Password baru (min. 6 karakter)">
+          <input
+            type={t}
+            value={n}
+            onChange={(e) => {
+              setN(e.target.value);
+              setErr('');
+            }}
+          />
+          <PwMeter n={n} />
+        </Field>
+        <Field label="Ulangi password baru">
+          <input
+            type={t}
+            value={c}
+            onChange={(e) => {
+              setC(e.target.value);
+              setErr('');
+            }}
+            onKeyDown={(e) => e.key === 'Enter' && save()}
+          />
+        </Field>
+        <label className="pwshow">
+          <input
+            type="checkbox"
+            checked={show}
+            onChange={(e) => setShow(e.target.checked)}
+          />{' '}
+          Tampilkan password
+        </label>
+        {err && <div className="pwerr">{err}</div>}
+        <div className="acts">
+          <button className="pri" onClick={save}>
+            Simpan
+          </button>
+          <button className="pwcancel" onClick={onClose}>
+            Batal
+          </button>
+        </div>
+        <div className="pwfoot">
+          <Ic n="lock" s={12} /> Dilindungi &middot; PT Argapura PO Request
+          System
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Pengaturan sistem: pemeriksaan & perbaikan keunikan data (akun, ID, nomor PO, catatan riwayat) agar tidak bentrok saat user makin banyak. */
+function IntegrityCard({
+  users,
+  pos,
+  hist,
+  setUsers,
+  setPos,
+  setHist,
+  notify,
+}: {
+  users: User[];
+  pos: PO[];
+  hist: Hist[];
+  setUsers: (f: (u: User[]) => User[]) => void;
+  setPos: (f: (p: PO[]) => PO[]) => void;
+  setHist: (f: (h: Hist[]) => Hist[]) => void;
+  notify: (m: string) => void;
+}) {
+  const dups = (a: string[]) => {
+    const m = new Map<string, number>();
+    a.forEach((x) => m.set(x, (m.get(x) ?? 0) + 1));
+    return [...m.values()].filter((v) => v > 1).reduce((t, v) => t + v - 1, 0);
+  };
+  const checks = [
+    {
+      l: 'Email akun unik (tanpa beda huruf besar/kecil)',
+      n: dups(users.map((u) => u.email.trim().toLowerCase())),
+    },
+    { l: 'ID akun unik', n: dups(users.map((u) => u.id)) },
+    { l: 'Nomor PO unik', n: dups(pos.map((x) => x.no)) },
+    { l: 'ID catatan Change History unik', n: dups(hist.map((h) => h.id)) },
+  ];
+  const bad = checks.reduce((t, c) => t + c.n, 0);
+  const fix = () => {
+    setUsers((l) => {
+      const seenE = new Set<string>(),
+        seenI = new Set<string>();
+      const sorted = [...l].sort(
+        (a, b) =>
+          Number(b.status === 'approved') - Number(a.status === 'approved')
+      ); // akun approved diprioritaskan
+      const out = new Map<string, User>();
+      sorted.forEach((u, i) => {
+        let email = u.email.trim().toLowerCase();
+        let id = u.id;
+        let status = u.status;
+        if (seenE.has(email)) {
+          const [a, b] = email.split('@');
+          email = `${a}+dup${i}@${b ?? 'local'}`;
+          status = 'rejected';
+        }
+        if (seenI.has(id)) id = newId('u-');
+        seenE.add(email);
+        seenI.add(id);
+        out.set(l.indexOf(u) + '', { ...u, email, id, status });
+      });
+      return l.map((_, i) => out.get(i + '')!);
+    });
+    setPos((l) => {
+      const taken = new Set<string>();
+      return l.map((x) => {
+        const no = uniqueNo(x.no, taken);
+        taken.add(no);
+        return no === x.no ? x : { ...x, no };
+      });
+    });
+    setHist((l) => {
+      const seen = new Set<string>();
+      return l.map((h) => {
+        const id = seen.has(h.id) ? newId('h-') : h.id;
+        seen.add(id);
+        return id === h.id ? h : { ...h, id };
+      });
+    });
+    notify('Data diperiksa dan duplikat diperbaiki.');
+  };
+  return (
+    <Card ic="info" title="Keunikan Data & Anti-Bentrok">
+      <div className="body">
+        <p className="mute small" style={{ marginTop: 0 }}>
+          Sistem memakai ID acak (UUID) untuk akun dan catatan, membandingkan
+          email tanpa membedakan huruf besar/kecil, menyesuaikan nomor PO
+          otomatis bila bentrok saat submit, serta menyinkronkan data antar tab
+          browser.
+        </p>
+        <div className="tbl">
+          <table>
+            <thead>
+              <tr>
+                <th>Pemeriksaan</th>
+                <th>Hasil</th>
+              </tr>
+            </thead>
+            <tbody>
+              {checks.map((c) => (
+                <tr key={c.l}>
+                  <td>{c.l}</td>
+                  <td>
+                    <span className={'tag ' + (c.n ? 's-rejected' : 's-Done')}>
+                      {c.n ? `${c.n} duplikat` : 'Aman'}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="acts" style={{ marginTop: 10 }}>
+          <button className="pri" disabled={!bad} onClick={fix}>
+            Perbaiki otomatis
+          </button>
+          {!bad && (
+            <span className="mute small">Tidak ada duplikat ditemukan.</span>
+          )}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+/** Data contoh Change History untuk admin (dibuat dari user & PO contoh yang ada). */
+function makeDemoHist(pos: PO[], users: User[]): Hist[] {
+  const now = Date.now();
+  const out: Hist[] = [];
+  let n = 0;
+  const push = (
+    iso: string,
+    u: { id: string; nama: string; dept: string },
+    no: string,
+    what: string
+  ) => {
+    if (new Date(iso).getTime() <= now)
+      out.push({
+        id: `seed-${++n}-${hash32(iso + what + no).toString(36)}`,
+        iso,
+        uid: u.id,
+        by: u.nama,
+        dept: u.dept,
+        no,
+        what,
+      });
+  };
+  const at = (day: string, key: string) => {
+    const [y, m, d] = dayOf(day).split('-').map(Number);
+    const h = hash32(key);
+    return new Date(
+      y,
+      m - 1,
+      d,
+      8 + (h % 9),
+      (h >>> 4) % 60,
+      (h >>> 9) % 60
+    ).toISOString();
+  };
+  const demoU = users.filter((u) => u.id.startsWith('demo-'));
+  pos
+    .filter((x) => x.uid.startsWith('demo-'))
+    .forEach((p) => {
+      const cr = users.find((u) => u.id === p.uid) ?? ADMIN;
+      push(
+        p.iso,
+        cr,
+        p.no,
+        `Pengajuan PO baru dibuat (${p.v.nama}, ${p.items.length} item)`
+      );
+      if (p.rej) push(p.rej, ADMIN, p.no, 'Pengajuan ditolak (Rejected)');
+      TSTEPS.forEach((st) => {
+        if (st.k === 'made') return;
+        const d = p.trk?.[st.k as TKey];
+        if (!d) return;
+        const actor =
+          st.k === 'supp'
+            ? cr
+            : st.k === 'recv'
+            ? hash32(p.no + 'r') % 3 === 0
+              ? ADMIN
+              : cr
+            : ADMIN;
+        const t = at(d, p.no + st.k);
+        if (hash32(p.no + st.k) % 11 === 0) {
+          const [y, m, dd] = dayOf(d).split('-').map(Number);
+          const prev = ymd(new Date(y, m - 1, dd - 1));
+          push(
+            at(prev, p.no + st.k + 'a'),
+            actor,
+            p.no,
+            `${st.l}: tanggal diisi ${fmtD(prev)}`
+          );
+          push(
+            t,
+            actor,
+            p.no,
+            `${st.l}: tanggal diubah ${fmtD(prev)} → ${fmtD(d)}`
+          );
+        } else push(t, actor, p.no, `${st.l}: tanggal diisi ${fmtD(d)}`);
+        if (st.k === 'appr')
+          push(
+            new Date(new Date(t).getTime() + 90000).toISOString(),
+            ADMIN,
+            p.no,
+            'Status PO ditandai Done (PO di-approve)'
+          );
+        if (st.k === 'supp' && hash32(p.no + 'lk') % 3 === 0)
+          push(
+            new Date(new Date(t).getTime() + 120000).toISOString(),
+            cr,
+            p.no,
+            'Link bukti pengiriman ke supplier diisi'
+          );
+      });
+    });
+  demoU.forEach((u, i) => {
+    const base = new Date(now - (200 - i * 6) * 86400000);
+    if (u.status === 'approved')
+      push(
+        new Date(
+          base.getFullYear(),
+          base.getMonth(),
+          base.getDate(),
+          9 + (i % 6),
+          (i * 7) % 60,
+          12
+        ).toISOString(),
+        ADMIN,
+        '-',
+        `Approve anggota baru: ${u.nama} (${u.email})`
+      );
+    if (u.status === 'approved' && i % 4 === 1)
+      push(
+        new Date(base.getTime() + 20 * 86400000 + i * 3600000).toISOString(),
+        u,
+        '-',
+        'Ganti password akun sendiri'
+      );
+    if (u.status === 'approved' && i % 7 === 3)
+      push(
+        new Date(base.getTime() + 41 * 86400000 + i * 3600000).toISOString(),
+        ADMIN,
+        '-',
+        `Reset password akun ${u.nama} (${u.email})`
+      );
+  });
+  return out.sort((a, b) => b.iso.localeCompare(a.iso));
+}
+
+/* ================= TEMA WARNA: seluruh warna biru/aqua pada CSS diputar huenya (status hijau/merah/kuning tidak ikut berubah) ================= */
+const DARKER = new Set([-170, 140, 50]); // tema Emas (coklat), Merah Ruby, Ungu Royal: dibuat lebih gelap
+const DARK_K = 0.2; // tema Emas/Ruby/Ungu: dasar 20%
+const DARK_X = 0.15; // tambahan gelap 15% untuk semua tema warna (selain Biru Samudra bawaan & Hitam Putih). Warna sangat terang (latar/kartu) dikecualikan agar halaman tetap terbaca
+const darkK = (d: number) =>
+  1 - (1 - (DARKER.has(d) ? DARK_K : 0)) * (1 - DARK_X);
+const GRAY = 999; // kode khusus tema monokrom "Klasik Hitam Putih" (bukan sudut hue)
+const THEMES: { n: string; d: number }[] = [
+  { n: 'Biru Samudra', d: 0 },
+  { n: 'Teal', d: -28 },
+  { n: 'Klasik Hitam Putih', d: GRAY },
+  { n: 'Emas', d: -170 },
+  { n: 'Merah Ruby', d: 140 },
+  { n: 'Magenta', d: 100 },
+  { n: 'Ungu Royal', d: 50 },
+  { n: 'Indigo', d: 25 },
+];
+const toHsl = (r: number, g: number, b: number): [number, number, number] => {
+  r /= 255;
+  g /= 255;
+  b /= 255;
+  const mx = Math.max(r, g, b),
+    mn = Math.min(r, g, b),
+    l = (mx + mn) / 2,
+    dd = mx - mn;
+  if (!dd) return [0, 0, l];
+  const s = l > 0.5 ? dd / (2 - mx - mn) : dd / (mx + mn);
+  const h =
+    mx === r
+      ? (g - b) / dd + (g < b ? 6 : 0)
+      : mx === g
+      ? (b - r) / dd + 2
+      : (r - g) / dd + 4;
+  return [h * 60, s, l];
+};
+const fromHsl = (h: number, s: number, l: number): [number, number, number] => {
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s,
+    p = 2 * l - q;
+  const f = (t: number) => {
+    t = (t + 1) % 1;
+    return Math.round(
+      255 *
+        (t < 1 / 6
+          ? p + (q - p) * 6 * t
+          : t < 1 / 2
+          ? q
+          : t < 2 / 3
+          ? p + (q - p) * (2 / 3 - t) * 6
+          : p)
+    );
+  };
+  return [f(h / 360 + 1 / 3), f(h / 360), f(h / 360 - 1 / 3)];
+};
+/** Putar hue hanya untuk warna biru/aqua (165°–255°) yang cukup berwarna. */
+const rotRGB = (
+  r: number,
+  g: number,
+  b: number,
+  d: number
+): [number, number, number] => {
+  if (!d) return [r, g, b];
+  const [h, s, l] = toHsl(r, g, b);
+  if (s < 0.1 || h < 165 || h > 255) return [r, g, b];
+  if (d === GRAY) {
+    const y = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+    return [y, y, y];
+  } // biru/aqua -> abu-abu (setara kecerahan)
+  const f = l <= 0.6 ? 1 : l >= 0.92 ? 0 : (0.92 - l) / 0.32;
+  const l2 = l * (1 - darkK(d) * f); // gelapkan nada sedang/gelap (sidebar, tombol, header), latar terang tetap
+  return fromHsl((((h + d) % 360) + 360) % 360, s, l2);
+};
+const hex2 = (n: number) => n.toString(16).padStart(2, '0');
+const rotHex = (hx: string, d: number) => {
+  const m = /^#([0-9a-f]{6})$/i.exec(hx);
+  if (!m) return hx;
+  const [r, g, b] = rotRGB(
+    parseInt(m[1].slice(0, 2), 16),
+    parseInt(m[1].slice(2, 4), 16),
+    parseInt(m[1].slice(4, 6), 16),
+    d
+  );
+  return '#' + hex2(r) + hex2(g) + hex2(b);
+};
+const themeCache = new Map<number, string>();
+function themed(src: string, d: number): string {
+  const hit = themeCache.get(d);
+  if (hit) return hit;
+  let out = src;
+  if (d) {
+    out = out
+      .replace(
+        /#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})(?![0-9a-zA-Z_-])/g,
+        (_m, h: string) => {
+          const f =
+            h.length === 3
+              ? h
+                  .split('')
+                  .map((c) => c + c)
+                  .join('')
+              : h;
+          return rotHex('#' + f, d);
+        }
+      )
+      .replace(
+        /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*(\.?\d*\.?\d+)\s*)?\)/g,
+        (_m, r: string, g: string, b: string, a?: string) => {
+          const [x, y, z] = rotRGB(+r, +g, +b, d);
+          return a === undefined
+            ? `rgb(${x},${y},${z})`
+            : `rgba(${x},${y},${z},${a})`;
+        }
+      )
+      .replace(
+        /rgba\((\d+),(\d+),(\d+),(calc\([^)]*\([^)]*\)\))\)/g,
+        (_m, r: string, g: string, b: string, a: string) => {
+          const [x, y, z] = rotRGB(+r, +g, +b, d);
+          return `rgba(${x},${y},${z},${a})`;
+        }
+      );
+  }
+  out +=
+    d === GRAY
+      ? `\n:root{--hd:0deg}\n.waves,.wave,.trend,.cb i,.kpi:first-child .kic,.lgd i,.lg2 i,.sidefx{filter:grayscale(1)}\n`
+      : `\n:root{--hd:${d}deg}\n.waves,.wave,.trend,.cb i,.kpi:first-child .kic,.lgd i,.lg2 i{filter:hue-rotate(var(--hd))${
+          DARKER.has(d) ? ' brightness(.8)' : ''
+        }}\n`;
+  themeCache.set(d, out);
+  return out;
+}
+
+/* ================= STYLE (tema aqua-biru, kaca) ================= */
+const css = `
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@600;700;800&family=Poppins:wght@400;500;600;700&display=swap");
+:root{color-scheme:light;--bg:#e4f3fb;--card:#fff;--ink:#12284a;--mute:#5b6f8c;--line:#d3e2f2;--brand:#0f5fc0;--brand2:#1fa4de;--aqua:#2dd4d8;--soft:#e8f3fd}
+*{box-sizing:border-box}
+html,body,#root{margin:0;padding:0;width:100%;max-width:none;display:block;text-align:left}
+#root{background:transparent}
+body{color:var(--ink);font:14px/1.5 Inter,"Segoe UI",system-ui,Roboto,Arial,sans-serif;background:radial-gradient(900px 500px at 85% 0%,rgba(80,225,235,.35),transparent 60%),linear-gradient(135deg,#eaf8fd 0%,#d2e6fb 55%,#c4ecf4 100%) fixed;min-height:100vh}
+.ic{flex:none;display:block}
+h1,h2{font-family:inherit}
+/* ---- shell: sidebar + konten ---- */
+.shell{display:grid;grid-template-columns:230px minmax(0,1fr);min-height:100vh}
+.side{position:sticky;top:0;height:100vh;overflow-y:auto;color:#fff;padding:16px 10px 16px;display:flex;flex-direction:column;border-radius:0 26px 26px 0;
+  background:radial-gradient(120% 55% at 0% 100%,rgba(45,226,230,.8),transparent 62%),radial-gradient(90% 40% at 100% 0%,rgba(80,170,255,.35),transparent 60%),linear-gradient(180deg,#0a3a8e 0%,#0b5fba 50%,#1295d6 100%);
+  box-shadow:8px 0 32px rgba(10,60,140,.28)}
+.brand{text-align:center;padding:2px 4px 10px}
+.brand img{width:auto;max-width:100%;height:auto;max-height:64px;object-fit:contain}
+.logoph{display:inline-flex;justify-content:center;background:transparent;border-radius:10px;padding:0;box-shadow:none;max-width:100%}
+.brand .logoph img{max-width:185px;max-height:46px}
+.brand b{display:block;margin-top:7px;font-weight:600;font-size:11.5px;letter-spacing:.5px}
+.navlist{display:flex;flex-direction:column;gap:3px;margin-top:4px}
+.nv{display:flex;align-items:center;gap:9px;white-space:nowrap;width:100%;text-align:left;border:1px solid transparent;background:transparent;color:#fff;padding:7px 10px;border-radius:10px;font-size:12.5px;font-weight:500}
+.nv:hover{background:rgba(255,255,255,.13)}
+.nv.on{background:linear-gradient(90deg,#17a9ee,#40e2ee);border-color:rgba(255,255,255,.75);font-weight:600;box-shadow:0 0 20px rgba(90,225,255,.6),inset 0 1px 0 rgba(255,255,255,.65)}
+.nv .bd{margin-left:auto;background:#ff4d5e;color:#fff;border-radius:999px;min-width:18px;height:18px;display:grid;place-items:center;font-size:10.5px;font-weight:700;padding:0 5px;font-style:normal}
+.nv.grp{justify-content:space-between;padding:4px 10px;font-weight:600;font-size:12px}
+.sub .nv{padding:6px 10px 6px 12px;font-size:12px}
+.nv.out{margin-top:2px}.nv.out:hover{background:rgba(255,77,94,.28)}
+/* ---- Sidebar: interaksi Hover (slide + glow) · Active (pill meluncur) · Transition 250ms ---- */
+.navlist{position:relative}
+.nv{position:relative;z-index:1;transition:background .25s ease,border-color .25s ease,box-shadow .25s ease,color .25s ease}
+.nv>*:not(.bd){transition:transform .25s cubic-bezier(.2,.8,.2,1)}
+.nv:hover>*:not(.bd),.nv:focus-visible>*:not(.bd){transform:translateX(3px)}
+.nv:hover:not(.out){background:linear-gradient(90deg,rgba(150,215,255,.42),rgba(190,240,255,.14));border-color:rgba(200,240,255,.55);box-shadow:0 0 14px rgba(120,210,255,.45),inset 0 1px 0 rgba(255,255,255,.35)}
+.nv.out:hover{box-shadow:0 0 14px rgba(255,100,120,.4)}
+.nv:focus-visible{outline:2px solid rgba(255,255,255,.9);outline-offset:1px}
+.navpill{position:absolute;left:0;right:0;top:0;z-index:0;pointer-events:none;border-radius:10px;border:1px solid rgba(255,255,255,.8);
+  background:linear-gradient(90deg,#17a9ee,#40e2ee);box-shadow:0 0 20px rgba(90,225,255,.6),inset 0 1px 0 rgba(255,255,255,.65)}
+.navpill.go{transition:transform .28s cubic-bezier(.4,0,.2,1),height .28s cubic-bezier(.4,0,.2,1)}
+@media(prefers-reduced-motion:reduce){.nv,.nv>*:not(.bd),.navpill.go{transition:none}}
+.sep{height:1px;background:rgba(255,255,255,.3);margin:7px 6px}
+.main{padding:14px 20px 28px;min-width:0}
+section{width:100%;min-width:0}
+/* ---- topbar ---- */
+.top{position:relative;z-index:30;display:flex;align-items:center;gap:10px;padding:6px 14px;border-radius:16px;border:1px solid #fff;background:linear-gradient(135deg,rgba(255,255,255,.9),rgba(214,240,255,.7));-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);box-shadow:0 8px 28px rgba(40,100,180,.16)}
+.ttl b{display:block;font-size:15px;line-height:1.15;color:#0d2a57}.ttl small{color:var(--mute);font-size:11px}
+.gs{flex:1;max-width:320px;margin-left:12px}
+.top .gs input{border-radius:10px;background:rgba(255,255,255,.85);height:32px;min-height:32px;padding:3px 10px 3px 32px;font-size:12px}
+.top .gs .ico{left:10px;top:8px}
+.sp{flex:1}
+.bell{position:relative;border:0;background:transparent;padding:4px;color:#12315f}
+.bell .rd{position:absolute;top:2px;right:3px;width:8px;height:8px;border-radius:50%;background:#ff4d5e;border:1.5px solid #fff}
+.me{position:relative;border-left:1px solid var(--line);padding-left:10px}
+.mebtn{display:flex;align-items:center;gap:8px;border:0;background:transparent;padding:2px;text-align:left}
+.av{width:30px;height:30px;border-radius:50%;background:#12315f;color:#fff;display:grid;place-items:center;font-weight:700;font-size:11.5px;flex:none}
+.mn b{display:block;font-size:12.5px;line-height:1.2;color:#0d2a57}.mn small{color:var(--mute);font-size:10.5px}
+.umask{position:fixed;inset:0;z-index:20}
+.umenu{position:absolute;right:0;top:42px;z-index:21;min-width:160px;background:#fff;border:1px solid var(--line);border-radius:14px;box-shadow:0 12px 30px rgba(20,60,120,.22);padding:6px;display:flex;flex-direction:column}
+.umenu button{display:flex;align-items:center;gap:8px;border:0;background:transparent;text-align:left;font-size:13px;padding:7px 10px;border-radius:10px}.umenu button:hover{background:var(--soft)}
+.crumb{display:flex;align-items:center;gap:8px;margin:10px 6px 8px;color:#27487c;font-size:12.5px}.crumb b{color:#0d2a57}
+.chome{border:0;background:transparent;padding:0;color:#27487c;display:grid;place-items:center}
+/* ---- hero ---- */
+.hero{position:relative;display:flex;align-items:center;gap:12px;padding:10px 16px;min-height:60px;overflow:hidden;background:linear-gradient(120deg,rgba(255,255,255,.92),rgba(206,236,252,.8))}
+.hero>div{position:relative;z-index:1}
+.hico{position:relative;z-index:1;width:44px;height:44px;border-radius:12px;display:grid;place-items:center;color:#1558b8;background:linear-gradient(145deg,#f4faff,#c9e3fb);border:1px solid #fff;box-shadow:0 8px 20px rgba(40,100,180,.2);flex:none}
+.hero h1{margin:0;font-size:20px;line-height:1.15;color:#0d2a57}.hero p{margin:1px 0 0;color:#40587f;font-size:12.5px}
+.wave{position:absolute;right:0;top:0;width:55%;height:100%;pointer-events:none}
+/* ---- kartu ---- */
+.card{background:rgba(255,255,255,.8);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);border:1px solid #fff;border-radius:20px;margin-bottom:18px;overflow:hidden;box-shadow:0 10px 30px rgba(40,100,180,.13)}
+.card>h2{position:relative;display:flex;align-items:center;gap:12px;margin:0;padding:0 22px;height:54px;color:#fff;font-size:17.5px;font-weight:700;background:linear-gradient(100deg,#0b56b0 0%,#1596d6 58%,#40dbe0 100%)}
+.card>h2::after{content:"";position:absolute;left:0;right:0;top:0;height:50%;background:linear-gradient(180deg,rgba(255,255,255,.32),rgba(255,255,255,0));pointer-events:none}
+.body{padding:18px 20px}.pad{padding:16px}
+.mute{color:var(--mute)}.small{font-size:12.5px}
+.two{display:grid;grid-template-columns:minmax(0,1fr) 400px;gap:18px;align-items:start}
+.two2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+@media(max-width:1100px){.two,.two2{grid-template-columns:1fr}}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px 20px}
+.grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px 20px}
+.gi{display:grid;grid-template-columns:1fr 1fr;gap:0 22px;align-items:start}.gi .col{display:flex;flex-direction:column}
+@media(max-width:700px){.grid,.gi{grid-template-columns:1fr}}
+/* ---- input ---- */
+label{display:block;font-weight:600;margin-bottom:6px;color:#14305c}label i{color:#d33;font-style:normal}
+input,select,textarea{width:100%;padding:12px 14px;min-height:46px;border:1px solid #cddff0;border-radius:12px;background:#fff;color:var(--ink);font:inherit}
+textarea{resize:none;field-sizing:content}
+input::placeholder,textarea::placeholder{color:#8a9bb5}
+input:focus,select:focus,textarea:focus,button:focus-visible{outline:2px solid var(--brand2);outline-offset:1px}
+input[readonly]{background:#eef3fa}
+.ifld{position:relative}.ifld .ico{position:absolute;left:14px;top:13px;color:#5d7396;pointer-events:none;display:flex}
+.ifld input,.ifld textarea,.ifld select{padding-left:44px}
+.ifld.cmb input{padding-right:44px}.ifld .arr{position:absolute;right:6px;top:5px;border:0;background:transparent;padding:8px;color:#4a6590}
+.ifld.grow{flex:1;min-width:220px}
+.fld{margin-bottom:14px}
+.card .gi .fld{margin-bottom:16px}
+/* ---- tabel & tombol ---- */
+.tbl{overflow-x:auto}table{width:100%;border-collapse:collapse}
+th,td{padding:8px 10px;border:1px solid var(--line);text-align:left;vertical-align:middle}th{background:var(--soft);font-size:12.5px}
+.tbl tbody tr:nth-child(even) td{background:rgba(30,125,220,.07)}
+.tbl tbody tr:nth-child(even) td.detail{background:#f9fbfe}
+td input,td select{min-width:80px}.num{text-align:right;white-space:nowrap}
+
+button{font:inherit;cursor:pointer;border-radius:10px;border:1px solid var(--line);background:#fff;color:var(--ink);padding:9px 16px}
+.pri{background:linear-gradient(135deg,#1e7fe0,#0f5fc0);color:#fff;border-color:#0f5fc0;font-weight:600;display:inline-flex;align-items:center;gap:6px}
+.ghost{color:var(--brand);border-color:var(--brand2);padding:4px 10px;font-size:12.5px;background:#fff}
+/* ---- Ganti password, tampil password (admin) ---- */
+.pwbox{width:100%;max-width:400px;margin-top:8vh;align-self:flex-start;padding:22px 22px 18px;border-radius:18px;background:linear-gradient(135deg,rgba(255,255,255,.92),rgba(214,238,255,.9));border:1px solid rgba(255,255,255,.9);box-shadow:0 18px 50px rgba(5,30,90,.4)}
+.pwbox h3{margin:0 0 12px;color:#0a1d3d}
+.pwbox .acts{margin-top:12px}
+.pwshow{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--mute);margin:2px 0 8px}.pwshow input{width:auto;min-width:0}
+.pwcell{display:inline-flex;align-items:center;gap:6px}.pwcell code{font-family:ui-monospace,Consolas,monospace;font-size:13px;background:rgba(10,60,140,.08);padding:2px 8px;border-radius:8px;min-width:70px}
+.pweye{padding:2px 7px;font-size:14px;line-height:1.2}
+/* ---- Daftar Barang: drill-down ---- */
+.rowlink{cursor:pointer;transition:background .2s}
+.rowlink:hover td,.rowlink:focus-visible td{background:rgba(70,170,255,.16)!important}
+.rowlink:focus-visible{outline:2px solid var(--brand2);outline-offset:-2px}
+.drlnk{display:inline-flex;align-items:center;gap:3px;font-weight:700;color:var(--brand);transition:transform .2s}
+.rowlink:hover .drlnk{transform:translateX(3px)}
+.drill .drhead{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:14px}
+.drill .back{display:inline-flex;align-items:center;gap:4px;font-weight:600}
+.drill .drttl{flex:1;min-width:160px;display:flex;flex-direction:column}
+.drill .drttl b{font-size:18px;color:#0a1d3d}.drill .drttl small{color:var(--mute);font-size:12.5px}
+.drill .drstat{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:14px}
+.drill .drstat>div{padding:10px 14px;border-radius:12px;border:1px solid rgba(120,190,255,.5);background:linear-gradient(135deg,rgba(255,255,255,.7),rgba(190,230,255,.45))}
+.drill .drstat small{display:block;color:var(--mute);font-size:11.5px;margin-bottom:2px}.drill .drstat b{font-size:15px;color:#0a1d3d}
+.drill tr.cur td{background:rgba(45,212,216,.2)!important;font-weight:600}
+.tnew2{margin-left:8px;padding:1px 8px;border-radius:99px;font-size:10.5px;font-weight:600;color:#fff;background:linear-gradient(135deg,#1e7fe0,#2dd4d8)}
+.wide{width:100%;margin-top:6px}
+.actions{display:flex;gap:10px;justify-content:flex-end;padding-bottom:16px}.actions .l{margin-right:auto}
+.acts{display:flex;gap:6px;flex-wrap:wrap}
+.acts.sm{flex-wrap:nowrap;align-items:center}
+.acts.sm button{padding:1px 12px;font-size:12.5px;line-height:1.45;font-weight:600;border-radius:12px;white-space:nowrap;display:inline-flex;align-items:center;gap:5px;box-shadow:none}
+.info{display:flex;align-items:center;gap:10px;background:linear-gradient(135deg,#e3f1fd,#d6ecfb);border:1px solid #cde3f6;border-radius:14px;padding:12px 14px;color:#2d4a74;margin-bottom:14px}
+.info>span{flex:1}.info .ic{color:#1569c7}
+.tag{background:var(--soft);color:var(--brand);border-radius:12px;padding:2px 12px;font-size:12.5px;font-style:normal;font-weight:600}
+.s-Done,.s-approved{background:#e3f4ea;color:#157347}.s-rejected{background:#fde8e8;color:#b42318}.s-pending,.s-Open{background:#fff3d6;color:#8a5b00}
+/* ---- Data PO ---- */
+.kvi>div{display:flex;align-items:center;gap:8px;padding:9px 2px}
+.kvi>div>span{display:flex;align-items:center;gap:10px;color:#4a5f80;width:134px;flex:none;white-space:nowrap}.kvi>div>span .ic{color:#486692}
+.kvi b{font-weight:600;color:#10244a;flex:1;display:flex;align-items:center;gap:8px;white-space:nowrap;min-width:0}.kvi b .tag{margin-left:auto}
+.sum{margin-top:10px;border-top:1px solid var(--line)}
+.sum>div{display:flex;justify-content:space-between;align-items:center;padding:10px 4px;border-bottom:1px solid var(--line);color:#4a5f80}
+.sum>div>span:first-child{display:flex;align-items:center;gap:10px}
+.sum .gt{margin-top:10px;border:0;border-radius:14px;padding:12px 14px;background:linear-gradient(135deg,#d9edfc,#c9e6fb);color:#0f5fc0;font-weight:700;font-size:18px}
+.sum .gt span:last-child{font-size:25px}
+.fold .fhead{display:flex;align-items:center;gap:12px;width:100%;border:0;border-radius:0;background:transparent;padding:16px 20px;color:#14305c;font-size:15px}
+.fold .fhead .sp{flex:1}
+.stat{padding:18px;margin:0}.stat span{color:var(--mute);display:block}.stat b{font-size:25px;color:var(--brand)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:18px;margin-bottom:18px}
+.empty{color:var(--mute);padding:14px;text-align:center}
+.detail{background:#f9fbfe;font-size:13px}.detail ul{margin:6px 0;padding-left:18px}
+.bar{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap;align-items:center}.bar>input{flex:1;min-width:200px}.bar>select{width:200px}
+.prev.side{background:linear-gradient(180deg,#0a3a8e,#1295d6);padding:12px}.prev.side svg,.prev.side img{max-width:100%;max-height:64px;height:auto}
+/* ---- grafik, tracking, notifikasi ---- */
+.bars{display:flex;gap:10px;align-items:flex-end;height:220px}
+.bcol{flex:1;display:flex;flex-direction:column;align-items:center;height:100%;min-width:0}
+.bcol .bb{flex:1;width:70%;display:flex;align-items:flex-end;background:#eef4fb;border-radius:8px;overflow:hidden}
+.bcol .bb i{display:block;width:100%;background:linear-gradient(180deg,#40dbe0,#0f5fc0);border-radius:8px 8px 0 0}
+.bv{font-size:11px;color:var(--mute);margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}.bl{margin-top:6px;font-size:12px}
+.hrow{margin-bottom:12px}.hl{display:flex;justify-content:space-between;gap:8px}.hb{height:8px;background:#eef4fb;border-radius:6px;margin-top:4px;overflow:hidden}.hb i{display:block;height:100%;background:linear-gradient(90deg,#1596d6,#40dbe0)}
+.trkcard .body{padding:16px 20px}
+.trkgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;align-items:stretch}
+.trkgrid .trkcard{min-width:0;display:flex;flex-direction:column}
+.trkgrid .trkcard .body{padding:14px 16px;flex:1;display:flex;flex-direction:column}
+/* Kartu tertutup: bar progres menempel di bawah kartu, jadi semua kartu sebaris sama tinggi dan bar-nya sejajar */
+.trkgrid .trkcard:not(.open) .trkhead{margin-bottom:12px}
+.trkgrid .trkcard:not(.open) .pbar{margin-top:auto}
+@media(max-width:1100px){.trkgrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:700px){.trkgrid{grid-template-columns:1fr}}
+.trkhead{display:flex;align-items:center;gap:14px;width:100%;border:0;border-radius:0;background:transparent;padding:0;text-align:left}
+.tl1{flex:1;min-width:0}.tl1 b{display:block;font-size:15px;color:#0d2a57}.tl1 small{color:var(--mute)}
+.tl2{display:flex;flex-direction:column;align-items:flex-end;gap:2px}.tl2 small{color:var(--mute)}
+.pbar{height:6px;background:#e3edf8;border-radius:6px;margin:12px 0 4px;overflow:hidden}.pbar i{display:block;height:100%;background:linear-gradient(90deg,#1596d6,#40dbe0);border-radius:6px;transition:width .4s}
+.pager{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:14px 0 4px}
+.pager .pgnums{display:flex;gap:4px;flex-wrap:wrap;align-items:center}
+.pager .pgnums button{min-width:30px;height:30px;padding:0 6px;border-radius:8px;border:1px solid rgba(13,42,87,.18);background:rgba(255,255,255,.7);color:#0d2a57;cursor:pointer}
+.pager .pgnums button.on{background:linear-gradient(180deg,#0a3a8e,#1295d6);color:#fff;border-color:transparent;font-weight:700}
+.pager .pgnums em{font-style:normal;color:var(--mute);padding:0 2px}
+.pager button.ghost:disabled{opacity:.45;cursor:default}
+.tl{list-style:none;margin:18px 0 8px;padding:0}
+.tl li{position:relative;display:flex;gap:14px;padding-bottom:22px}.tl li:last-child{padding-bottom:4px}
+.tl li::before{content:"";position:absolute;left:13px;top:30px;bottom:-2px;width:2px;background:#d3e2f2}
+.tl li:last-child::before{display:none}.tl li.ok::before{background:#7ccf9b}
+.tl li>i{flex:none;z-index:1;width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:#eef3fa;color:#8a9bb5;font-style:normal}
+.tl li.ok>i{background:#157347;color:#fff}
+.tl li.cur>i{background:#e6a817;color:#fff;animation:pulse 1.8s ease-in-out infinite}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(230,168,23,.45)}50%{box-shadow:0 0 0 7px rgba(230,168,23,0)}}
+.tl .dt{width:8px;height:8px;border-radius:50%;background:#b8c6da}
+.tc{flex:1;min-width:0;padding-top:2px}.th{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.tl li.open .th b{color:#7487a3}.tl li.ok .th b{color:#0d2a57}.tl li.cur .th b{color:#8a5b00}
+.tc small{display:block;color:var(--mute);margin-top:2px}
+.tedit{display:flex;gap:8px;align-items:center;margin-top:8px}.tedit input{width:auto;min-height:38px;padding:6px 10px}
+.s-wait{background:#eef2f7;color:#6b7c95}
+@media(prefers-reduced-motion:reduce){.tl li.cur>i{animation:none}}
+/* ---- Supplier BP ---- */
+.bpbox{border:1px solid var(--line);border-radius:14px;background:#f6faff;padding:14px 16px;margin-bottom:16px}
+.bpbox>b{display:block;margin-bottom:10px;color:#0d2a57}.bpbox p{margin:8px 0 0}
+.bpf{display:grid;grid-template-columns:140px minmax(0,1fr) 190px auto;gap:12px;align-items:end}.bpf .fld{margin:0}.bpf .acts{padding-bottom:1px}
+@media(max-width:900px){.bpf{grid-template-columns:1fr 1fr}}
+.bad{color:#b42318;font-weight:600}.warnt{color:#8a5b00;font-weight:600}
+.bpw{margin-top:6px;font-size:12.5px;color:#8a5b00;background:#fff3d6;border-radius:8px;padding:6px 10px}.bpw.bad{color:#b42318;background:#fde8e8;font-weight:400}
+.nt{display:flex;align-items:center;gap:12px;width:100%;text-align:left;margin-bottom:8px;padding:12px 14px;border-radius:14px;background:#fff}
+.nt.un{background:#eaf5ff;border-color:#9cc7f2}
+.nti{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;background:var(--soft);color:var(--brand);flex:none}
+.ntt{flex:1}.ntt b{display:block}.ntt small{color:var(--mute)}
+.dot{width:10px;height:10px;border-radius:50%;background:#ff4d5e}
+@media(max-width:900px){
+  .shell{grid-template-columns:1fr}
+  .side{position:static;height:auto;border-radius:0 0 22px 22px}
+  .navlist{flex-direction:row;flex-wrap:wrap}.nv{width:auto}.sep,.nv.grp,.sub{display:none}
+  .navpill{display:none}
+  .top{flex-wrap:wrap}.gs{order:5;max-width:none;margin-left:0;flex-basis:100%}
+  .two{grid-template-columns:1fr}
+}
+/* ---- Dokumen PO & riwayat supplier ---- */
+.viewer{display:flex;flex-direction:column;gap:10px}
+.vbar{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap}
+.vsel{flex:1;min-width:260px}.vsel label{margin-bottom:4px}
+.vinfo{flex:1;min-width:200px}.vinfo small{display:block;color:var(--mute)}
+.vact{display:flex;gap:8px;flex-wrap:wrap}
+.vpaper{background:#cfd6e0;border:1px solid var(--line);border-radius:8px;padding:12px;overflow:hidden}
+.vpaper>div{margin:0 auto}
+.vpaper iframe{display:block;border:0;background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.25)}
+.modal{position:fixed;inset:0;z-index:50;background:rgba(10,20,40,.6);overflow:auto;padding:20px;display:flex;justify-content:center;align-items:flex-start}
+.modal .viewer{background:#fff;border-radius:10px;padding:16px;width:100%;max-width:900px}
+.hist{border:1px solid var(--line);border-radius:8px;margin-top:10px;background:#fafcff}
+.hhead{display:flex;justify-content:space-between;align-items:center;gap:8px;width:100%;text-align:left;border:0;background:transparent;padding:10px 12px}
+.hhead small{display:block;color:var(--mute);font-weight:400}
+.hbody{padding:0 12px 12px}
+.hhead .ht{flex:1;text-align:left;min-width:0}.hhead .ht b{display:block}
+.hi{width:46px;height:46px;border-radius:12px;display:grid;place-items:center;flex:none;color:#1558b8;background:linear-gradient(145deg,#eef7ff,#cfe5fb);border:1px solid #fff;box-shadow:0 3px 10px rgba(40,100,180,.15)}
+.hhead{gap:12px}
+.chk{display:flex;gap:8px;align-items:flex-start;font-weight:400;margin:6px 0}.chk input{width:auto;margin-top:3px}
+.lnk{border:0;background:none;padding:0;color:var(--brand);text-decoration:underline;text-align:left}
+button:disabled{opacity:.5;cursor:not-allowed}
+/* ---- Login: 3D flip + glassmorphism ---- */
+.auth{--ease:cubic-bezier(.45,.05,.2,1);min-height:100vh;display:grid;place-items:center;padding:16px;position:relative;overflow:hidden;background:linear-gradient(135deg,#0a1d42 0%,#123f86 45%,#1b6fd1 100%)}
+.auth::before,.auth::after{content:"";position:absolute;border-radius:50%;filter:blur(60px);opacity:.75;animation:drift 14s ease-in-out infinite alternate}
+.auth::before{width:380px;height:380px;left:-90px;top:-80px;background:#22d3ee}
+.auth::after{width:420px;height:420px;right:-110px;bottom:-120px;background:#a855f7;animation-delay:-6s}
+@keyframes drift{to{transform:translate(60px,40px) scale(1.15)}}
+.scene{position:relative;z-index:1;width:100%;max-width:400px;display:grid;perspective:1400px}
+.authbox{padding:26px 24px}.authbox p{margin:2px 0 14px}.fld{margin-bottom:12px}
+.face{grid-area:1/1;position:relative;overflow:hidden;display:flex;flex-direction:column;color:#fff;border-radius:20px;border:1px solid rgba(255,255,255,.38);
+  background:linear-gradient(135deg,rgba(255,255,255,calc(.26*var(--g,1))),rgba(255,255,255,calc(.07*var(--g,1))) 45%,rgba(255,255,255,calc(.14*var(--g,1))));
+  -webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);
+  -webkit-backface-visibility:hidden;backface-visibility:hidden;visibility:hidden;
+  transition:transform .9s var(--ease),visibility 0s linear .45s;animation:glow 4s ease-in-out infinite alternate}
+.face.act{visibility:visible;transition:transform .9s var(--ease),visibility 0s}
+.face.f{transform:rotateY(0)}.face.b{transform:rotateY(180deg)}
+.scene.flipped .face.f{transform:rotateY(-180deg)}.scene.flipped .face.b{transform:rotateY(0)}
+@keyframes glow{
+  from{box-shadow:0 10px 40px rgba(4,16,48,.45),0 0 18px rgba(125,200,255,.30),inset 0 1px 0 rgba(255,255,255,.55),inset 0 0 0 1px rgba(255,255,255,.06)}
+  to{box-shadow:0 10px 40px rgba(4,16,48,.45),0 0 34px rgba(160,215,255,.60),inset 0 1px 0 rgba(255,255,255,.55),inset 0 0 0 1px rgba(255,255,255,.12)}}
+.sheen{position:absolute;top:-20%;bottom:-20%;left:0;width:45%;pointer-events:none;z-index:3;opacity:0;
+  background:linear-gradient(105deg,transparent 0%,rgba(255,255,255,0) 30%,rgba(255,255,255,.5) 50%,rgba(255,255,255,0) 70%,transparent 100%);
+  transform:translateX(-130%) skewX(-18deg)}
+.face.act .sheen{animation:sweep .95s ease-in-out .2s both}
+@keyframes sweep{0%{opacity:1;transform:translateX(-130%) skewX(-18deg)}100%{opacity:1;transform:translateX(330%) skewX(-18deg)}}
+.auth .face h1{color:#fff;text-shadow:0 2px 12px rgba(0,0,0,.35);text-align:center}
+.auth .face>p.mute,.auth .face .logobox+h1+p{text-align:center}
+.logobox{background:#fff;border-radius:12px;padding:6px 10px;margin:0 auto 12px;display:flex;justify-content:center;align-items:center;box-shadow:0 4px 18px rgba(0,0,0,.25);max-width:100%}
+.logobox img{display:block;max-height:64px;max-width:220px;width:auto;height:auto;object-fit:contain}
+.auth.hasbg::before{inset:0;width:auto;height:auto;border-radius:0;filter:none;opacity:1;animation:none;background:rgba(8,20,48,.28)}
+.auth.hasbg::after{display:none}
+.prev{border:1px solid var(--line);border-radius:8px;min-height:110px;display:flex;align-items:center;justify-content:center;background:#f9fbfe}
+.prev.logo{background:#fff;padding:10px}.prev.logo img{max-height:90px;max-width:100%;object-fit:contain}
+.prev.bg{background:linear-gradient(135deg,#0a1d42,#1b6fd1) center/cover no-repeat;color:#fff;font-size:12px;height:140px}
+.btnfile{display:inline-block;margin:0;padding:8px 14px;border:1px solid var(--brand);border-radius:6px;background:var(--brand);color:#fff;font-weight:600;cursor:pointer}
+input[type=range]{padding:0}
+.auth .face .mute{color:rgba(255,255,255,.78)}
+.authbox p.foot{margin:auto 0 0;padding-top:10px}
+.auth .face label{color:rgba(255,255,255,.95)}.auth .face label i{color:#ffb4bd}
+.auth .face input,.auth .face select{background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.32);color:#fff}
+.auth .face select option{color:#14243d;background:#fff}
+.auth .face input:focus,.auth .face select:focus,.auth .face button:focus-visible{outline:2px solid rgba(255,255,255,.85);outline-offset:1px;box-shadow:0 0 12px rgba(160,215,255,.6)}
+.auth .face input:-webkit-autofill{-webkit-text-fill-color:#fff;caret-color:#fff;box-shadow:0 0 0 100px rgba(40,90,170,.55) inset}
+.auth .face .tabs button{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.3);color:#fff}
+.auth .face .tabs .on{background:rgba(255,255,255,.3);border-color:rgba(255,255,255,.6);font-weight:600}
+.auth .face .pri{background:linear-gradient(135deg,#3da0ff,#1558b8);border:1px solid rgba(255,255,255,.45);box-shadow:0 4px 18px rgba(21,88,184,.55)}
+.auth .face .eye{color:#fff;background:transparent;border:0;box-shadow:none}
+.auth .face .info{background:rgba(255,255,255,.16);border-color:rgba(255,255,255,.35);color:#fff}
+@media(prefers-reduced-motion:reduce){.face{transition:none;animation:none}.face.act{transition:none}.face.act .sheen{animation:none}.auth::before,.auth::after{animation:none}}
+.tabs{display:flex;gap:6px;margin-bottom:14px}.tabs button{flex:1}.tabs .on{background:var(--brand);color:#fff;border-color:var(--brand)}
+.pw{position:relative}.pw input{padding-right:42px}
+.eye{position:absolute;right:4px;top:50%;transform:translateY(-50%);border:0;background:transparent;padding:4px 8px;font-size:16px;line-height:1}
+.note{font-size:12px;color:#157347;margin-top:4px;line-height:1.35}.note.bad{color:#b42318}
+.item{border:1px solid var(--line);border-radius:8px;padding:12px;margin-bottom:12px;background:#fafcff}
+.ihead{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}.ihead button{padding:4px 10px}
+.item .fld{margin:0}
+.acts.fx button{min-width:82px;justify-content:center}.acts.fx{flex-wrap:nowrap}
+.ctbl th,.ctbl td{padding:8px 12px;vertical-align:middle}.ctbl td{font-size:13px;line-height:1.4}.ctbl th{white-space:nowrap}
+.ctbl td:first-child,.ctbl th:first-child{width:44px;text-align:center}.ctbl td:nth-child(2){min-width:170px}.ctbl td:nth-child(4),.ctbl td:nth-child(5){min-width:170px}
+.ctbl td:last-child,.ctbl th:last-child{width:1%;white-space:nowrap}.ctbl .tag{white-space:nowrap}
+.trhint{font-size:11.5px;color:var(--mute);margin-top:4px}.trhint b{color:var(--brand)}.trref{display:flex;flex-wrap:wrap;gap:14px;margin-top:6px;font-size:11.5px;color:var(--mute)}.trref i{display:inline-block;width:18px;border-top:2px dashed;margin-right:6px;vertical-align:middle}.trref b{color:#12315f}
+.exs{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 10px}.exs small{color:var(--mute)}.exs button{padding:1px 10px;font-size:12px;line-height:1.45;border-radius:12px;color:var(--brand);border-color:var(--brand2);background:rgba(255,255,255,.6)}
+.slink{margin-top:6px;display:flex;flex-direction:column;gap:6px}.slink .tedit{flex-wrap:wrap;margin-top:0}.slink a{font-size:13px;color:var(--brand);font-weight:600;word-break:break-all}
+.r1{display:grid;grid-template-columns:minmax(0,1fr) 90px 130px;gap:10px;margin-bottom:10px}
+.r2{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+@media(max-width:640px){.r1{grid-template-columns:1fr 1fr}.r1>:first-child{grid-column:1/-1}.r2{grid-template-columns:1fr 1fr}}
+/* ---- Dashboard ---- */
+.mfil{margin-left:auto;display:flex;align-items:center;gap:7px;background:#fff;border:1px solid #cfe0f2;border-radius:10px;padding:0 10px;height:32px;color:#27487c;font-weight:600}
+.mfil select{border:0;background:transparent;min-height:0;height:30px;width:auto;padding:0 2px;appearance:none;-webkit-appearance:none;font-weight:600;font-size:12.5px;color:#12315f;cursor:pointer}
+.mfil select:focus{outline:none}
+.kpis{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:14px;margin-bottom:14px}
+.kpi{display:flex;align-items:center;gap:12px;padding:14px;margin:0}
+.kic{width:42px;height:42px;border-radius:12px;display:grid;place-items:center;color:#fff;flex:none;box-shadow:0 6px 14px rgba(30,90,170,.25)}
+.kb{min-width:0}.kb small{display:block;color:var(--mute);font-size:12px}
+.kb b{display:block;font-size:clamp(18px,1.8vw,25px);line-height:1.15;color:#0d2a57;white-space:nowrap}
+.kpi:last-child .kb b{font-size:clamp(15px,1.35vw,20px)}
+.kd{display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-size:11px;color:var(--mute)}
+.kd em{font-style:normal;font-weight:700}.kd .good{color:#12a05c}.kd .bad{color:#e03546}.kd .flat{color:#7487a3}
+.drow{display:grid;gap:14px;margin-bottom:14px}
+.d3{grid-template-columns:1.35fr 1fr 1.1fr}.d2{grid-template-columns:1.05fr 1fr}
+.dcard{margin:0;overflow:hidden}
+.dh{display:flex;align-items:center;gap:9px;padding:12px 14px 2px}
+.dic{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;color:#1e6fd0;background:linear-gradient(145deg,#eaf4ff,#cfe4fb);flex:none}
+.dh h3{margin:0;font-size:14px;color:#0d2a57}.dr{margin-left:auto;font-size:12px}
+.db{padding:6px 14px 14px}
+.vall{border:0;background:none;padding:0;color:var(--brand);font-weight:600;font-size:12px;display:inline-flex;gap:3px;align-items:center}
+.lgd{display:flex;gap:12px;font-size:11px;color:var(--mute)}.lgd i{display:inline-block;width:10px;height:10px;border-radius:2px;background:#a9d4f5;margin-right:5px;vertical-align:-1px}.lgd i.ln{width:14px;height:2px;background:#1e5fc0;vertical-align:3px}
+.trend{width:100%;height:auto;display:block}.trend .ax{font-size:9.5px;fill:#6b7c95}.trend .tt1{font-size:10.5px;font-weight:700;fill:#fff}.trend .tt2{font-size:8.5px;fill:#b9d3f5}
+.donutwrap{display:flex;align-items:center;justify-content:center;gap:14px;padding-top:10px;flex-wrap:wrap}
+.donut{width:132px;height:132px;flex:none}.dnum{font-size:24px;font-weight:700;fill:#0d2a57;text-anchor:middle}.dlbl{font-size:8.5px;fill:#6b7c95;text-anchor:middle}
+.dleg{list-style:none;margin:0;padding:0;font-size:12px}.dleg li{display:flex;align-items:center;gap:7px;margin:9px 0;color:#34496b;white-space:nowrap}
+.dleg i{width:9px;height:9px;border-radius:50%;flex:none}.dleg b{margin-left:auto;padding-left:10px;color:#0d2a57}.dleg span{color:var(--mute)}
+.cseg{display:inline-flex;gap:4px;margin:4px 0 2px}.cseg button{padding:1px 12px;font-size:12px;line-height:1.45;border-radius:12px;font-weight:600;color:var(--brand);border-color:var(--brand2);background:rgba(255,255,255,.6)}.cseg button.on{background:linear-gradient(135deg,#1e7fe0,#0f5fc0);color:#fff;border-color:#0f5fc0}
+.crow{display:grid;grid-template-columns:minmax(70px,1.1fr) 1.4fr auto;gap:8px;align-items:center;font-size:11.5px;margin:13px 0}
+.cn{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#27406a}.cv{color:#34496b;white-space:nowrap}
+.cb{display:block;height:9px;background:#e6f0fa;border-radius:6px;overflow:hidden}
+.cb i{display:block;height:100%;border-radius:6px}
+.dtbl th,.dtbl td{padding:6px 9px;font-size:12px}.dtbl th{white-space:nowrap}
+.ell{display:block;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dtbl .lnk{font-size:12px}
+.pc{display:flex;align-items:center;gap:8px}.pc .cb{flex:1;min-width:46px}.pc>span:last-child{font-size:11.5px;color:var(--mute);width:32px;text-align:right}
+.lm{display:inline-block;border-radius:10px;padding:2px 10px;font-weight:600;font-size:11.5px;white-space:nowrap}
+.lm.a{background:#fff3d6;color:#8a5b00}.lm.b{background:#ffe3cf;color:#b45309}.lm.c{background:#fde0e0;color:#b42318}
+@media(max-width:1250px){.kpis{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:1150px){.d3,.d2{grid-template-columns:1fr}}
+@media(max-width:700px){.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
+/* ---- Animasi masuk (saat pindah halaman lewat sidebar) ---- */
+@keyframes pgIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+@keyframes riseIn{from{opacity:0;transform:translateY(16px) scale(.98)}to{opacity:1;transform:none}}
+@keyframes growY{from{transform:scaleY(0)}to{transform:scaleY(1)}}
+@keyframes growX{from{transform:scaleX(0)}to{transform:scaleX(1)}}
+@keyframes draw{to{stroke-dashoffset:0}}
+@keyframes pop{from{opacity:0;transform:scale(.2)}to{opacity:1;transform:scale(1)}}
+@keyframes dsweep{from{stroke-dashoffset:100}to{stroke-dashoffset:0}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+.pg{animation:pgIn .45s cubic-bezier(.2,.8,.2,1) both}
+.kpi,.dcard{animation:riseIn .55s cubic-bezier(.2,.8,.2,1) both}
+.drow>.dcard:nth-child(2){animation-delay:.09s}.drow>.dcard:nth-child(3){animation-delay:.18s}
+.gbar{transform-box:fill-box;transform-origin:50% 100%;animation:growY .8s cubic-bezier(.2,.8,.2,1) both}
+.gline{stroke-dasharray:1;stroke-dashoffset:1;animation:draw 1.1s .35s ease forwards}
+.gdot{transform-box:fill-box;transform-origin:center;animation:pop .4s cubic-bezier(.3,1.5,.5,1) both}
+.gtip{animation:fadeIn .4s 1.1s both}
+.dreveal{stroke-dasharray:100 100;animation:dsweep 1.15s .15s cubic-bezier(.3,.6,.3,1) both}
+.cb i{transform-origin:left;animation:growX .9s cubic-bezier(.2,.8,.2,1) both}
+.bcol .bb i{transform-origin:bottom;animation:growY .8s cubic-bezier(.2,.8,.2,1) both}
+.hb i{transform-origin:left;animation:growX .9s cubic-bezier(.2,.8,.2,1) both}
+.pbar i{transform-origin:left;animation:growX .8s cubic-bezier(.2,.8,.2,1) both}
+.tl li{animation:riseIn .45s cubic-bezier(.2,.8,.2,1) both}
+.tl li:nth-child(2){animation-delay:.07s}.tl li:nth-child(3){animation-delay:.14s}.tl li:nth-child(4){animation-delay:.21s}.tl li:nth-child(5){animation-delay:.28s}.tl li:nth-child(6){animation-delay:.35s}
+@media(prefers-reduced-motion:reduce){.pg,.kpi,.dcard,.gbar,.gdot,.gtip,.dreveal,.cb i,.bcol .bb i,.hb i,.pbar i,.tl li{animation:none!important}.gline{animation:none;stroke-dashoffset:0}}
+
+/* ---- Login & Daftar: kartu diringkas (~30%) agar muat satu layar ---- */
+.auth .scene{max-width:300px}
+.auth .authbox{padding:16px 18px;border-radius:16px}
+.auth .face h1{font-size:19px;line-height:1.2;margin:2px 0 0}
+.auth .authbox p{margin:1px 0 8px;font-size:12px}
+.auth .logobox{margin:0 auto 6px;padding:5px 9px;border-radius:10px}
+.auth .logobox img{max-height:38px;max-width:150px}
+.auth .face label{font-size:12px;margin-bottom:3px}
+.auth .fld{margin-bottom:8px}
+.auth .face input,.auth .face select{min-height:34px;padding:6px 11px;font-size:13px;border-radius:9px}
+.auth .pw input{padding-right:34px}
+.auth .tabs{margin-bottom:8px}
+.auth .face .tabs button{padding:6px 10px;font-size:13px}
+.auth .face .pri.wide{padding:8px 12px;margin-top:2px}
+.auth .face .info{padding:7px 10px;font-size:12px;margin-bottom:8px}
+.auth .authbox p.foot{font-size:11px;padding-top:6px}
+
+/* ---- Tombol aksi di tabel pengajuan: seragam & rapi (2 kolom) ---- */
+.abtn{display:grid;grid-template-columns:repeat(2,minmax(94px,1fr));gap:6px;min-width:204px}
+.abtn button{display:inline-flex;align-items:center;justify-content:center;width:100%;min-height:30px;padding:5px 8px;border-radius:8px;font-size:12.5px;font-weight:600;line-height:1.2;white-space:nowrap}
+.abtn .cx{background:#fff;color:#d6334a;border:1px solid #ef8a97}
+.abtn .cx:hover{background:#fde8ea}
+/* ---- Login & Daftar: huruf putih tegas tanpa efek menyala (mudah dibaca) ---- */
+.auth{--tsh:0 1px 2px rgba(0,20,60,.45)}
+.auth .face{background:linear-gradient(135deg,rgba(18,66,160,calc(.34*var(--g,1))),rgba(8,36,104,calc(.2*var(--g,1))) 45%,rgba(28,88,190,calc(.3*var(--g,1))));border-color:rgba(190,230,255,.55)}
+.auth .face h1{color:#fff;font-weight:800;text-shadow:var(--tsh)}
+.auth .face label,.auth .face .mute,.auth .face .mute.small,.auth .face .foot{color:#fff;font-weight:600;text-shadow:var(--tsh)}
+.auth .face .mute{color:#e8f4ff}
+.auth .face label i{color:#ffb3c0;text-shadow:none}
+.auth .face input,.auth .face select{color:#fff;font-weight:500;text-shadow:none;background:rgba(6,32,96,.42);border:1px solid rgba(170,225,255,.75)}
+/* Isian login/daftar model embos ke dalam (lubang) persis referensi neumorphic: palung biru tua + bayangan dalam */
+.auth .face input,.auth .face select{background:rgba(2,18,56,.78);border:1px solid rgba(0,0,0,.45);box-shadow:inset 0 4px 12px rgba(0,0,0,.6),inset 0 -1px 0 rgba(255,255,255,.14)}
+.auth .face input::placeholder{color:rgba(215,238,255,.72);text-shadow:none}
+.auth .face input:focus,.auth .face select:focus{border-color:rgba(0,0,0,.45);box-shadow:inset 0 4px 12px rgba(0,0,0,.6),inset 0 -1px 0 rgba(255,255,255,.14);outline:2px solid rgba(255,255,255,.9);outline-offset:1px}
+.auth .face input:-webkit-autofill{-webkit-text-fill-color:#fff;caret-color:#fff;box-shadow:0 0 0 100px rgba(2,18,56,.95) inset}
+.auth .face .tabs button{color:#fff;font-weight:600;text-shadow:none;background:rgba(6,32,96,.34);border-color:rgba(170,225,255,.6)}
+.auth .face .tabs .on{background:rgba(56,150,255,.55);border-color:#d4f0ff;box-shadow:none}
+/* Tab Masuk/Daftar model embos ke dalam: wadah seperti lubang (cekung), tab aktif timbul mengkilap */
+.auth .face .tabs{display:flex;gap:0;padding:4px;border-radius:999px;background:rgba(2,18,56,.72);border:1px solid rgba(0,0,0,.45);box-shadow:inset 0 4px 12px rgba(0,0,0,.6),inset 0 -1px 0 rgba(255,255,255,.14)}
+.auth .face .tabs button{flex:1;border:0;background:transparent;color:rgba(220,240,255,.75);border-radius:999px}
+.auth .face .tabs .on{background:linear-gradient(180deg,#2ea8ff,#0a5fd6);color:#fff;font-weight:700;border:0;box-shadow:0 4px 12px rgba(0,40,120,.5),inset 0 1px 0 rgba(255,255,255,.6)}
+.auth .face .pri{color:#fff;font-weight:700;text-shadow:none;background:linear-gradient(135deg,#1f86ff,#0b46b8);border:1px solid #a8e0ff;box-shadow:0 4px 12px rgba(5,30,90,.35)}
+.auth .face .eye{color:#fff;text-shadow:none}
+/* ---- Ambient Mesh Gradient + Gradient Shimmer pada LATAR BELAKANG halaman login ---- */
+.auth.hasbg::after,.auth:not(.hasbg)::after{display:block;content:"";position:absolute;inset:-30%;width:auto;height:auto;border-radius:0;z-index:0;pointer-events:none;filter:none;opacity:.7;animation:authmesh 18s ease-in-out infinite alternate;will-change:transform;
+  background:
+    radial-gradient(34% 36% at 18% 22%,rgba(6,24,84,.92),transparent 70%),
+    radial-gradient(32% 34% at 80% 18%,rgba(24,104,230,.8),transparent 70%),
+    radial-gradient(36% 36% at 72% 80%,rgba(34,205,240,.72),transparent 70%),
+    radial-gradient(34% 32% at 22% 78%,rgba(120,196,255,.62),transparent 70%),
+    radial-gradient(28% 30% at 50% 50%,rgba(14,64,160,.6),transparent 72%)}
+@keyframes authmesh{
+  0%{transform:translate3d(-6%,-4%,0) rotate(0deg) scale(1)}
+  33%{transform:translate3d(7%,-3%,0) rotate(50deg) scale(1.1)}
+  66%{transform:translate3d(5%,7%,0) rotate(110deg) scale(1.03)}
+  100%{transform:translate3d(-7%,5%,0) rotate(180deg) scale(1.12)}}
+/* Pita cahaya (shimmer) tipis yang melintas pelan di atas gradasi */
+.auth.hasbg::before{z-index:1;background:linear-gradient(115deg,transparent 38%,rgba(160,230,255,.2) 50%,transparent 62%) 120% 0/260% 100% no-repeat,rgba(8,20,48,.12);animation:authsweep 10s ease-in-out infinite}
+@keyframes authsweep{0%{background-position:120% 0,0 0}60%,100%{background-position:-60% 0,0 0}}
+@media(prefers-reduced-motion:reduce){.auth.hasbg::before,.auth.hasbg::after,.auth:not(.hasbg)::after{animation:none}}
+/* ---- Slow Flowing Abstract Waves (loop sangat lambat 45–80 dtk) ---- */
+.auth .waves{position:absolute;inset:0;width:100%;height:100%;z-index:1;pointer-events:none;overflow:hidden}
+.auth .waves .wv{transform-box:fill-box;transform-origin:center;will-change:transform}
+.auth .waves .w1{animation:wvf1 52s ease-in-out infinite alternate}
+.auth .waves .w2{animation:wvf2 68s ease-in-out infinite alternate}
+.auth .waves .w3{animation:wvf3 78s ease-in-out infinite alternate}
+.auth .waves .w4{animation:wvf2 90s ease-in-out infinite alternate-reverse;opacity:.8}
+@keyframes wvf1{0%{transform:translate3d(-90px,10px,0) rotate(-1.2deg)}50%{transform:translate3d(10px,-24px,0) rotate(.6deg)}100%{transform:translate3d(100px,16px,0) rotate(1.4deg)}}
+@keyframes wvf2{0%{transform:translate3d(110px,-8px,0) rotate(1deg)}50%{transform:translate3d(-20px,22px,0) rotate(-.8deg)}100%{transform:translate3d(-100px,-12px,0) rotate(-1.4deg)}}
+@keyframes wvf3{0%{transform:translate3d(-70px,-14px,0) rotate(.8deg)}100%{transform:translate3d(90px,20px,0) rotate(-1deg)}}
+@media(prefers-reduced-motion:reduce){.auth .waves .wv{animation:none}}
+/* ---- Tombol Masuk / Kirim pendaftaran: loading state ---- */
+.auth .face .sbtn{justify-content:center;text-align:center;position:relative;overflow:hidden;transition:background .3s,opacity .2s,box-shadow .3s}
+.auth .face .sbtn .sbl{position:relative;z-index:1;display:inline-flex;align-items:center;justify-content:center;gap:8px}
+.auth .face .sbtn:disabled{cursor:not-allowed}
+.auth .face .sbtn.loading:not(.ok){opacity:.78;filter:saturate(.8) brightness(.92)}
+.auth .face .sbtn .pbfill{position:absolute;left:0;top:0;bottom:0;z-index:0;background:linear-gradient(90deg,rgba(255,255,255,.1),rgba(255,255,255,.38));border-right:2px solid rgba(255,255,255,.8);transition:width .12s linear}
+.auth .face .sbtn .spin{width:14px;height:14px;border-radius:50%;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;animation:authspin .7s linear infinite;flex:none}
+@keyframes authspin{to{transform:rotate(360deg)}}
+.auth .face .sbtn.ok{opacity:1;filter:none;background:linear-gradient(135deg,#27c46b,#128a47);border-color:#b8f5d2;box-shadow:0 4px 14px rgba(10,110,55,.45)}
+.auth .face .sbtn .chk{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;background:#fff;color:#128a47;font-size:12px;font-weight:900;animation:pop .35s cubic-bezier(.2,.8,.2,1) both}
+/* Overlay + shimmer pada formulir Daftar selama pemrosesan */
+.auth .face.formbusy::after{content:"";position:absolute;inset:0;border-radius:inherit;z-index:5;pointer-events:all;cursor:progress;background:linear-gradient(105deg,rgba(255,255,255,0) 30%,rgba(255,255,255,.22) 50%,rgba(255,255,255,0) 70%) -150% 0/250% 100% no-repeat,rgba(6,28,84,.28);animation:authshim 1.2s linear infinite}
+@keyframes authshim{to{background-position:150% 0,0 0}}
+.auth .face input:disabled,.auth .face select:disabled{opacity:.7;cursor:not-allowed}
+.auth .face .tabs button:disabled{cursor:not-allowed;opacity:.75}
+@media(prefers-reduced-motion:reduce){.auth .face .sbtn .spin{animation-duration:1.6s}.auth .face.formbusy::after{animation:none}}
+.auth .face .info{color:#fff;font-weight:600;text-shadow:none;background:rgba(6,32,96,.5);border-color:rgba(170,225,255,.65)}
+
+/* ---- Dashboard: efek kaca ---- */
+.dash{position:relative;isolation:isolate}
+.dash::before{content:"";position:absolute;inset:-24px -10px;z-index:-1;pointer-events:none;filter:blur(8px);
+  background:radial-gradient(260px 200px at 10% 12%,rgba(45,212,216,.42),transparent 70%),radial-gradient(320px 240px at 88% 30%,rgba(80,140,255,.38),transparent 70%),radial-gradient(300px 230px at 40% 62%,rgba(150,120,255,.22),transparent 70%),radial-gradient(300px 220px at 85% 92%,rgba(45,212,216,.3),transparent 70%)}
+.kpi,.dcard{position:relative;background:linear-gradient(135deg,rgba(255,255,255,.62),rgba(255,255,255,.26) 48%,rgba(255,255,255,.44));
+  -webkit-backdrop-filter:blur(16px) saturate(1.5);backdrop-filter:blur(16px) saturate(1.5);border:1px solid rgba(255,255,255,.75);
+  box-shadow:0 8px 30px rgba(31,90,170,.16),inset 0 1px 0 rgba(255,255,255,.95),inset 0 0 0 1px rgba(255,255,255,.18);transition:box-shadow .25s}
+.kpi:hover,.dcard:hover{box-shadow:0 12px 36px rgba(31,110,210,.26),0 0 22px rgba(90,200,255,.3),inset 0 1px 0 rgba(255,255,255,.95)}
+.kpi::after,.dcard::after{content:"";position:absolute;top:-30%;bottom:-30%;left:0;width:38%;pointer-events:none;opacity:0;
+  background:linear-gradient(105deg,transparent,rgba(255,255,255,.6),transparent);transform:translateX(-140%) skewX(-18deg);animation:dsheen 1.3s .35s ease-out both}
+@keyframes dsheen{0%{opacity:0;transform:translateX(-140%) skewX(-18deg)}15%{opacity:1}100%{opacity:0;transform:translateX(400%) skewX(-18deg)}}
+.dcard .dtbl th{background:rgba(214,234,252,.62)}
+.dcard .tbl table,.dcard th,.dcard td{border-color:rgba(160,195,235,.45)}
+.dcard .tbl tbody tr:nth-child(odd) td{background:rgba(255,255,255,.32)}
+.dcard .tbl tbody tr:nth-child(even) td{background:rgba(120,180,240,.14)}
+.dic{background:linear-gradient(145deg,rgba(255,255,255,.9),rgba(190,220,250,.8));box-shadow:0 2px 8px rgba(40,100,180,.18)}
+@media(prefers-reduced-motion:reduce){.kpi::after,.dcard::after{animation:none}}
+
+/* ---- Form Buat PO: kartu kiri & kanan sejajar per baris ---- */
+.two{align-items:start}
+.two>.cl{grid-column:1}.two>.cr{grid-column:2}
+.two>.cl>.card,.two>.cr>.card{margin-bottom:0}
+.two>.cr>.card+.card{margin-top:12px}
+@media(max-width:1100px){.two>.cl,.two>.cr{grid-column:auto}.two>.cl{order:1}.two>.cr{order:2}}
+/* ---- Rank Top 10 Supplier: angka tepat di tengah bulatan ---- */
+.rk{display:inline-flex;align-items:center;justify-content:center;line-height:1;padding:0;text-align:center;flex:none}
+/* ---- Tabel Supplier BP ---- */
+.bpt td,.bpt th{white-space:nowrap}
+.bpt td{font-size:14px}
+.bpt td:first-child b{font-size:14px;font-weight:700}
+.bpt{table-layout:fixed;width:100%}
+.bpt th:nth-child(1){width:19%}.bpt th:nth-child(2){width:26%}.bpt th:nth-child(3){width:14%}.bpt th:nth-child(4){width:17%}.bpt th:nth-child(5){width:15%}
+.bpt td:nth-child(2){white-space:normal}
+.bpst{display:inline-flex;align-items:center;gap:7px;font-size:13px;font-weight:700;white-space:nowrap;background:none;padding:0}
+.bpst i{width:7px;height:7px;border-radius:50%;background:currentColor;flex:none}
+.bpst.ak{color:#157347}.bpst.so{color:#8a5b00}.bpst.ex{color:#b42318}
+
+
+/* ---- Logo login beranimasi (tanpa emas): Terangkai Cepat + Shimmer putih kebiruan + Beacon Glow biru + Pulse & Flash ---- */
+.auth .logobox.alogo{box-sizing:border-box;position:relative;overflow:visible;padding:18px 16px 14px;margin:0 auto 10px;width:100%;max-width:100%;border-radius:16px;--al:9s;background:linear-gradient(180deg,#ffffff 0%,#eef5ff 100%);box-shadow:0 12px 30px rgba(4,16,48,.18),inset 0 0 0 1px rgba(170,205,255,.9)}
+/* panel putih + sorot cahaya dari atas, seperti panggung logo di video referensi */
+.auth .logobox.alogo::before{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;background:repeating-conic-gradient(from 172deg at 50% -12%,rgba(140,200,255,.20) 0deg 8deg,transparent 8deg 20deg),radial-gradient(65% 60% at 50% 0%,rgba(190,225,255,.6),transparent 70%)}
+/* video logo login: tampil sebagai jendela gelap membulat di atas panel putih (background video gelap bawaan) */
+.alogo .al-swap{position:relative;z-index:1;width:230px;max-width:100%;height:50px;margin:0 auto}
+.alogo .al-video{position:absolute;inset:0;display:block;width:100%;height:100%;object-fit:cover;object-position:50% 47%;border-radius:10px;box-shadow:0 8px 24px rgba(4,16,48,.35);background:#04081a;transition:opacity .9s ease,transform .9s cubic-bezier(.4,0,.2,1),filter .9s ease}
+/* logo asli (latar putih) masuk: membesar-mengecil halus + blur hilang + kilau biru menyapu */
+/* logo asli: latar putih polos, di tengah, 17% lebih besar dari jendela video, tetapi lebarnya selalu dibatasi lebar kotak putih (100cqw) agar tidak keluar. Selector panjang agar menang atas ".auth .logobox img" yang membatasi ukuran. */
+.auth .logobox.alogo .al-swap .al-logo{position:absolute;inset:0;margin:auto;display:block;width:105%;width:min(117%,calc(100cqw - 24px));height:117%;max-width:none;max-height:none;object-fit:contain;object-position:center;opacity:0;transform:scale(1.18) translateY(5px);filter:blur(10px);transition:opacity .9s ease,transform .9s cubic-bezier(.2,.9,.3,1.2),filter .9s ease;pointer-events:none}
+.auth .logobox.alogo{background:#fff;container-type:inline-size}
+.auth .logobox.alogo::before{transition:opacity .9s ease}
+.auth .logobox.alogo.show-logo::before{opacity:0}
+.alogo .al-sweep{position:absolute;inset:0;border-radius:10px;overflow:hidden;pointer-events:none}
+.alogo .al-sweep::after{content:"";position:absolute;top:-10%;bottom:-10%;left:0;width:42%;background:linear-gradient(105deg,transparent,rgba(120,185,255,.7),rgba(255,255,255,.9),transparent);opacity:0;transform:translateX(-140%) skewX(-18deg)}
+.alogo .al-swap.is-logo .al-video{opacity:0;transform:scale(.86);filter:blur(7px)}
+.auth .logobox.alogo .al-swap.is-logo .al-logo{opacity:1;transform:none;filter:none;transition-delay:.2s}
+.alogo .al-swap.is-logo .al-sweep::after{animation:alSweep 1.1s ease-out .55s 1 both}
+.alogo .al-swap.is-video .al-video{transition-delay:.25s}
+@keyframes alSweep{0%{opacity:0;transform:translateX(-140%) skewX(-18deg)}20%{opacity:1}100%{opacity:0;transform:translateX(380%) skewX(-18deg)}}
+@media(prefers-reduced-motion:reduce){.alogo .al-video,.alogo .al-logo{transition-duration:.01s;transition-delay:0s}.alogo .al-sweep::after{animation:none!important}}
+/* panel video dibuat setipis pil logo lama, supaya tinggi totalnya sama seperti gambar kanan */
+.auth .logobox.alogo.videobox{padding:8px 10px}
+.alogo .al-stage{position:relative;width:260px;max-width:100%;line-height:0;isolation:isolate}
+.alogo .al-stage img{display:block;width:100%;height:auto;max-height:none;max-width:none}
+.alogo .al-stage img:not(.al-base){position:absolute;inset:0;pointer-events:none}
+.alogo .al-aura{position:absolute;left:3%;top:-8%;width:34%;height:116%;border-radius:50%;pointer-events:none;z-index:0;opacity:0;
+  background:radial-gradient(closest-side,rgba(40,130,255,.65),rgba(20,100,230,.28) 55%,transparent 75%);filter:blur(7px);animation:alAura var(--al) ease-in-out infinite}
+/* lapisan dasar: hanya bagian teks (kanan logo) bila logo bawaan; teks menyusul dari kanan dengan sedikit efek "klik" */
+.alogo .al-base{opacity:0;animation:alBase var(--al) ease-in-out infinite}
+.alogo:not(.custom) .al-base{clip-path:polygon(23.8% 0,100% 0,100% 100%,23.8% 100%)}
+/* 1) Terangkai cepat: atap terpecah jadi 4 pita yang meluncur bergantian dari kiri dan kanan, lalu menyatu */
+.alogo .al-rw{position:absolute;inset:0;pointer-events:none;opacity:0}
+.alogo .al-rb{position:absolute;inset:0;pointer-events:none;opacity:0}
+.alogo .al-rb.rb1{clip-path:polygon(0 0,23.8% 0,23.8% 17%,0 17%);animation:alRb1 var(--al) cubic-bezier(.2,.9,.3,1.35) infinite}
+.alogo .al-rb.rb2{clip-path:polygon(0 17%,23.8% 17%,23.8% 34%,0 34%);animation:alRb2 var(--al) cubic-bezier(.2,.9,.3,1.35) infinite}
+.alogo .al-rb.rb3{clip-path:polygon(0 34%,23.8% 34%,23.8% 51%,0 51%);animation:alRb3 var(--al) cubic-bezier(.2,.9,.3,1.35) infinite}
+.alogo .al-rb.rb4{clip-path:polygon(0 51%,23.8% 51%,23.8% 68%,0 68%);animation:alRb4 var(--al) cubic-bezier(.2,.9,.3,1.35) infinite}
+/* shimmer putih kebiruan: sapuan cahaya diagonal dari tengah pilar ke kanan, hanya di atas piksel logo */
+.alogo .al-shine{position:absolute;inset:0;z-index:4;pointer-events:none;opacity:0;mix-blend-mode:screen;
+  -webkit-mask-size:100% 100%;mask-size:100% 100%;-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;
+  background:linear-gradient(105deg,transparent 40%,rgba(190,225,255,0) 44%,rgba(190,225,255,.95) 50%,rgba(255,255,255,.95) 52%,rgba(190,225,255,0) 58%,transparent 62%);
+  background-size:260% 100%;background-repeat:no-repeat;background-position:120% 0;animation:alShine var(--al) ease-in-out infinite}
+/* 2) Beacon Glow: pilar hitam naik kokoh, lalu garis atap biru menyala neon */
+.alogo .al-pil{clip-path:polygon(0 68%,23.8% 68%,23.8% 100%,0 100%);opacity:0;animation:alPil var(--al) cubic-bezier(.2,.8,.2,1) infinite}
+.alogo .al-rw{animation:alRoof var(--al) ease-in-out infinite}
+.alogo .al-roof{clip-path:polygon(0 0,23.8% 0,23.8% 68%,0 68%)}
+@keyframes alBase{0%,9%{opacity:0;transform:translateX(34px)}13%{opacity:1;transform:translateX(-2px)}15%,92%{opacity:1;transform:translateX(0)}98%,100%{opacity:0;transform:translateX(0)}}
+@keyframes alRb1{0%{opacity:0;transform:translateX(-46px)}4%{opacity:1;transform:translateX(0)}13%{opacity:1;transform:translateX(0)}15%,100%{opacity:0;transform:translateX(0)}}
+@keyframes alRb2{0%,2%{opacity:0;transform:translateX(46px)}6%{opacity:1;transform:translateX(0)}13%{opacity:1;transform:translateX(0)}15%,100%{opacity:0;transform:translateX(0)}}
+@keyframes alRb3{0%,4%{opacity:0;transform:translateX(-46px)}8%{opacity:1;transform:translateX(0)}13%{opacity:1;transform:translateX(0)}15%,100%{opacity:0;transform:translateX(0)}}
+@keyframes alRb4{0%,6%{opacity:0;transform:translateX(46px)}10%{opacity:1;transform:translateX(0)}13%{opacity:1;transform:translateX(0)}15%,100%{opacity:0;transform:translateX(0)}}
+@keyframes alShine{0%,17%{opacity:0;background-position:120% 0}18%{opacity:1;background-position:100% 0}31%{opacity:1;background-position:-20% 0}32%,100%{opacity:0;background-position:-20% 0}}
+@keyframes alPil{0%,4%{opacity:0;transform:translateY(16px)}10%{opacity:1;transform:translateY(0)}92%{opacity:1;transform:translateY(0)}98%,100%{opacity:0;transform:translateY(0)}}
+@keyframes alRoof{0%,14%{opacity:0;filter:none}16%{opacity:1;filter:drop-shadow(0 0 3px #5cc2ff) drop-shadow(0 0 10px #1a7bff) drop-shadow(0 0 22px rgba(40,140,255,.95)) brightness(1.3)}
+  22%{opacity:1;filter:drop-shadow(0 0 1px #35a2ff) drop-shadow(0 0 4px rgba(26,123,255,.7)) brightness(1.08)}
+  28%{opacity:1;filter:drop-shadow(0 0 3px #5cc2ff) drop-shadow(0 0 11px #1a7bff) drop-shadow(0 0 24px rgba(40,140,255,.95)) brightness(1.3)}
+  34%,92%{opacity:1;filter:none}98%,100%{opacity:0;filter:none}}
+@keyframes alAura{0%,15%{opacity:0;transform:scale(.7)}19%{opacity:.95;transform:scale(1.1)}25%{opacity:.3;transform:scale(.95)}31%{opacity:.9;transform:scale(1.12)}40%,100%{opacity:0;transform:scale(1.2)}}
+/* 3) Grand Citadel Pulse & Flash: dipicu saat login berhasil (class .burst) */
+.alogo .al-ring,.alogo .al-flash{position:absolute;left:50%;top:50%;border-radius:50%;pointer-events:none;opacity:0;z-index:5}
+.alogo .al-ring{width:40px;height:40px;margin:-20px 0 0 -20px;border:2px solid rgba(160,215,255,.95);box-shadow:0 0 18px 4px rgba(90,170,255,.7),inset 0 0 14px rgba(160,215,255,.6)}
+.alogo .al-flash{width:150px;height:150px;margin:-75px 0 0 -75px;background:radial-gradient(closest-side,rgba(255,255,255,.95),rgba(150,205,255,.5) 55%,transparent 75%)}
+.auth .face .logobox.alogo.burst{animation:alPulse .95s cubic-bezier(.34,1.56,.64,1) forwards;box-shadow:0 4px 30px rgba(120,190,255,.9),0 0 50px 8px rgba(80,160,255,.6)}
+.alogo.burst .al-ring.r1{animation:alRing .9s ease-out forwards}
+.alogo.burst .al-ring.r2{animation:alRing .9s ease-out .18s forwards}
+.alogo.burst .al-flash{animation:alFlash .7s ease-out forwards}
+@keyframes alPulse{0%{transform:scale(1)}35%{transform:scale(1.14)}55%{transform:scale(.97)}75%{transform:scale(1.05)}100%{transform:scale(1.03);opacity:.9}}
+@keyframes alRing{0%{opacity:.95;transform:scale(.6)}100%{opacity:0;transform:scale(9)}}
+@keyframes alFlash{0%{opacity:0;transform:scale(.4)}25%{opacity:1}100%{opacity:0;transform:scale(2.6)}}
+/* logo tampil statis & lengkap bila pengguna meminta gerakan dikurangi */
+@media(prefers-reduced-motion:reduce){.alogo .al-base{animation:none;opacity:1}.alogo .al-pil{animation:none;opacity:1}.alogo .al-rw{animation:none;opacity:1;filter:none}.alogo .al-rb,.alogo .al-shine,.alogo .al-aura{animation:none;opacity:0}.auth .face .logobox.alogo.burst,.alogo.burst .al-ring,.alogo.burst .al-flash{animation:none}}
+
+/* ---- Efek login berhasil: Glassmorphic Expansion & Fade-out, lalu dashboard muncul pelan ---- */
+@keyframes loginExpand{
+  0%{transform:rotateY(0) scale(1);opacity:1;box-shadow:0 10px 40px rgba(4,16,48,.45),0 0 18px rgba(125,200,255,.3),inset 0 1px 0 rgba(255,255,255,.55)}
+  45%{transform:rotateY(0) scale(1.02);opacity:1;box-shadow:0 14px 50px rgba(4,16,48,.5),0 0 46px 8px rgba(110,190,255,.75),0 0 90px 18px rgba(70,150,255,.45),inset 0 1px 0 rgba(255,255,255,.7)}
+  100%{transform:rotateY(0) scale(1.02);opacity:0;box-shadow:0 14px 50px rgba(4,16,48,.2),0 0 70px 14px rgba(110,190,255,.35),0 0 110px 24px rgba(70,150,255,.2),inset 0 1px 0 rgba(255,255,255,.4)}}
+@keyframes loginBgOut{from{opacity:1}to{opacity:0}}
+/* hanya opacity + fill-mode backwards: animasi transform yang "menempel" membuat .shell jadi acuan position:fixed, sehingga sidebar ikut ter-scroll & biru-nya terputus */
+@keyframes appIn{from{opacity:0}to{opacity:1}}
+.auth .scene.leaving .face.act{animation:loginExpand .95s cubic-bezier(.4,0,.2,1) forwards;pointer-events:none}
+.auth.leaving{animation:loginBgOut .45s ease-in .6s forwards}
+.shell{animation:appIn .7s cubic-bezier(.2,.8,.2,1) backwards}
+@media(prefers-reduced-motion:reduce){.auth .scene.leaving .face.act,.auth.leaving,.shell{animation:none}}
+
+/* ---- Ambient Fluid Wave: pita gelombang & pendaran cahaya bergerak melingkar, terlihat jelas tapi tetap halus ---- */
+@keyframes fwA{0%{transform:translate3d(0,0,0) rotate(0deg) scale(1,1)}25%{transform:translate3d(190px,-60px,0) rotate(2deg) scale(1.06,1.2)}50%{transform:translate3d(0,-120px,0) rotate(0deg) scale(1,1.32)}75%{transform:translate3d(-190px,-60px,0) rotate(-2deg) scale(1.06,1.2)}100%{transform:translate3d(0,0,0) rotate(0deg) scale(1,1)}}
+@keyframes fwB{0%{transform:translate3d(0,0,0) rotate(0deg) scale(1,1)}25%{transform:translate3d(-170px,70px,0) rotate(-2.2deg) scale(1.08,.84)}50%{transform:translate3d(0,130px,0) rotate(0deg) scale(1,.72)}75%{transform:translate3d(170px,70px,0) rotate(2.2deg) scale(1.08,.84)}100%{transform:translate3d(0,0,0) rotate(0deg) scale(1,1)}}
+.auth .waves{mix-blend-mode:screen}
+.auth .waves .wv{filter:drop-shadow(0 0 14px rgba(120,210,255,.75))}
+.auth .waves .wv path[stroke]{stroke-opacity:.9;stroke-width:3px}
+.auth .waves .w1{animation:fwA 30s linear infinite;animation-timing-function:ease-in-out}
+.auth .waves .w2{animation:fwB 38s linear infinite;animation-timing-function:ease-in-out}
+.auth .waves .w3{animation:fwA 46s linear infinite reverse;animation-timing-function:ease-in-out}
+.auth .waves .w4{animation:fwB 54s linear infinite reverse;animation-timing-function:ease-in-out;opacity:1}
+@keyframes orbitA{from{transform:rotate(0deg) translateX(var(--r)) rotate(0deg)}to{transform:rotate(360deg) translateX(var(--r)) rotate(-360deg)}}
+@keyframes orbitB{from{transform:rotate(360deg) translateX(var(--r)) rotate(-360deg)}to{transform:rotate(0deg) translateX(var(--r)) rotate(0deg)}}
+@keyframes orbBreath{0%,100%{opacity:.7}50%{opacity:1}}
+.auth .orb{position:absolute;z-index:1;pointer-events:none;border-radius:50%;filter:blur(28px);mix-blend-mode:screen;will-change:transform;
+  animation:orbitA var(--t) linear infinite,orbBreath 8s ease-in-out infinite}
+.auth .orb.o1{--r:220px;--t:36s;width:520px;height:520px;left:4%;top:2%;background:radial-gradient(circle,rgba(110,205,255,1),rgba(60,140,255,0) 70%)}
+.auth .orb.o2{--r:260px;--t:48s;width:580px;height:580px;right:0%;bottom:-2%;background:radial-gradient(circle,rgba(80,240,250,.95),rgba(40,160,240,0) 70%);animation-name:orbitB,orbBreath;animation-delay:0s,-4s}
+.auth .orb.o3{--r:180px;--t:60s;width:440px;height:440px;left:40%;top:46%;background:radial-gradient(circle,rgba(205,185,255,.95),rgba(130,110,255,0) 70%);animation-delay:-12s,-2s}
+@media(prefers-reduced-motion:reduce){.auth .waves .wv,.auth .orb{animation:none}}
+
+#toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#14243d;color:#fff;padding:10px 16px;border-radius:6px;z-index:60;max-width:90vw}
+
+/* ---- Efek glass untuk sidebar & seluruh halaman (selain login) ---- */
+.shell{position:relative;isolation:isolate}
+.shell::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
+  background:radial-gradient(420px 320px at 8% 18%,rgba(45,212,216,.4),transparent 70%),radial-gradient(520px 380px at 92% 20%,rgba(90,140,255,.34),transparent 70%),radial-gradient(480px 360px at 55% 78%,rgba(160,120,255,.2),transparent 70%),radial-gradient(420px 320px at 12% 92%,rgba(45,212,216,.32),transparent 70%)}
+.side{background:radial-gradient(120% 55% at 0% 100%,rgba(45,226,230,.55),transparent 62%),radial-gradient(90% 40% at 100% 0%,rgba(120,190,255,.35),transparent 60%),linear-gradient(180deg,rgba(10,58,142,.74) 0%,rgba(11,95,186,.62) 50%,rgba(18,149,214,.56) 100%);
+  -webkit-backdrop-filter:blur(20px) saturate(1.6);backdrop-filter:blur(20px) saturate(1.6);border:1px solid rgba(255,255,255,.38);border-left:0;
+  box-shadow:8px 0 32px rgba(10,60,140,.26),inset 0 1px 0 rgba(255,255,255,.55),inset -1px 0 0 rgba(255,255,255,.22)}
+.logoph{background:transparent;-webkit-backdrop-filter:none;backdrop-filter:none;border:0}
+.nv{background:rgba(255,255,255,.07);border-color:rgba(255,255,255,.14);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+.nv:hover{background:rgba(255,255,255,.22);border-color:rgba(255,255,255,.4)}
+.nv.on,.nv.on:hover{background:transparent;border-color:transparent;box-shadow:none;-webkit-backdrop-filter:none;backdrop-filter:none;font-weight:600}
+@media(max-width:900px){.nv.on,.nv.on:hover{background:linear-gradient(90deg,rgba(23,169,238,.85),rgba(64,226,238,.7));border-color:rgba(255,255,255,.85);box-shadow:0 0 16px rgba(90,225,255,.55)}}
+.nv.grp{background:transparent;border-color:transparent;-webkit-backdrop-filter:none;backdrop-filter:none}
+.nv.grp:hover{background:linear-gradient(90deg,rgba(150,215,255,.32),rgba(190,240,255,.1));border-color:rgba(200,240,255,.4)}
+.top{background:linear-gradient(135deg,rgba(255,255,255,.66),rgba(214,240,255,.38));-webkit-backdrop-filter:blur(18px) saturate(1.5);backdrop-filter:blur(18px) saturate(1.5);border:1px solid rgba(255,255,255,.8);box-shadow:0 8px 28px rgba(40,100,180,.16),inset 0 1px 0 rgba(255,255,255,.95)}
+.top .gs input{background:rgba(255,255,255,.55);border-color:rgba(255,255,255,.9)}
+.card,.hero{background:linear-gradient(135deg,rgba(255,255,255,.62),rgba(255,255,255,.28) 48%,rgba(255,255,255,.46));-webkit-backdrop-filter:blur(16px) saturate(1.5);backdrop-filter:blur(16px) saturate(1.5);border:1px solid rgba(255,255,255,.78);box-shadow:0 8px 30px rgba(31,90,170,.16),inset 0 1px 0 rgba(255,255,255,.95),inset 0 0 0 1px rgba(255,255,255,.18)}
+.hero{background:linear-gradient(120deg,rgba(255,255,255,.62),rgba(190,228,250,.36))}
+.card:hover{box-shadow:0 12px 36px rgba(31,110,210,.22),0 0 20px rgba(90,200,255,.22),inset 0 1px 0 rgba(255,255,255,.95)}
+.card>h2{background:linear-gradient(100deg,rgba(11,86,176,.86),rgba(21,150,214,.76) 58%,rgba(64,219,224,.7));-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);border-bottom:1px solid rgba(255,255,255,.55);text-shadow:0 1px 3px rgba(0,40,100,.35)}
+.card input,.card select,.card textarea,.modal input,.modal select{background:rgba(255,255,255,.58);border:1px solid rgba(255,255,255,.9);box-shadow:inset 0 1px 3px rgba(31,90,170,.1);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+.card input[readonly]{background:rgba(214,230,248,.6)}
+th{background:rgba(214,234,252,.6)}
+th,td{border-color:rgba(160,195,235,.45)}
+.tbl tbody tr td{background:rgba(255,255,255,.3)}
+.tbl tbody tr:nth-child(even) td{background:rgba(120,180,240,.14)}
+.detail,.tbl tbody tr:nth-child(even) td.detail{background:rgba(255,255,255,.52)}
+.ghost,.bar>button:not(.pri),.vact button:not(.pri),.acts button:not(.pri),.actions .l,.abtn .cx{background:rgba(255,255,255,.55);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+.item,.hist{background:rgba(255,255,255,.42);border-color:rgba(255,255,255,.85);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
+.bpbox{background:rgba(232,245,255,.5);border-color:rgba(255,255,255,.85);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
+.nt{background:rgba(255,255,255,.52);border-color:rgba(255,255,255,.85);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
+.nt.un{background:rgba(206,232,255,.66);border-color:rgba(110,175,240,.85)}
+.info{background:linear-gradient(135deg,rgba(227,241,253,.66),rgba(214,236,251,.44));border-color:rgba(255,255,255,.8)}
+.sum .gt{background:linear-gradient(135deg,rgba(190,225,252,.72),rgba(170,215,250,.5))}
+.umenu{background:rgba(255,255,255,.72);-webkit-backdrop-filter:blur(18px) saturate(1.5);backdrop-filter:blur(18px) saturate(1.5);border-color:rgba(255,255,255,.9)}
+.mfil{background:rgba(255,255,255,.58);border-color:rgba(255,255,255,.9);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
+.modal{background:rgba(10,30,70,.5);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+.modal .viewer{background:rgba(255,255,255,.8);-webkit-backdrop-filter:blur(18px) saturate(1.4);backdrop-filter:blur(18px) saturate(1.4);border:1px solid rgba(255,255,255,.9);box-shadow:0 20px 60px rgba(10,30,70,.4),inset 0 1px 0 rgba(255,255,255,.95)}
+.vpaper{background:rgba(207,214,224,.55);border-color:rgba(255,255,255,.8)}
+#toast{background:rgba(18,36,66,.8);-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.28);border-radius:12px;box-shadow:0 8px 28px rgba(10,30,70,.35)}
+@media(prefers-reduced-motion:reduce){.card:hover{transition:none}}
+/* ---- Form Buat PO: layout rapat tanpa ruang kosong & ukuran diperkecil ---- */
+.two .card{margin-bottom:12px;border-radius:16px;container-type:inline-size}
+.two .card>h2{height:40px;padding:0 16px;gap:9px;font-size:14.5px}
+.two .card>h2 svg{width:18px;height:18px}
+.two .card .body{padding:12px 14px}
+.two label{font-size:12px;margin-bottom:3px}
+.two .card .fld{margin-bottom:0}
+.two input,.two select,.two textarea{min-height:34px;padding:6px 10px;font-size:13px;border-radius:9px}
+.two .ifld input,.two .ifld textarea,.two .ifld select{padding-left:32px}
+.two .ifld .ico{left:9px;top:8px}.two .ifld .ico svg{width:16px;height:16px}
+.two .gi,.two .grid,.two .grid3{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px 12px;align-items:start}
+.two .gi .fld:nth-child(2){grid-column:span 2} /* Alamat: 2 kolom -> baris 1 = Nama, Alamat, Email; baris 2 = NPWP, Fax, PIC, Telepon */
+.two .body>div[style*="margin-bottom"]{margin-bottom:8px!important}
+.two .body>p{margin:6px 0 0}
+.two .item{padding:8px 10px;margin-bottom:8px;border-radius:12px;container-type:inline-size}
+.two .ihead{margin-bottom:4px}.two .ihead button{padding:2px 8px}
+.two .exs{margin:0 0 6px;gap:5px}.two .exs button{padding:0 9px;font-size:11.5px}
+.two .r1{grid-template-columns:repeat(4,minmax(0,1fr));gap:8px 10px;margin:0;align-items:start}
+.two .r1>.fld:first-child{grid-column:1/-1}
+.two .r2{display:contents}
+.two .pri,.two .actions button{padding:7px 14px;font-size:13px;border-radius:10px}
+.two .actions{margin-top:4px}
+@container (max-width:620px){
+  .two .gi,.two .grid,.two .grid3{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .two .gi .fld:nth-child(2){grid-column:auto}
+  .two .gi .fld:nth-child(7){grid-column:1/-1}
+}
+@container (max-width:380px){
+  .two .gi,.two .grid,.two .grid3{grid-template-columns:1fr}
+  .two .gi .fld:nth-child(7){grid-column:auto}
+}
+@container (max-width:460px){
+  .two .r1{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+.two{grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);gap:14px}
+.two>div>.card:last-child{margin-bottom:0}
+.two .hist{margin-top:6px}.two .hhead{padding:6px 10px}.two .hi{width:34px;height:34px;border-radius:10px}.two .hi svg{width:18px;height:18px}
+.two .hhead .ht b{font-size:13px}.two .hhead small{font-size:11.5px}
+.two .kvi>div{padding:5px 2px}.two .sum>div{padding:6px 4px}.two .sum .gt{padding:8px 12px;font-size:15px}.two .sum .gt span:last-child{font-size:19px}
+.two .info{padding:8px 10px;margin-bottom:8px}
+.two .actions{padding-bottom:0}
+.two .fold .fhead{padding:10px 14px;font-size:13.5px}
+.two .fold textarea{min-height:60px}
+@media(max-width:1100px){.two{grid-template-columns:1fr}}
+.dpf{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:end}.dpf .fld{margin:0}.dpf .acts{padding-bottom:1px}
+@media(max-width:700px){.dpf{grid-template-columns:1fr}}
+
+/* ---- Modal Ganti Password: tema login (biru glass, ornamen mewah) ---- */
+.pwbox.lux{position:relative;overflow:hidden;width:380px;max-width:92vw;padding:24px 26px 18px;border-radius:22px;color:#fff;
+  background:radial-gradient(120% 55% at 0% 100%,rgba(45,226,230,.6),transparent 62%),radial-gradient(90% 40% at 100% 0%,rgba(120,190,255,.38),transparent 60%),linear-gradient(180deg,rgba(10,58,142,.86) 0%,rgba(11,95,186,.78) 50%,rgba(18,149,214,.72) 100%);
+  -webkit-backdrop-filter:blur(20px) saturate(1.6);backdrop-filter:blur(20px) saturate(1.6);
+  border:1px solid rgba(255,255,255,.5);
+  box-shadow:0 24px 60px rgba(4,16,48,.55),0 0 34px rgba(125,200,255,.35),inset 0 1px 0 rgba(255,255,255,.55),inset 0 0 0 1px rgba(255,255,255,.08)}
+.pwbox.lux>*{position:relative;z-index:1}
+.pwbox.lux .pworn{position:absolute;inset:0;width:100%;height:100%;z-index:0;pointer-events:none}
+.pwbox.lux .sheen{position:absolute;top:-20%;bottom:-20%;left:0;width:45%;z-index:2;pointer-events:none;opacity:0;background:linear-gradient(105deg,transparent 0%,rgba(255,255,255,0) 30%,rgba(255,255,255,.45) 50%,rgba(255,255,255,0) 70%,transparent 100%);transform:translateX(-130%) skewX(-18deg);animation:sweep 1.1s ease-in-out .25s both}
+.pwhead{text-align:center;margin-bottom:12px}
+.pwlock{width:54px;height:54px;margin:0 auto 8px;border-radius:50%;display:grid;place-items:center;color:#fff;background:linear-gradient(145deg,rgba(255,255,255,.34),rgba(120,200,255,.16));border:1px solid rgba(220,242,255,.8);box-shadow:0 6px 20px rgba(4,20,70,.45),0 0 0 6px rgba(255,255,255,.07),0 0 0 12px rgba(255,255,255,.04),inset 0 1px 0 rgba(255,255,255,.7)}
+.pwbox.lux h3{margin:0;color:#fff;font-size:20px;font-weight:800;letter-spacing:.3px;text-shadow:0 1px 2px rgba(0,20,60,.5)}
+.pwbox.lux .pwhead p{margin:3px 0 0;font-size:12px;color:#e0f1ff}
+.pwdiv{display:flex;align-items:center;gap:8px;margin:12px 18px 0}
+.pwdiv i{flex:1;height:1px;background:linear-gradient(90deg,transparent,rgba(210,238,255,.8),transparent)}
+.pwdiv em{width:7px;height:7px;transform:rotate(45deg);background:linear-gradient(135deg,#e9f7ff,#6fc6ff);box-shadow:0 0 10px rgba(150,220,255,.9)}
+.pwbox.lux label{color:#fff;font-weight:600;font-size:12px;margin-bottom:3px;text-shadow:0 1px 2px rgba(0,20,60,.45)}
+.pwbox.lux .fld{margin-bottom:8px}
+.pwbox.lux input:not([type=checkbox]){min-height:36px;padding:7px 12px;font-size:13px;border-radius:10px;color:#fff;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.5);box-shadow:inset 0 1px 3px rgba(0,30,90,.25);-webkit-backdrop-filter:none;backdrop-filter:none}
+/* Isian ganti password model embos ke dalam (lubang) yang sama dengan login/daftar */
+.pwbox.lux input:not([type=checkbox]){background:rgba(2,18,56,.62);border:1px solid rgba(0,0,0,.45);box-shadow:inset 0 4px 12px rgba(0,0,0,.55),inset 0 -1px 0 rgba(255,255,255,.14)}
+.pwbox.lux input:-webkit-autofill{-webkit-text-fill-color:#fff;caret-color:#fff;box-shadow:0 0 0 100px rgba(2,18,56,.95) inset}
+.pwbox.lux input:not([type=checkbox]):focus{outline:2px solid rgba(255,255,255,.9);outline-offset:1px;border-color:#d4f0ff}
+.pwbox.lux input::placeholder{color:rgba(215,238,255,.7)}
+.pwbox.lux .pwshow{display:flex;align-items:center;gap:8px;color:#e8f4ff;font-size:12px;font-weight:500;margin:2px 0 8px}
+.pwbox.lux .pwshow input{width:15px;height:15px;min-height:0;padding:0;margin:0;accent-color:#3da0ff}
+.pwstr{display:flex;align-items:center;gap:8px;margin-top:5px}
+.pwstr .bars{display:flex;gap:4px;flex:1;height:auto;align-items:center}.pwstr .bars i{flex:1;height:4px;border-radius:3px;background:rgba(255,255,255,.22)}
+.pwstr .bars i.on{background:#ff7a86}.pwstr .bars i.on.s2{background:#ffc94d}.pwstr .bars i.on.s3{background:#6fe3a8}.pwstr .bars i.on.s4{background:#3fe0c8;box-shadow:0 0 8px rgba(63,224,200,.8)}
+.pwstr small{color:#e8f4ff;font-size:11px;min-width:64px;text-align:right}
+.pwdesc{font-size:11px;line-height:1.5;margin:2px 0 8px;color:var(--mute)}
+.pwbox.lux .pwdesc{color:#e8f4ff}
+/* Legenda 4 level model embos ke dalam (lubang): kotak cekung, level aktif dibingkai warnanya */
+.pwlegend{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:6px 0 10px;padding:10px;border-radius:14px;background:rgba(3,20,60,.06);box-shadow:inset 0 2px 8px rgba(3,20,60,.18),inset 0 -1px 0 rgba(255,255,255,.6)}
+.pwlegend>div{border-radius:10px;padding:8px}
+.pwlegend b{display:block;font-size:11px;margin-bottom:3px}
+.pwlegend small{display:block;font-size:10px;line-height:1.4;color:var(--mute)}
+.pwbox.lux .pwlegend{background:rgba(0,10,35,.35);box-shadow:inset 0 3px 12px rgba(0,0,0,.55),inset 0 -1px 0 rgba(255,255,255,.10)}
+.pwbox.lux .pwlegend small{color:#cfe8ff}
+.pwerr{margin:0 0 8px;padding:7px 10px;border-radius:10px;font-size:12px;font-weight:600;color:#fff;background:rgba(190,30,50,.5);border:1px solid rgba(255,170,180,.7)}
+.pwbox.lux .acts{margin-top:4px;gap:8px}
+.pwbox.lux .acts .pri{flex:1;justify-content:center;padding:9px 14px;color:#fff;font-weight:700;background:linear-gradient(90deg,#17a9ee,#40e2ee);border:1px solid rgba(255,255,255,.75);box-shadow:0 0 18px rgba(90,225,255,.55),inset 0 1px 0 rgba(255,255,255,.65)}
+.pwbox.lux .acts .pwcancel{padding:9px 16px;color:#fff;font-weight:600;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.45);-webkit-backdrop-filter:none;backdrop-filter:none}
+.pwbox.lux .acts button:hover{filter:brightness(1.12)}
+.thm .thact{display:flex;gap:6px;align-items:center;margin-top:2px}
+.thm .thact button{padding:2px 10px;font-size:11.5px;font-weight:600;line-height:1.4;border-radius:9px;white-space:nowrap;display:inline-flex;align-items:center;gap:4px}
+.thm .thact .back{color:#0b3a8e;background:#fff;border:1px solid #fff}
+.thm .thact .back:disabled{opacity:.45;color:#0b3a8e}
+.thm .thact .ghost:disabled{opacity:.45}
+/* ---- Font: judul Plus Jakarta Sans, isi Inter, halaman login Poppins ---- */
+.hero h1,.card>h2,.ttl b,.dh h3,.tl1 b,.drill .drttl b,.pwbox.lux h3,.thm b,.pwbox h3{font-family:"Plus Jakarta Sans",Inter,"Segoe UI",system-ui,sans-serif;letter-spacing:-.01em}
+.hero h1{font-weight:800;font-size:21px;letter-spacing:-.015em}
+.card>h2{font-weight:700;font-size:16.5px}
+.auth,.auth input,.auth select,.auth button,.auth label{font-family:Poppins,Inter,"Segoe UI",system-ui,sans-serif}
+.auth .face h1{font-family:Poppins,Inter,sans-serif;font-weight:700;letter-spacing:.2px}
+/* Foto background login ikut berwarna sesuai tema admin (lapisan warna, luminositas foto tetap) */
+.authtint{position:absolute;inset:0;z-index:1;pointer-events:none;mix-blend-mode:color;opacity:.7;background:linear-gradient(135deg,#0a3a8e,#1b6fd1 50%,#40e2ee)}
+
+/* ---- Dashboard: glass berlapis seperti desain referensi ---- */
+.dash .dhead{display:flex;align-items:center;gap:14px;margin:2px 0 14px;flex-wrap:wrap}
+.dhic{width:50px;height:50px;border-radius:14px;display:grid;place-items:center;color:#1e6fd0;background:linear-gradient(145deg,rgba(255,255,255,.9),rgba(170,210,250,.65));border:1px solid rgba(255,255,255,.9);box-shadow:0 8px 20px rgba(31,90,170,.22),inset 0 1px 0 #fff}
+.dht{flex:1;min-width:220px}
+.dht h2{margin:0;font-family:"Plus Jakarta Sans",Inter,sans-serif;font-size:25px;font-weight:800;letter-spacing:-.02em;color:#0d2a57;line-height:1.1}
+.dht p{margin:3px 0 0;color:#40587f;font-size:13px}
+.dper,.dupd{display:flex;align-items:center;gap:8px;height:42px;padding:0 14px;border-radius:14px;color:#27487c;font-weight:600;font-size:13px;margin:0;
+  background:linear-gradient(135deg,rgba(255,255,255,.78),rgba(255,255,255,.4));-webkit-backdrop-filter:blur(14px) saturate(1.5);backdrop-filter:blur(14px) saturate(1.5);border:1px solid rgba(255,255,255,.9);box-shadow:0 6px 18px rgba(31,90,170,.14),inset 0 1px 0 #fff}
+.dper select{border:0;background:transparent;min-height:0;height:30px;width:auto;padding:0 2px;appearance:none;-webkit-appearance:none;font-weight:700;font-size:13px;color:#12315f;cursor:pointer;box-shadow:none}
+.dper select:focus{outline:none}
+.dper .dsel{display:flex;align-items:center;gap:4px;margin:0;padding:0 0 0 10px;border-left:1px solid rgba(39,72,124,.18)}
+.dper .dsel:first-of-type{border-left:0;padding-left:0}
+.dupd{gap:10px}.dupd small{display:block;font-size:10.5px;color:var(--mute);font-weight:500;line-height:1.1}.dupd b{display:block;font-size:12.5px;color:#12315f;line-height:1.2}
+.dash .kpi{overflow:hidden;border-radius:22px;padding:16px 16px;min-height:104px;border:1px solid rgba(255,255,255,.85);
+  box-shadow:0 12px 30px rgba(31,90,170,.2),inset 0 1px 0 rgba(255,255,255,.9),inset 0 0 0 1px rgba(255,255,255,.2)}
+.dash .kpi::before{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;background:linear-gradient(125deg,rgba(255,255,255,.55) 0%,rgba(255,255,255,.12) 38%,rgba(255,255,255,0) 60%)}
+.dash .kpi .kb,.dash .kpi .kic{position:relative;z-index:1}
+.dash .kic{width:48px;height:48px;border-radius:50%!important;border:1.5px solid rgba(255,255,255,.85);box-shadow:0 6px 16px rgba(20,60,130,.3),0 0 0 5px rgba(255,255,255,.18),inset 0 1px 0 rgba(255,255,255,.7)}
+.dash .kb small{font-weight:600;font-size:12.5px;color:#27406a}
+.dash .kb b{font-family:"Plus Jakarta Sans",Inter,sans-serif;font-weight:800;color:#0d2a57}
+.kbars{position:absolute;right:14px;bottom:12px;display:flex;align-items:flex-end;gap:4px;z-index:0}
+.kbars i{display:block;width:8px;border-radius:3px 3px 1px 1px;background:linear-gradient(180deg,var(--kc,rgba(255,255,255,.55)),rgba(255,255,255,.15))}
+.kbars i:nth-child(1){height:14px}.kbars i:nth-child(2){height:22px}.kbars i:nth-child(3){height:31px}.kbars i:nth-child(4){height:42px}
+.dash .k1{--kc:rgba(255,255,255,.7);background:linear-gradient(135deg,rgba(20,100,225,.92),rgba(70,160,250,.7))}
+.dash .k1 .kb small,.dash .k1 .kb b,.dash .k1 .kd span{color:#fff}.dash .k1 .kic{background:rgba(255,255,255,.2)!important}
+.dash .k1 .kd em.good{color:#9dffc8}.dash .k1 .kd em.bad{color:#ffc0c6}
+.dash .k2{--kc:rgba(240,150,20,.7);background:linear-gradient(135deg,rgba(255,196,80,.62),rgba(255,235,200,.45))}
+.dash .k3{--kc:rgba(22,162,99,.6);background:linear-gradient(135deg,rgba(80,215,150,.55),rgba(215,250,232,.45))}
+.dash .k4{--kc:rgba(224,53,70,.55);background:linear-gradient(135deg,rgba(255,130,142,.55),rgba(255,222,226,.45))}
+.dash .k5{--kc:rgba(125,90,235,.6);background:linear-gradient(135deg,rgba(190,170,255,.58),rgba(236,230,255,.48))}
+.dash .dcard{border-radius:22px;border:1px solid rgba(255,255,255,.85);
+  background:linear-gradient(135deg,rgba(255,255,255,.6),rgba(255,255,255,.22) 50%,rgba(255,255,255,.4));
+  box-shadow:0 12px 32px rgba(31,90,170,.16),inset 0 1px 0 rgba(255,255,255,.95),inset 0 0 0 1px rgba(255,255,255,.2)}
+.dash .dcard>.dh{position:relative;z-index:1}
+.dash .dcard::before{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;background:linear-gradient(125deg,rgba(255,255,255,.4) 0%,rgba(255,255,255,0) 42%)}
+.dash .dic{width:32px;height:32px;border-radius:50%;color:#1e6fd0;background:linear-gradient(145deg,#fff,rgba(176,213,250,.85));border:1px solid rgba(255,255,255,.95);box-shadow:0 3px 10px rgba(40,100,180,.28),0 0 0 4px rgba(255,255,255,.25)}
+.dash .dh h3{font-family:"Plus Jakarta Sans",Inter,sans-serif;font-size:14.5px;font-weight:700}
+.dash .dcard .tbl{border-radius:14px;border:1px solid rgba(255,255,255,.8);overflow:auto;background:rgba(255,255,255,.28)}
+.dash .dcard .dtbl{border-collapse:separate;border-spacing:0}
+.dash .dcard .dtbl th{background:linear-gradient(180deg,rgba(60,130,230,.34),rgba(120,180,245,.24));color:#0d2a57;font-weight:700;border-color:rgba(255,255,255,.7)}
+.dash .dcard .dtbl td{border-color:rgba(255,255,255,.7)}
+.dash .dcard .tbl tbody tr:nth-child(odd) td{background:rgba(255,255,255,.5)}
+.dash .dcard .tbl tbody tr:nth-child(even) td{background:rgba(190,220,250,.32)}
+.dpn{display:inline-flex;align-items:center;gap:8px}
+.dpi{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;color:#fff;background:linear-gradient(145deg,#3a96ee,#1a62c8);box-shadow:0 2px 8px rgba(30,90,170,.35);flex:none}
+.rk{display:inline-grid;place-items:center;width:20px;height:20px;border-radius:50%;margin-right:7px;font-size:11px;font-weight:800;color:#fff;background:linear-gradient(145deg,#3a96ee,#1a62c8);box-shadow:0 2px 6px rgba(30,90,170,.35);vertical-align:middle}
+.rk.g1{background:linear-gradient(145deg,#ffd45e,#f0a014)}.rk.g2{background:linear-gradient(145deg,#9fb6d4,#6d86aa)}.rk.g3{background:linear-gradient(145deg,#e8a874,#c0743a)}
+.dash .ell{max-width:190px}
+.trend .tt3{font-size:9.5px;font-weight:700;fill:#12315f}
+.dash .cseg button{border-radius:999px;padding:2px 16px}
+.dash .cb{height:11px;background:rgba(255,255,255,.55);box-shadow:inset 0 1px 2px rgba(31,90,170,.15)}
+.dash .donut{width:150px;height:150px}
+/* ---- Dashboard: Tren Nilai PO & Status Pengajuan PO (efek kaca pada chart) ---- */
+.dtop{grid-template-columns:minmax(0,1.18fr) minmax(0,1fr)}
+.dash .dh.big{padding:16px 18px 4px;gap:14px;align-items:center}
+.dash .dh.big .dic{width:52px;height:52px;border-radius:16px;color:#1d63d6;background:linear-gradient(145deg,#fff,rgba(176,213,250,.9));box-shadow:0 6px 16px rgba(40,100,180,.28),inset 0 1px 0 #fff,0 0 0 5px rgba(255,255,255,.28)}
+.dht2{min-width:0}.dht2 h3{margin:0}
+.dash .dh.big h3{font-size:clamp(17px,1.7vw,23px);font-weight:800;line-height:1.15}
+.dht2 p{margin:3px 0 0;font-size:12.5px;color:var(--mute)}
+.dh.big+.db{padding:8px 18px 18px}
+.lg2{display:flex;gap:18px;font-size:11.5px;color:#34496b;text-align:left}
+.lg2>span{display:flex;align-items:center;gap:7px;line-height:1.2}
+.lg2 em{font-style:normal;font-weight:600}
+.lg2 em small{display:block;color:var(--mute);font-weight:500;font-size:10.5px}
+.lg2 i{display:inline-block;width:18px;height:12px;border-radius:4px;background:linear-gradient(180deg,#cfe4ff,#9cc6f7);border:1px solid rgba(255,255,255,.9);flex:none}
+.lg2 i.ln{width:22px;height:2px;border:0;border-radius:2px;background:#1b4fbf;position:relative;overflow:visible}
+.lg2 i.ln::after{content:"";position:absolute;left:50%;top:50%;width:9px;height:9px;margin:-4.5px 0 0 -4.5px;border-radius:50%;background:#1b4fbf;border:2px solid #fff;box-sizing:border-box}
+.trend .ax{font-size:10px;fill:#5b6f90}.trend .axt{font-size:10.5px;font-weight:600;fill:#4d6285}
+.trend .bv{font-size:10px;font-weight:700}.trend .tt3{font-size:11px;font-weight:800;fill:#12315f}
+.trend .tshine{transform-box:fill-box;animation:tshine 7s 1.4s ease-in-out infinite}
+@keyframes tshine{0%,45%{transform:translateX(0) skewX(-18deg);opacity:0}52%{opacity:1}100%{transform:translateX(900px) skewX(-18deg);opacity:0}}
+.tstats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr)) minmax(0,1.3fr);margin-top:10px;border-radius:18px;border:1px solid rgba(255,255,255,.9);background:linear-gradient(135deg,rgba(255,255,255,.72),rgba(255,255,255,.3));box-shadow:inset 0 1px 0 #fff,0 4px 14px rgba(31,90,170,.08)}
+.ts{padding:12px 16px;border-right:1px solid rgba(150,190,235,.4);min-width:0}
+.ts:last-child{border-right:0}
+.ts .tl{display:flex;align-items:center;gap:8px;font-size:12.5px;color:#4d6285;font-weight:600}
+.ts .tl i{display:block;width:22px;height:4px;border-radius:2px;flex:none;background:repeating-linear-gradient(90deg,var(--c) 0 6px,transparent 6px 9px)}
+.ts b{display:block;font-size:clamp(15px,1.45vw,21px);font-weight:800;color:#0d2a57;margin:5px 0 1px;font-family:"Plus Jakarta Sans",Inter,sans-serif;white-space:nowrap}
+.ts small{font-size:11.5px;color:var(--mute)}
+.ts.tot{display:flex;align-items:center;gap:10px}
+.tico{width:42px;height:42px;border-radius:12px;display:grid;place-items:center;color:#1d63d6;background:linear-gradient(145deg,#fff,rgba(176,213,250,.85));box-shadow:0 3px 10px rgba(40,100,180,.22);flex:none}
+.ts .tb{display:block;min-width:0}.ts .tl2{display:block;font-size:12.5px;color:#4d6285;font-weight:600}
+.trfoot{display:flex;align-items:center;gap:9px;margin-top:10px;font-size:12px;color:#4d6285}
+.trfoot .ic{color:#1d63d6;flex:none}.trfoot b{color:#0f3d8f}
+.ppill{position:relative;display:inline-flex;align-items:center;gap:9px;height:40px;padding:0 14px;border-radius:14px;background:linear-gradient(135deg,#fff,rgba(235,244,255,.8));border:1px solid rgba(255,255,255,.95);box-shadow:0 4px 12px rgba(31,90,170,.14);color:#12315f;font-weight:600;font-size:13px;white-space:nowrap}
+.ppill select{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}
+.stwrap{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,1fr);gap:8px;align-items:center}
+.donut2{width:100%;height:auto;max-width:300px;display:block;margin:0 auto;filter:drop-shadow(0 10px 16px rgba(30,90,170,.2))}
+.donut2 .dn{font-family:"Plus Jakarta Sans",Inter,sans-serif;font-size:40px;font-weight:800;fill:#0d2a57;text-anchor:middle}
+.donut2 .dl{font-size:14px;fill:#5b6f90;text-anchor:middle}
+.donut2 .dp{font-size:13px;font-weight:800}.donut2 .dq{font-size:10.5px;fill:#5b6f90}
+.donut2 .dspin{transform-origin:150px 140px;animation:dspin 9s linear infinite}
+@keyframes dspin{to{transform:rotate(360deg)}}
+.stleg{list-style:none;margin:0;padding:4px 14px;border-radius:20px;border:1px solid rgba(255,255,255,.9);background:linear-gradient(135deg,rgba(255,255,255,.74),rgba(255,255,255,.34));box-shadow:inset 0 1px 0 #fff,0 6px 18px rgba(31,90,170,.1)}
+.stleg li{display:grid;grid-template-columns:14px minmax(0,1fr) auto 40px;gap:10px;align-items:center;padding:11px 0}
+.stleg li+li{border-top:1px solid rgba(150,190,235,.35)}
+.stleg .dot{width:14px;height:14px;border-radius:50%;box-shadow:0 2px 6px rgba(0,0,0,.18),inset 0 1px 1px rgba(255,255,255,.7)}
+.stleg .lt b{display:block;font-size:15px;color:#0d2a57;font-weight:700}
+.stleg .lt small{display:block;font-size:11px;color:var(--mute);line-height:1.25;margin-top:2px}
+.stleg .lv{text-align:right}.stleg .lv b{display:block;font-size:19px;font-weight:800;color:#0d2a57;line-height:1.1}
+.stleg .lv small{font-size:12px;color:var(--mute)}
+.stleg .lic{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;border:1px solid rgba(255,255,255,.95);box-shadow:0 3px 8px rgba(31,90,170,.12)}
+.sinfo{margin-top:12px;padding:12px 14px 14px;border-radius:20px;border:1px solid rgba(255,255,255,.9);background:linear-gradient(135deg,rgba(255,255,255,.68),rgba(255,255,255,.28));box-shadow:inset 0 1px 0 #fff,0 6px 18px rgba(31,90,170,.08)}
+.sinfo h4{display:flex;align-items:center;gap:9px;margin:0 0 10px;font-size:14px;color:#0d2a57}
+.sinfo h4 span{width:26px;height:26px;border-radius:8px;display:grid;place-items:center;color:#1d63d6;background:linear-gradient(145deg,#fff,rgba(176,213,250,.85));box-shadow:0 2px 6px rgba(40,100,180,.2)}
+.sgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr))}
+.sc{padding:2px 12px;border-right:1px solid rgba(150,190,235,.4);min-width:0}
+.sc:first-child{padding-left:0}.sc:last-child{border-right:0;padding-right:0}
+.sc .sh{display:flex;align-items:center;gap:8px;font-size:12px;color:#4d6285;font-weight:600;line-height:1.2}
+.sc .si{width:36px;height:36px;border-radius:11px;display:grid;place-items:center;color:#1d63d6;background:linear-gradient(145deg,#fff,rgba(176,213,250,.85));box-shadow:0 3px 8px rgba(40,100,180,.2);flex:none}
+.sc b{display:block;margin:8px 0 4px;font-size:clamp(15px,1.4vw,20px);font-weight:800;color:#0d2a57;font-family:"Plus Jakarta Sans",Inter,sans-serif;white-space:nowrap}
+.sc small{display:block;font-size:11px;color:var(--mute)}
+.chip{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:7px;font-size:11.5px;font-weight:700;font-style:normal;margin-right:6px}
+.chip.good{color:#12a05c;background:rgba(34,181,115,.16)}.chip.bad{color:#e03546;background:rgba(239,74,90,.14)}.chip.flat{color:#6b7c95;background:rgba(120,140,170,.16)}
+.pgb{display:block;height:9px;border-radius:6px;background:rgba(255,255,255,.7);box-shadow:inset 0 1px 2px rgba(31,90,170,.18);overflow:hidden;margin:2px 0 6px}
+.pgb i{display:block;height:100%;border-radius:6px;box-shadow:inset 0 1px 0 rgba(255,255,255,.5)}
+.ccols{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:34px}
+@media(max-width:1150px){.dtop{grid-template-columns:1fr}}
+@media(max-width:900px){.ccols{grid-template-columns:1fr}.tstats{grid-template-columns:1fr 1fr}.ts{border-bottom:1px solid rgba(150,190,235,.4)}.ts:nth-child(2n){border-right:0}.ts:nth-last-child(-n+2){border-bottom:0}}
+@media(max-width:620px){.stwrap{grid-template-columns:1fr}.sgrid{grid-template-columns:1fr}.sc,.sc:first-child,.sc:last-child{border-right:0;padding:8px 0;border-bottom:1px solid rgba(150,190,235,.4)}.sc:last-child{border-bottom:0}.dash .dh.big{flex-wrap:wrap}.dash .dh.big .dr{margin-left:0;flex:1 1 100%}}
+@media(prefers-reduced-motion:reduce){.trend .tshine,.donut2 .dspin{animation:none}.trend .tshine{opacity:0}}
+@media(max-width:700px){.dht h2{font-size:20px}}
+/* ---- Verifikasi User: kolom password simetris & tombol keterangan rapi ---- */
+/* Tabel Verifikasi User: ringkas agar muat satu layar tanpa scroll ke samping */
+.utbl{overflow-x:visible}
+.utbl table{width:100%;table-layout:auto}
+.utbl td,.utbl th{vertical-align:middle;white-space:normal;overflow-wrap:anywhere;padding:3px 9px;font-size:11px;line-height:1.15}
+.utbl th{font-size:10.5px;padding:5px 9px}
+.utbl td:nth-child(3),.utbl td:nth-child(5),.utbl td:nth-child(6),.utbl th:nth-child(3),.utbl th:nth-child(5),.utbl th:nth-child(6){white-space:nowrap}
+.utbl .tag{font-size:10px;padding:1px 8px;line-height:1.2}
+.utbl .pwcell{display:inline-flex;align-items:center;gap:4px}
+.utbl .pwcell code{display:inline-block;box-sizing:border-box;width:80px;height:17px;line-height:17px;padding:0 7px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;letter-spacing:1px;border-radius:9px}
+.utbl .pwcell code,.pwcell code{color:#fff!important;font-weight:600;background:linear-gradient(135deg,#0a3a8e,#0b5fba 55%,#1295d6)!important;border:1px solid rgba(255,255,255,.55);box-shadow:0 2px 8px rgba(10,60,140,.3),inset 0 1px 0 rgba(255,255,255,.35);text-shadow:0 1px 1px rgba(0,20,70,.45)}
+.utbl .pwcell .pweye{width:18px;height:18px;min-width:18px;padding:0;margin:0;display:inline-grid;place-items:center;border-radius:9px;color:#0f5fc0;background:linear-gradient(145deg,#fff,rgba(200,225,252,.85));border:1px solid rgba(15,95,192,.35);box-shadow:0 2px 6px rgba(30,90,170,.18),inset 0 1px 0 #fff;transition:transform .15s,box-shadow .2s,background .2s}
+.utbl .pwcell .pweye:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(30,90,170,.3);background:linear-gradient(135deg,#1e7fe0,#0f5fc0);color:#fff}
+.auth .face .eye{display:grid;place-items:center;padding:4px 7px}
+.utbl .actsel{height:18px;min-height:0;width:140px;max-width:100%;padding:0 20px 0 9px;border-radius:9px;font-size:10.5px;font-weight:700;cursor:pointer}.utbl .actsel:disabled{opacity:.55;cursor:not-allowed}
+.utbl .uact{display:flex;gap:6px;flex-wrap:nowrap}
+.utbl .uact button{width:96px;height:20px;padding:0 6px;justify-content:center;font-size:12px;font-weight:600;border-radius:14px}
+/* tabel kompak: Kategori Barang/Jasa & Data Supplier */
+.tbl.ctbl th,.tbl.ctbl td{padding:3px 10px;font-size:11.5px;line-height:1.2}
+.tbl.ctbl th{font-size:11px;padding:5px 10px}
+.tbl.ctbl .tag{font-size:10.5px;padding:1px 9px;line-height:1.25}
+.tbl.ctbl td:nth-child(2),.tbl.ctbl td:nth-child(4),.tbl.ctbl td:nth-child(5){min-width:150px}
+.tbl.ctbl .acts.sm button{padding:0 10px;font-size:11px;line-height:1.35;min-width:66px;height:20px}
+.tbl .bpt td,.tbl .bpt th{padding:3px 10px;line-height:1.2}
+.tbl .bpt th{font-size:11px;padding:5px 10px}
+.tbl .bpt td{font-size:12px}.bpt td:first-child b{font-size:12px}
+.tbl .bpt .bpst{font-size:11.5px;gap:5px}.bpt .bpst i{width:6px;height:6px}
+.tbl .bpt .acts.sm button{padding:0 10px;font-size:11px;line-height:1.35;min-width:66px;height:20px}
+.bpt .actsel{height:20px;min-height:0;width:140px;max-width:100%;padding:0 20px 0 9px;border-radius:9px;font-size:11px;font-weight:700;cursor:pointer}
+.thmw{position:relative;display:flex;align-items:center}
+.thm{position:absolute;right:-8px;top:40px;z-index:21;width:268px;padding:14px;border-radius:16px;display:flex;flex-direction:column;gap:8px;color:#fff;
+  background:radial-gradient(120% 55% at 0% 100%,rgba(45,226,230,.55),transparent 62%),linear-gradient(180deg,rgba(10,58,142,.9),rgba(11,95,186,.84) 55%,rgba(18,149,214,.8));
+  -webkit-backdrop-filter:blur(20px) saturate(1.6);backdrop-filter:blur(20px) saturate(1.6);border:1px solid rgba(255,255,255,.5);box-shadow:0 18px 44px rgba(5,30,90,.45),inset 0 1px 0 rgba(255,255,255,.5)}
+.thm b{font-size:14px}.thm p{margin:0;color:#e0f1ff;font-size:11.5px}.thm label{color:#fff;font-size:12px;margin:2px 0 0}
+.thm .sw{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:2px 0}
+.thm .sw button{height:34px;padding:0;border-radius:10px;border:2px solid rgba(255,255,255,.45);box-shadow:0 2px 8px rgba(0,20,70,.35);transition:transform .2s}
+.thm .sw button:hover{transform:translateY(-2px)}
+.thm .sw button.on{border-color:#fff;box-shadow:0 0 0 2px rgba(255,255,255,.55),0 0 14px rgba(255,255,255,.6)}
+.thm input[type=range]{padding:0;min-height:0;accent-color:#fff}
+.thm .ghost{align-self:flex-start;color:#fff;border-color:rgba(255,255,255,.6);background:rgba(255,255,255,.14)}
+.pwfoot{display:flex;align-items:center;justify-content:center;gap:6px;margin-top:12px;padding-top:9px;border-top:1px solid rgba(190,230,255,.28);font-size:10.5px;letter-spacing:.4px;color:#cfe8ff}
+@media(prefers-reduced-motion:reduce){.pwbox.lux .sheen{animation:none}}
+
+
+/* ---- Halaman Semua Pengajuan (admin) ---- */
+.ap-filter{border-radius:22px;margin-bottom:14px}
+.apf{display:grid;grid-template-columns:minmax(260px,1.6fr) minmax(150px,1fr) minmax(130px,.9fr) minmax(130px,.9fr) auto;gap:14px;align-items:end;padding:16px 18px}
+.apf-f{min-width:0}
+.apf-f label{display:block;font-weight:700;font-size:13px;color:#0d2a57;margin-bottom:6px}
+.apf-f select{min-height:42px;padding:8px 12px;font-size:13.5px}
+.ap-range{display:flex;align-items:center;gap:8px;min-height:42px;padding:0 12px;border-radius:12px;background:rgba(255,255,255,.58);border:1px solid rgba(255,255,255,.9);box-shadow:inset 0 1px 3px rgba(31,90,170,.1);color:#27406a;font-size:13.5px;white-space:nowrap}
+.ap-range .ic{flex:none;color:#4a5f86}
+.ap-range .ic:last-child{margin-left:auto}
+.ap-date{position:relative;cursor:pointer;margin:0;font-weight:500}
+.ap-date input{position:absolute;inset:0;width:100%;height:100%;min-height:0;padding:0;border:0;opacity:0;cursor:pointer}
+.apf-btns{display:flex;gap:10px}
+.apf-btns button{min-height:42px;padding:0 16px;border-radius:10px;font-size:13.5px;white-space:nowrap;display:inline-flex;align-items:center;justify-content:center;gap:7px;cursor:pointer}
+.ap-reset{background:rgba(255,255,255,.7);border:1px solid #9db7e8;color:#1f47b8;font-weight:600}
+.ap-kpi{min-width:0;gap:12px}
+.ap-kic{width:46px;height:46px;border-radius:14px;display:grid;place-items:center;flex:none;background:linear-gradient(145deg,#eef2ff,#d9e4ff);color:#3157d5;box-shadow:inset 0 1px 0 #fff,0 4px 10px rgba(49,87,213,.15);position:relative;z-index:1}
+.ap-kic .rpc{width:26px;height:26px;border-radius:50%;border:1.8px solid currentColor;display:grid;place-items:center;font-size:11px;font-weight:800}
+.ap-kb{min-width:0;display:flex;flex-direction:column;gap:3px;position:relative;z-index:1}
+.ap-kb small{font-size:12px;font-weight:600;color:#27406a;white-space:nowrap}
+.ap-kv{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.ap-kv b{font-family:"Plus Jakarta Sans",Inter,sans-serif;font-size:24px;line-height:1.1;font-weight:800;color:#0d2a57}
+.ap-kv b.sm{font-size:17px}
+.ap-bdg{font-style:normal;font-size:11px;font-weight:700;padding:2px 10px;border-radius:999px}
+.ap-bdg.b{background:#dbe7ff;color:#2f5bd6}.ap-bdg.y{background:#fff0c2;color:#8a5b00}
+.ap-dl{font-style:normal;font-size:11.5px;font-weight:700}
+.ap-dl.good{color:#16a263}.ap-dl.bad{color:#e03546}.ap-dl.flat{color:#6b7c99}
+.ap-ks{font-size:10.5px;color:#5b6f8c;white-space:nowrap}
+.ap-row{grid-template-columns:minmax(0,1.5fr) minmax(0,1fr)}
+@media(max-width:1000px){.ap-row{grid-template-columns:minmax(0,1fr)}.apf{grid-template-columns:repeat(2,minmax(0,1fr))}.apf-btns{grid-column:1/-1}}
+.ap-chart{position:relative;padding:8px 6px 4px 20px}
+.ap-yt{position:absolute;left:0;top:8px;height:190px;display:flex;align-items:center;justify-content:center;writing-mode:vertical-rl;transform:rotate(180deg);font-size:10.5px;color:#5b6f8c;white-space:nowrap}
+.ap-plot{display:grid;grid-template-columns:30px minmax(0,1fr);height:190px;padding-top:6px}
+.ap-yax{display:flex;flex-direction:column;justify-content:space-between;align-items:flex-end;padding-right:8px;margin:-6px 0;font-size:11px;line-height:12px;color:#4a5f86}
+.ap-area{position:relative;border-left:1px solid #c3d2ea}
+.ap-grid{position:absolute;left:0;right:0;height:0;border-top:1px dashed rgba(120,150,200,.35)}
+.ap-bars{position:absolute;inset:0;display:grid;grid-auto-flow:column;grid-auto-columns:1fr;align-items:end;padding:0 4px}
+.ap-col{height:100%;display:flex;align-items:flex-end;justify-content:center}
+.ap-col i{display:block;width:min(54%,46px);border-radius:4px 4px 0 0;position:relative;transform-origin:bottom;animation:apgrow .7s cubic-bezier(.2,.8,.2,1) both}
+.ap-col i b{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);margin-bottom:3px;font-size:12px;font-weight:700;color:#0d2a57}
+@keyframes apgrow{from{transform:scaleY(0)}to{transform:scaleY(1)}}
+.ap-xl{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;margin-left:30px;padding:6px 4px 0;font-size:11px;color:#27406a;text-align:center}
+.ap-xl span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:0 2px}
+.ap-top{font-size:13px;margin-top:2px}
+.ap-th,.ap-tr{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1.5fr) 24px;gap:12px;align-items:center;padding:8px 12px}
+.ap-th{background:rgba(214,226,248,.75);border-top:1px solid #cfdbef;border-bottom:1px solid #cfdbef;font-weight:700;color:#0d2a57}
+.ap-th span:nth-child(2){grid-column:2/4}
+.ap-tr{border-bottom:1px solid rgba(190,205,230,.45);color:#12284a}
+.ap-tr .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ap-tr .bt{display:block;height:11px}
+.ap-tr .bt i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,#3b4fe0,#5b78f2);transform-origin:left;animation:apgrowx .7s cubic-bezier(.2,.8,.2,1) both}
+@keyframes apgrowx{from{transform:scaleX(0)}to{transform:scaleX(1)}}
+.ap-tr .ct{text-align:right;font-weight:700}
+.ap-lim{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+@media(max-width:700px){.ap-lim{grid-template-columns:minmax(0,1fr)}}
+.ap-limc{text-align:left;cursor:pointer;display:flex;flex-direction:column;gap:4px;padding:14px 18px;border:2px solid transparent;font:inherit}
+.ap-limc small{font-size:12.5px;font-weight:700;color:#27406a}
+.ap-limv{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.ap-limv b{font-family:"Plus Jakarta Sans",Inter,sans-serif;font-size:26px;line-height:1.1;font-weight:800;color:#0d2a57}
+.ap-limv span{font-size:12px;color:#5b6f8c;font-weight:600}
+.ap-limv em{font-style:normal;font-weight:800;font-size:14px;color:#1f47b8;margin-left:auto}
+.ap-lims{font-size:11.5px;font-weight:700}
+.ap-limc.atas .ap-lims{color:#b42318}.ap-limc.bawah .ap-lims{color:#157347}
+.ap-limc.atas.on{border-color:#e0707a}.ap-limc.bawah.on{border-color:#5fbf8b}
+.ap-nl{display:inline-block;margin-top:4px;font-size:10.5px;font-weight:800;padding:2px 8px;border-radius:999px}
+.ap-nl.big{background:#fde8e8;color:#b42318}.ap-nl.sm{background:#e3f4ea;color:#157347}
+.ap-nl-n{font-size:10.5px;font-weight:700;color:#b42318;margin-top:3px;line-height:1.3;max-width:170px;white-space:normal}
+.ap-exp{display:inline-flex;align-items:center;gap:7px;padding:7px 14px;border-radius:10px;border:1px solid #9db7e8;background:rgba(255,255,255,.7);color:#1f47b8;font-weight:600;font-size:13px;cursor:pointer}
+.ap-tbl{width:100%;border-collapse:collapse}
+.ap-tbl th,.ap-tbl td{padding:9px 10px;font-size:12.5px;text-align:left;vertical-align:middle;border-bottom:1px solid rgba(190,205,230,.5);color:#12284a}
+.ap-tbl th{background:rgba(214,226,248,.75);color:#0d2a57;font-weight:700;white-space:nowrap}
+.ap-tbl .lnk{font-weight:700;text-decoration:underline;color:#1a47c8;font-size:12.5px;white-space:nowrap}
+.ap-tbl td.vd{min-width:130px;max-width:170px}.ap-tbl td.dp{min-width:110px;max-width:150px}.ap-tbl td.tt{white-space:nowrap}
+.ap-sort{background:none;border:0;padding:0;font:inherit;font-weight:700;color:inherit;cursor:pointer;display:inline-flex;gap:5px;align-items:center}
+.ap-sa{font-size:11px;color:#5b6f8c}
+.ap-act{display:flex;gap:8px;align-items:center}
+.ap-det{background:linear-gradient(135deg,#2a52e0,#1e3fc0);color:#fff;border:0;border-radius:8px;padding:7px 16px;font-weight:600;font-size:12.5px;cursor:pointer;box-shadow:0 3px 8px rgba(30,63,192,.3)}
+.ap-dots{width:34px;height:30px;border-radius:8px;border:1px solid #c5d3ee;background:rgba(255,255,255,.7);color:#27406a;font-weight:800;letter-spacing:1px;cursor:pointer;line-height:1;padding:0}
+.ap-mask{position:fixed;inset:0;z-index:70}
+.ap-menu{position:fixed;z-index:71;min-width:172px;padding:6px;border-radius:12px;background:#fff;border:1px solid #d3e2f2;box-shadow:0 14px 34px rgba(20,50,110,.25);display:flex;flex-direction:column}
+.ap-menu button{text-align:left;background:none;border:0;padding:8px 12px;border-radius:8px;font-size:13px;color:#12284a;cursor:pointer;font-family:inherit}
+.ap-menu button:hover{background:#eef4ff}.ap-menu button.cx{color:#b42318}
+@media(prefers-reduced-motion:reduce){.ap-col i,.ap-tr .bt i{animation:none}}
+
+/* ---- Nilai KPI mengecil otomatis agar angka penuh; info Supplier BP di tabel Semua Pengajuan ---- */
+.kpi>.kb{flex:1 1 0;min-width:0}
+.fitg{position:absolute;visibility:hidden;white-space:nowrap;pointer-events:none}
+.ap-tbl td.vd{min-width:170px;max-width:230px}
+.ap-bp{display:flex;align-items:center;gap:6px;margin-top:4px;font-size:11px;font-weight:700;line-height:1.3}
+.ap-bp i{width:7px;height:7px;border-radius:50%;background:currentColor;flex:none}
+.ap-bp.ak{color:#157347}.ap-bp.so{color:#8a5b00}.ap-bp.ex{color:#b42318}.ap-bp.na{color:#6b7c99;font-weight:600}
+
+/* ---- Notifikasi penolakan PO & Kirim Ulang ---- */
+.nt.rj{border-color:rgba(224,53,70,.45)}
+.nt.rj .nti{background:#fde8e8;color:#b42318}
+.ntt small.ntr{display:block;margin-top:3px;color:#b42318;font-weight:600}
+.ntact{margin:-2px 0 10px 46px}
+.ntact .pri{padding:6px 14px;font-size:12.5px}
+
+/* ---- Tombol Cetak PO user: abu-abu + tooltip sebelum di-approve admin ---- */
+.tipw{position:relative;display:inline-flex}
+.tipw::after{content:attr(data-tip);position:absolute;bottom:calc(100% + 8px);left:50%;transform:translateX(-50%) translateY(4px);background:#14243d;color:#fff;font-size:12px;font-weight:600;padding:6px 10px;border-radius:8px;white-space:nowrap;opacity:0;pointer-events:none;transition:opacity .15s,transform .15s;z-index:30;box-shadow:0 6px 16px rgba(10,25,60,.3)}
+.tipw::before{content:"";position:absolute;bottom:calc(100% + 3px);left:50%;transform:translateX(-50%);border:5px solid transparent;border-top-color:#14243d;border-bottom:0;opacity:0;transition:opacity .15s;z-index:30;pointer-events:none}
+.tipw:hover::after,.tipw:focus-within::after{opacity:1;transform:translateX(-50%) translateY(0)}
+.tipw:hover::before,.tipw:focus-within::before{opacity:1}
+button.off,.ghost.off,.vact button.off{background:#d5dae3!important;color:#7d8798!important;border:1px solid #c3cad6!important;cursor:not-allowed!important;box-shadow:none!important;-webkit-backdrop-filter:none!important;backdrop-filter:none!important}
+
+/* ---- Semua Pengajuan: kartu & filter menyesuaikan ukuran font otomatis ---- */
+.fitbox{width:100%;min-width:0;overflow:hidden}
+.fitin{width:max-content;white-space:nowrap}
+.ap-kb{flex:1 1 0;min-width:0}
+.ap-kv{flex-wrap:nowrap;width:max-content}
+.ap-kv b.sm{font-size:24px}
+.ap-filter{container-type:inline-size}
+@media(min-width:1001px){.apf{grid-template-columns:minmax(0,1.7fr) minmax(0,1fr) minmax(0,.9fr) minmax(0,.9fr) auto}}
+.apf{gap:clamp(8px,1.1cqw,14px);padding:clamp(10px,1.2cqw,16px) clamp(10px,1.4cqw,18px)}
+.apf-f label{font-size:clamp(11px,1.05cqw,13px)}
+.apf-f select,.ap-range{font-size:clamp(11px,1.1cqw,13.5px);min-width:0}
+.apf-f select{padding-left:clamp(8px,1cqw,12px);padding-right:clamp(6px,.8cqw,10px);text-overflow:ellipsis}
+.ap-range{gap:clamp(4px,.6cqw,8px);padding:0 clamp(8px,1cqw,12px)}
+.ap-range>span{flex:none}
+.apf-btns{gap:clamp(6px,.8cqw,10px)}
+.apf-btns button{font-size:clamp(11px,1.1cqw,13.5px);padding:0 clamp(8px,1.1cqw,16px);gap:clamp(4px,.5cqw,7px)}
+
+/* ================= MODE HP & TABLET (Android / iPhone / iPad) =================
+   Tablet & HP: sidebar jadi drawer geser (tombol hamburger), form 1 kolom, tabel bisa digeser,
+   input 16px (iPhone tidak zoom sendiri saat mengetik), area sentuh min. 40px, aman dari notch/poni. */
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%;-webkit-tap-highlight-color:transparent}
+body{overflow-x:hidden}
+img,svg,video,canvas{max-width:100%}
+.burger,.sclose,.navmask{display:none}
+button,.nv,.bell,.mebtn{touch-action:manipulation}
+@media(max-width:900px){
+  body{background-attachment:scroll;min-height:100vh;min-height:100dvh}
+  .shell{min-height:100vh;min-height:100dvh}
+  .shell::before{display:none}
+  /* ---- sidebar = drawer ---- */
+  .navmask{display:block;position:fixed;inset:0;z-index:55;background:rgba(6,20,50,.55);-webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px);opacity:0;pointer-events:none;transition:opacity .25s ease}
+  .navmask.show{opacity:1;pointer-events:auto}
+  .side{position:fixed;top:0;left:0;bottom:0;height:auto;min-height:100vh;min-height:100dvh;width:min(84vw,300px);z-index:58;border-radius:0 24px 0 0;
+    padding:calc(14px + env(safe-area-inset-top)) 12px calc(16px + env(safe-area-inset-bottom)) calc(12px + env(safe-area-inset-left));
+    overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;
+    background:radial-gradient(120% 55% at 0% 100%,rgba(45,226,230,.8),transparent 62%),radial-gradient(90% 40% at 100% 0%,rgba(80,170,255,.35),transparent 60%),linear-gradient(180deg,#0a3a8e 0%,#0b5fba 50%,#1295d6 100%);
+    -webkit-backdrop-filter:none;backdrop-filter:none;
+    transform:translateX(-105%);visibility:hidden;transition:transform .3s cubic-bezier(.2,.8,.2,1),visibility 0s linear .3s}
+  .side.open{transform:none;visibility:visible;transition:transform .3s cubic-bezier(.2,.8,.2,1),visibility 0s;box-shadow:12px 0 40px rgba(5,25,70,.45)}
+  .sclose{display:grid;place-items:center;position:absolute;top:calc(10px + env(safe-area-inset-top));right:10px;width:36px;height:36px;padding:0;border-radius:50%;border:1px solid rgba(255,255,255,.45);background:rgba(255,255,255,.16);color:#fff}
+  .brand{padding-top:26px}
+  .navlist{flex-direction:column;flex-wrap:nowrap;gap:4px}
+  .nv{width:100%;padding:11px 12px;font-size:14px;min-height:42px}
+  .sep{display:block}.nv.grp{display:flex;padding:8px 12px}.sub{display:block}
+  .sub .nv{padding:10px 12px 10px 18px;font-size:13.5px}
+  .nv:hover>*:not(.bd),.nv:focus-visible>*:not(.bd){transform:none}
+  /* ---- konten & topbar ---- */
+  .main{padding:calc(8px + env(safe-area-inset-top)) calc(10px + env(safe-area-inset-right)) calc(24px + env(safe-area-inset-bottom)) calc(10px + env(safe-area-inset-left))}
+  .top{flex-wrap:wrap;gap:8px;padding:8px 10px;border-radius:16px}
+  .burger{display:grid;place-items:center;flex:none;width:40px;height:40px;padding:0;border-radius:12px;border:1px solid rgba(255,255,255,.9);background:rgba(255,255,255,.7);color:#12315f}
+  .ttl{flex:1;min-width:0}.ttl b,.ttl small{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sp{display:none}
+  .gs{order:5;flex:1 1 100%;max-width:none;margin:0}
+  .top .gs input{height:42px;min-height:42px;padding-left:38px}.top .gs .ico{top:12px}
+  .bell{padding:9px;display:grid;place-items:center}
+  .me{border-left:0;padding-left:0}.mn,.mebtn>.ic{display:none}.av{width:36px;height:36px}
+  .thmw{position:static}
+  .thm{position:absolute;left:0;right:0;top:calc(100% + 8px);width:auto;max-height:70vh;overflow-y:auto;z-index:70}
+  .umenu{top:46px;min-width:190px}.umenu button{padding:11px 12px;font-size:14px}
+  .crumb{flex-wrap:nowrap;overflow-x:auto;white-space:nowrap;margin:8px 4px 6px;font-size:12px;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+  .crumb::-webkit-scrollbar{display:none}.crumb>*{flex:none}
+  .hero{padding:10px 12px;gap:10px;min-height:56px}.hico{width:40px;height:40px}
+  .hero h1{font-size:18px}.hero p{font-size:12px}.wave{width:70%;opacity:.55}
+  .card{border-radius:16px;margin-bottom:14px}
+  .card>h2{height:auto;min-height:48px;padding:10px 14px;font-size:15.5px;line-height:1.25}
+  .body{padding:14px}.pad{padding:12px}
+  .fold .fhead{padding:12px 14px}
+  /* efek kaca diperingan supaya scroll tetap mulus di HP */
+  .card,.hero,.top,.modal .viewer{-webkit-backdrop-filter:blur(8px) saturate(1.2);backdrop-filter:blur(8px) saturate(1.2)}
+  /* ---- form & tombol ---- */
+  input:not([type=checkbox]):not([type=radio]):not([type=range]),select,textarea{font-size:16px!important;min-height:44px}
+  input[type=date],input[type=month],input[type=time],input[type=datetime-local]{display:block;min-width:0;max-width:100%}
+  .auth .face input,.auth .face select{min-height:42px}
+  .pri,.ghost,.actions button,.acts button,.vact button,.thm .thact button,.tabs button,.hhead{min-height:40px}
+  .acts.sm{flex-wrap:wrap}
+  .actions{flex-wrap:wrap}.actions button{flex:1 1 140px}.actions .l{margin-right:0;flex-basis:100%}
+  .kvi>div{flex-wrap:wrap}.kvi>div>span{width:auto;min-width:120px;white-space:normal}.kvi b{white-space:normal;flex-wrap:wrap}
+  .sum .gt{font-size:16px}.sum .gt span:last-child{font-size:20px}
+  .bar>select,.bar>input,.bar>.ifld{width:100%;flex:1 1 100%;min-width:0}
+  .ifld.grow{min-width:0;flex:1 1 100%}
+  .tedit{flex-wrap:wrap}.tedit input{flex:1 1 140px;min-width:0}
+  .stats{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}.stat{padding:14px}.stat b{font-size:21px}
+  /* ---- tabel: geser kiri-kanan dengan jari ---- */
+  .tbl{-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;scrollbar-width:thin}
+  .tbl table:not(.dtbl){min-width:600px}.tbl table.dtbl{min-width:420px}
+  th,td{padding:8px}
+  /* ---- dokumen PO / modal ---- */
+  .modal{padding:calc(8px + env(safe-area-inset-top)) 8px calc(8px + env(safe-area-inset-bottom))}
+  .modal .viewer{padding:12px;border-radius:14px}
+  .vbar{align-items:stretch}.vsel,.vinfo{min-width:0;flex:1 1 100%}.vact{width:100%}.vact button{flex:1 1 auto}
+  .vpaper{padding:8px}
+  .pwbox{margin-top:4vh}
+  #toast{bottom:calc(16px + env(safe-area-inset-bottom));z-index:90;width:max-content;max-width:calc(100vw - 24px);text-align:center}
+  /* ---- tracking, supplier, detail ---- */
+  .trkhead{flex-wrap:wrap}.tl2{align-items:flex-start}.tl li{gap:10px}
+  .drill .drstat{grid-template-columns:1fr 1fr}
+  .hhead .hi{width:40px;height:40px}
+}
+@media(max-width:700px){
+  /* ---- dashboard ---- */
+  .kpis{gap:10px}.kpi:last-child{grid-column:1/-1}
+  .dash .kpi{flex-direction:column;align-items:flex-start;gap:8px;padding:12px;min-height:0;border-radius:18px}
+  .dash .kic{width:38px;height:38px}
+  .kb{width:100%}.kb b{white-space:normal;overflow-wrap:anywhere;font-size:19px}.kpi:last-child .kb b{font-size:20px}
+  .dper{height:auto;min-height:42px;flex-wrap:wrap;padding-top:6px;padding-bottom:6px}.dash .dhead{gap:10px}.dht{min-width:0;flex:1 1 100%}.dht h2{font-size:21px}.mfil{margin-left:0}
+  .dash .donut{width:128px;height:128px}.dleg li{white-space:normal}
+  .dash .ell,.ell{max-width:130px}
+  .db{padding:6px 10px 12px}
+  .bars{height:180px;gap:6px}
+  .crow{grid-template-columns:minmax(60px,1fr) 1.3fr auto}
+  .r2{grid-template-columns:1fr 1fr}
+  /* ---- login: layar kecil ---- */
+  .auth{min-height:100vh;min-height:100dvh;padding:calc(14px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom))}
+  .auth .scene{max-width:min(340px,100%)}
+  .auth .authbox{padding:20px 18px}
+  .auth .orb.o3{display:none}.auth .orb.o1,.auth .orb.o2{width:320px;height:320px}
+  .auth::before,.auth::after{width:260px;height:260px}
+}
+@media(max-width:560px){
+  .bpf,.apf{grid-template-columns:1fr}
+  .apf-btns{grid-column:auto}
+  .r1{grid-template-columns:1fr 1fr}
+  .main{padding-left:calc(8px + env(safe-area-inset-left));padding-right:calc(8px + env(safe-area-inset-right))}
+  .card>h2{font-size:15px;gap:9px}
+  .dh h3{font-size:13.5px}
+  .tl li>i{width:26px;height:26px}.tl li::before{left:12px}
+}
+@media(max-width:360px){
+  .kpis{grid-template-columns:1fr}
+  .hero h1{font-size:16.5px}.hico{display:none}
+  .stats{grid-template-columns:1fr}
+}
+/* layar HP landscape yang pendek: drawer tetap bisa digulir */
+@media(max-height:480px) and (max-width:900px){.side{padding-top:calc(8px + env(safe-area-inset-top))}.brand{padding-top:4px}.sclose{top:6px}}
+/* perangkat sentuh: tidak ada efek hover yang "menempel" */
+@media(hover:none){.rowlink:hover .drlnk{transform:none}.nv:hover>*:not(.bd){transform:none}}
+
+/* ================= EFEK SIDEBAR: Active Indicator + Partikel Terhubung ================= */
+.side{overflow-x:hidden;isolation:isolate}
+.brand,.navlist,.sclose{position:relative;z-index:1}
+.sclose{position:absolute;z-index:2}
+/* Latar partikel terhubung (canvas) */
+.sidefx{position:absolute;left:0;top:0;width:100%;height:100%;z-index:0;pointer-events:none;filter:hue-rotate(var(--hd,0deg))}
+/* 3) Active Indicator Bar: garis vertikal bersinar di sisi kiri menu aktif (ikut meluncur bersama pill) */
+.navpill::before{content:"";position:absolute;left:-9px;top:16%;bottom:16%;width:4px;border-radius:0 5px 5px 0;
+  background:linear-gradient(180deg,#ffffff,#7ff3ff 55%,#3fc8ff);
+  box-shadow:0 0 8px 1px rgba(160,248,255,.95),0 0 20px 4px rgba(90,225,255,.65);animation:barGlow 2.2s ease-in-out infinite}
+@keyframes barGlow{0%,100%{opacity:.85;box-shadow:0 0 8px 1px rgba(160,248,255,.9),0 0 18px 3px rgba(90,225,255,.55)}50%{opacity:1;box-shadow:0 0 12px 2px rgba(190,252,255,1),0 0 28px 7px rgba(90,225,255,.8)}}
+@media(max-width:900px){
+  /* di HP pill disembunyikan, indikator dipasang langsung di menu aktif */
+  .nv.on::before{content:"";position:absolute;left:-12px;top:16%;bottom:16%;width:4px;border-radius:0 5px 5px 0;
+    background:linear-gradient(180deg,#ffffff,#7ff3ff 55%,#3fc8ff);box-shadow:0 0 8px 1px rgba(160,248,255,.95),0 0 20px 4px rgba(90,225,255,.65);animation:barGlow 2.2s ease-in-out infinite}
+}
+@media(prefers-reduced-motion:reduce){.navpill::before,.nv.on::before{animation:none}}
+/* ================= SIDEBAR DESKTOP: tertutup = ikon saja, melebar ke kanan saat kursor diarahkan ================= */
+.stop{display:contents}
+.spanel{display:contents}
+@media(min-width:901px){
+  .shell{display:block;padding-left:88px;transition:padding-left .32s cubic-bezier(.2,.8,.2,1)}
+  .shell.sidehov{padding-left:230px}
+  .shell>.side{position:fixed;top:0;left:0;bottom:0;height:100vh;min-height:100vh;min-height:100dvh;width:88px;z-index:40;padding:0;overflow:visible;display:flex;flex-direction:column;
+    border:0;border-radius:0;background:none;-webkit-backdrop-filter:none;backdrop-filter:none;box-shadow:none;
+    transition:width .32s cubic-bezier(.2,.8,.2,1)}
+  .shell>.side.hov{width:230px}
+  /* Pengaman: saat mengecil, kolom sidebar sendiri ikut biru sampai bawah (menyatu mulus dengan panel, karena kotak keduanya sama tinggi) */
+  .shell>.side:not(.hov){background:radial-gradient(120% 55% at 0% 100%,rgba(45,226,230,.8),transparent 62%),radial-gradient(90% 40% at 100% 0%,rgba(80,170,255,.35),transparent 60%),linear-gradient(180deg,#0a3a8e 0%,#0b5fba 50%,#1295d6 100%)}
+  /* bagian atas: warna sama dengan background dashboard (bukan biru) */
+  .shell>.side .stop{display:flex;flex:none;height:98px;align-items:center;justify-content:flex-start;padding:10px 10px 0;overflow:visible;position:relative;z-index:2;
+    background:transparent;transition:box-shadow .3s ease}
+  /* area logo: polos, ikut warna background dashboard (tanpa bayangan/kotak) */
+  .shell>.side .stop,.shell>.side.hov .stop{background:none;box-shadow:none;border:0;-webkit-backdrop-filter:none;backdrop-filter:none}
+  .shell>.side .brand{flex:none;width:210px;padding:0 4px}
+  .shell>.side .brand b{color:#0d2a57;white-space:nowrap}
+  .shell>.side .brand.nobox{background:transparent}
+  /* panel biru berisi menu */
+  .shell>.side .spanel{display:block;position:relative;flex:1;min-height:0;margin:0;padding:16px 10px 14px;overflow-y:auto;overflow-x:hidden;isolation:isolate;color:#fff;
+    border-radius:0 44px 0 0 / 0 64px 0 0;
+    background:radial-gradient(120% 55% at 0% 100%,rgba(45,226,230,.8),transparent 62%),radial-gradient(90% 40% at 100% 0%,rgba(80,170,255,.35),transparent 60%),linear-gradient(180deg,#0a3a8e 0%,#0b5fba 50%,#1295d6 100%);
+    box-shadow:20px 0 30px -18px rgba(10,60,140,.34);scrollbar-width:none;transition:box-shadow .3s ease}
+  .shell>.side .spanel::-webkit-scrollbar{display:none}
+  .shell>.side.hov .spanel{box-shadow:24px 0 34px -18px rgba(10,60,140,.42)}
+  /* brand (logo + teks) hanya tampil saat sidebar di-hover; saat mengecil, area atas melipat rapat */
+  .shell>.side .stop{transition:box-shadow .3s ease,height .32s cubic-bezier(.2,.8,.2,1),padding .32s cubic-bezier(.2,.8,.2,1)}
+  .shell>.side .brand{transition:opacity .22s ease}
+  .shell>.side:not(.hov) .stop{height:0;padding:0;overflow:hidden}
+  .shell>.side:not(.hov) .brand{opacity:0}
+  /* lipatan di tepi kanan panel saat sidebar mengecil (tanpa hover) */
+  .shell>.side:not(.hov) .spanel::before{content:"";position:absolute;top:0;right:0;width:34px;height:34px;pointer-events:none;z-index:2;
+    background:linear-gradient(225deg,transparent 49%,rgba(255,255,255,.55) 50%,rgba(255,255,255,.92) 100%);
+    border-radius:0 44px 0 14px;box-shadow:-3px 3px 8px rgba(3,20,60,.35)}
+  .shell>.side:not(.hov) .spanel::after{content:"";position:absolute;top:0;right:0;bottom:0;width:30px;pointer-events:none;z-index:0;
+    background:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,.20) 45%,rgba(2,18,55,.38) 100%);
+    border-radius:0 44px 0 0 / 0 64px 0 0}
+  /* menu: teks menyusut saat tertutup, tinggal ikon di tengah */
+  .shell>.side .navlist{padding:0;margin-top:0;transition:padding .32s cubic-bezier(.2,.8,.2,1)}
+  .shell>.side:not(.hov) .navlist{padding:0 7px}
+  .shell>.side .nv>span{overflow:hidden;white-space:nowrap;max-width:190px;opacity:1;
+    transition:opacity .22s ease .08s,max-width .32s cubic-bezier(.2,.8,.2,1),transform .25s cubic-bezier(.2,.8,.2,1)}
+  .shell>.side:not(.hov) .nv>span{max-width:0;opacity:0;transition-delay:0s}
+  .shell>.side .nv{transition:background .25s ease,border-color .25s ease,box-shadow .25s ease,color .25s ease,padding .32s cubic-bezier(.2,.8,.2,1),gap .32s ease}
+  .shell>.side:not(.hov) .nv{justify-content:center;gap:0;padding-left:0;padding-right:0}
+  .shell>.side:not(.hov) .nv:hover>*:not(.bd){transform:none}
+  .shell>.side:not(.hov) .nv.grp{display:none}
+  .shell>.side:not(.hov) .nv .bd{position:absolute;top:1px;right:9px;margin:0;min-width:15px;height:15px;font-size:9px;padding:0 3px}
+  .shell>.side:not(.hov) .sep{margin:7px 10px}
+  /* indikator menu aktif ikut menyempit */
+  .shell>.side:not(.hov) .navpill{left:7px;right:7px}
+  .shell>.side .navpill.go{transition:transform .28s cubic-bezier(.4,0,.2,1),height .28s cubic-bezier(.4,0,.2,1),left .32s cubic-bezier(.2,.8,.2,1),right .32s cubic-bezier(.2,.8,.2,1)}
+}
+@media(max-width:900px){
+  /* HP/tablet: drawer tetap seperti semula */
+  .stop{display:block}
+  .spanel{display:block;position:relative;flex:1;min-height:0}
+  .stop .brand b{color:#fff}
+}
+@media(prefers-reduced-motion:reduce){.shell>.side,.shell>.side *{transition:none!important}}
+
+/* ================= LOGIN & DAFTAR: neumorphic "embos ke dalam" (mengikuti gambar referensi) ================= */
+.auth .face{border-radius:34px;border:1px solid rgba(150,200,255,.5);padding:26px 24px 24px;
+  background:linear-gradient(160deg,rgba(40,100,215,calc(.62*var(--g,1) + .2)),rgba(16,58,150,calc(.55*var(--g,1) + .2)) 55%,rgba(26,84,190,calc(.6*var(--g,1) + .2)));
+  box-shadow:0 26px 60px rgba(2,14,48,.55),0 6px 14px rgba(2,14,48,.35),inset 0 2px 2px rgba(190,225,255,.55),inset 0 -3px 8px rgba(2,16,60,.55),inset 3px 0 6px rgba(150,200,255,.12),inset -3px 0 6px rgba(2,16,60,.25)}
+.auth .scene{max-width:360px}
+.auth .authbox{padding:26px 24px 24px;border-radius:34px}
+/* tray logo: palung di dalam kartu, berisi pil logo yang juga masuk ke dalam */
+.auth .logobox.alogo,.auth .logobox.alogo.videobox{background:linear-gradient(180deg,rgba(10,44,122,.55),rgba(20,70,170,.38));border:1px solid rgba(120,175,255,.28);border-radius:26px;padding:14px;margin:0 auto 12px;
+  box-shadow:inset 0 5px 12px rgba(2,14,52,.65),inset 0 -2px 4px rgba(150,200,255,.28),0 1px 0 rgba(170,215,255,.25)}
+.auth .logobox.alogo::before{display:none}
+.alogo .al-swap{width:100%;height:62px;border-radius:999px;background:linear-gradient(180deg,#0a2c78,#0d3a96);border:1px solid rgba(110,165,255,.3);
+  box-shadow:inset 0 4px 10px rgba(1,10,40,.75),inset 0 -2px 3px rgba(130,185,255,.22);overflow:hidden}
+.alogo .al-video{border-radius:999px;box-shadow:none;background:transparent}
+.alogo .al-sweep{border-radius:999px}
+/* logo asli berlatar putih -> dibalik agar tampil terang di atas pil biru tua (latar hitam dihilangkan oleh blend screen) */
+.auth .logobox.alogo .al-swap .al-logo{width:auto;height:84%;max-width:92%;inset:0;margin:auto;filter:invert(1) hue-rotate(180deg) brightness(1.15) blur(10px);mix-blend-mode:screen}
+.auth .logobox.alogo .al-swap.is-logo .al-logo{filter:invert(1) hue-rotate(180deg) brightness(1.15)}
+/* judul + garis cahaya */
+.auth .face h1{font-size:25px;font-weight:700;margin:4px 0 0;letter-spacing:.2px;text-shadow:0 2px 6px rgba(1,10,40,.55)}
+.auth .face>p.mute{font-size:14px;letter-spacing:.8px;margin:2px 0 4px;color:#e8f2ff;font-weight:500}
+.auth .face>p.mute::after{content:"";display:block;height:2px;margin:12px 6% 6px;border-radius:2px;background:linear-gradient(90deg,transparent,#2f8cff 30%,#6fc4ff 50%,#2f8cff 70%,transparent);box-shadow:0 0 10px rgba(70,160,255,.9)}
+/* tab Masuk / Daftar: tray masuk ke dalam, tombol aktif timbul, tombol non-aktif ikut masuk */
+.auth .face .tabs{gap:8px;padding:6px;margin:6px 0 14px;border-radius:999px;background:linear-gradient(180deg,rgba(8,36,108,.7),rgba(18,64,160,.45));border:1px solid rgba(120,175,255,.3);
+  box-shadow:inset 0 5px 12px rgba(2,14,52,.65),inset 0 -2px 4px rgba(150,200,255,.28)}
+.auth .face .tabs button{display:flex;align-items:center;justify-content:center;gap:10px;padding:9px 12px;font-size:14px;font-weight:600;border-radius:999px;color:rgba(200,225,255,.78);
+  background:rgba(4,26,88,.55);border:1px solid rgba(110,165,255,.18);box-shadow:inset 0 3px 7px rgba(1,10,40,.6),inset 0 -1px 2px rgba(140,190,255,.2)}
+.auth .face .tabs .on{color:#fff;background:linear-gradient(180deg,#2f8cff,#0a54d8);border:1px solid rgba(190,225,255,.7);
+  box-shadow:0 5px 14px rgba(0,40,140,.55),0 0 16px rgba(60,150,255,.55),inset 0 1px 1px rgba(255,255,255,.7),inset 0 -2px 4px rgba(0,30,110,.45)}
+/* label & isian */
+.auth .face label{font-size:14px;font-weight:700;margin:2px 0 6px 2px;text-shadow:0 1px 3px rgba(1,10,40,.55)}
+.auth .fld{margin-bottom:12px}
+.auth .face input,.auth .face select{min-height:46px;padding:10px 16px;font-size:14.5px;border-radius:18px;color:#fff;
+  background:linear-gradient(180deg,rgba(4,24,84,.82),rgba(10,44,122,.62));border:1px solid rgba(120,175,255,.32);
+  box-shadow:inset 0 5px 12px rgba(1,10,40,.7),inset 0 -2px 3px rgba(150,200,255,.25),0 1px 0 rgba(170,215,255,.22)}
+.auth .face input:focus,.auth .face select:focus{border-color:rgba(150,205,255,.7);outline:0;
+  box-shadow:inset 0 5px 12px rgba(1,10,40,.7),inset 0 -2px 3px rgba(150,200,255,.3),0 0 0 3px rgba(70,160,255,.35),0 0 14px rgba(70,160,255,.55)}
+.auth .fin,.auth .pw{position:relative}
+.auth .fin input,.auth .pw input{padding-left:46px}
+.auth .pw input{padding-right:46px}
+.auth .fic{position:absolute;left:15px;top:50%;transform:translateY(-50%);display:grid;place-items:center;color:rgba(200,225,255,.9);pointer-events:none;z-index:1}
+.auth .face .eye{right:10px;color:rgba(215,235,255,.95)}
+.auth .face .info{border-radius:16px;border:1px solid rgba(120,175,255,.3);background:linear-gradient(180deg,rgba(4,24,84,.78),rgba(10,44,122,.55));box-shadow:inset 0 4px 10px rgba(1,10,40,.65),inset 0 -1px 2px rgba(150,200,255,.22)}
+/* tombol login: tray masuk ke dalam, tombol timbul di dalamnya */
+.auth .btntray{margin-top:16px;padding:12px;border-radius:30px;background:linear-gradient(180deg,rgba(8,36,108,.7),rgba(18,64,160,.42));border:1px solid rgba(120,175,255,.3);
+  box-shadow:inset 0 6px 14px rgba(2,14,52,.7),inset 0 -2px 4px rgba(150,200,255,.28)}
+.auth .face .pri.wide{width:100%;margin:0;min-height:52px;padding:12px 56px;font-size:17px;font-weight:700;border-radius:999px;border:1px solid rgba(190,225,255,.65);
+  background:linear-gradient(180deg,#2f8cff 0%,#0a56e0 55%,#0640b8 100%);
+  box-shadow:0 6px 16px rgba(0,36,130,.6),0 0 20px rgba(60,150,255,.5),inset 0 2px 2px rgba(255,255,255,.65),inset 0 -3px 6px rgba(0,30,110,.5)}
+.auth .face .pri.wide:hover:not(:disabled){filter:brightness(1.08)}
+.auth .face .pri.wide:active:not(:disabled){box-shadow:inset 0 5px 12px rgba(0,20,90,.7),inset 0 -1px 2px rgba(150,200,255,.3);transform:translateY(1px)}
+.auth .face .sbtn .sarrow{position:absolute;right:8px;top:50%;transform:translateY(-50%);width:36px;height:36px;border-radius:50%;display:grid;place-items:center;color:#fff;
+  background:radial-gradient(circle at 35% 30%,#2f7cff,#0b3fb8);border:1px solid rgba(180,215,255,.55);box-shadow:inset 0 3px 6px rgba(0,20,90,.65),inset 0 -1px 2px rgba(170,210,255,.45),0 0 10px rgba(60,150,255,.5)}
+.auth .face .sbtn.ok{background:linear-gradient(180deg,#34d27b,#128a47)}
+.auth .authbox p.foot{color:#dcecff}
+@media(max-width:480px){.auth .scene{max-width:min(360px,100%)}.auth .face,.auth .authbox{padding:22px 18px 20px}}
+
+/* ===== Kartu login diperpendek ~20%: tiap sisi setinggi isinya sendiri (tidak lagi ikut sisi Daftar yang lebih tinggi) + jarak dirapatkan ===== */
+.auth .face{align-self:center;padding:20px 22px 18px}
+.auth .authbox{padding:20px 22px 18px}
+.auth .logobox.alogo,.auth .logobox.alogo.videobox{padding:10px;margin-bottom:6px;border-radius:24px}
+.alogo .al-swap{height:50px}
+.auth .face h1{font-size:23px;margin-top:2px}
+.auth .face>p.mute{margin:0 0 2px;font-size:13px}
+.auth .face>p.mute::after{margin:8px 6% 4px}
+.auth .face .tabs{margin:4px 0 10px;padding:5px}
+.auth .face .tabs button{padding:7px 10px}
+.auth .face label{margin:0 0 4px 2px;font-size:13px}
+.auth .fld{margin-bottom:9px}
+.auth .face input,.auth .face select{min-height:42px;padding:8px 14px}
+.auth .fin input,.auth .pw input{padding-left:44px}
+.auth .btntray{margin-top:12px;padding:9px;border-radius:28px}
+.auth .face .pri.wide{min-height:46px;padding:9px 52px;font-size:16px}
+.auth .face .sbtn .sarrow{width:32px;height:32px}
+/* isian yang terisi otomatis oleh browser tetap timbul ke dalam (sebelumnya rata karena warna autofill menimpa bayangan) */
+.auth .face input:-webkit-autofill,.auth .face input:-webkit-autofill:hover,.auth .face input:-webkit-autofill:focus{-webkit-text-fill-color:#fff;caret-color:#fff;transition:background-color 9999s ease-out 0s;
+  box-shadow:inset 0 5px 12px rgba(1,10,40,.75),inset 0 -2px 3px rgba(150,200,255,.28),inset 0 0 0 100px #0a2468}
+.auth .face input,.auth .face select{box-shadow:inset 0 6px 14px rgba(1,10,40,.8),inset 0 -2px 3px rgba(150,200,255,.3),0 1px 0 rgba(170,215,255,.25)}
+@media(max-width:480px){.auth .face,.auth .authbox{padding:18px 16px 16px}}
+
+/* ===== Ganti Password: seluruh elemen model embos ke dalam, senada dengan login ===== */
+.pwbox.lux{border-radius:30px;border:1px solid rgba(150,200,255,.5);padding:24px 24px 20px;
+  background:linear-gradient(160deg,rgba(40,100,215,.88),rgba(16,58,150,.9) 55%,rgba(26,84,190,.88));
+  box-shadow:0 26px 60px rgba(2,14,48,.55),0 6px 14px rgba(2,14,48,.35),inset 0 2px 2px rgba(190,225,255,.55),inset 0 -3px 8px rgba(2,16,60,.55)}
+.pwbox.lux .pworn{opacity:.5}
+.pwbox.lux .pwlock{width:56px;height:56px;background:linear-gradient(180deg,rgba(8,36,108,.75),rgba(18,64,160,.5));border:1px solid rgba(120,175,255,.35);
+  box-shadow:inset 0 5px 10px rgba(1,10,40,.75),inset 0 -2px 3px rgba(150,200,255,.3),0 0 0 6px rgba(8,36,108,.28),0 0 0 7px rgba(130,185,255,.18)}
+.pwbox.lux h3{font-size:22px;text-shadow:0 2px 6px rgba(1,10,40,.55)}
+.pwbox.lux .pwdiv{margin:10px 6% 0}
+.pwbox.lux .pwdiv i{height:2px;border-radius:2px;background:linear-gradient(90deg,transparent,#2f8cff,#6fc4ff,#2f8cff,transparent);box-shadow:0 0 10px rgba(70,160,255,.8)}
+.pwbox.lux label{font-size:13px;font-weight:700;margin:0 0 4px 2px}
+.pwbox.lux .fld{margin-bottom:10px}
+.pwbox.lux input:not([type=checkbox]){min-height:42px;padding:9px 16px;font-size:14px;border-radius:18px;
+  background:linear-gradient(180deg,rgba(4,24,84,.82),rgba(10,44,122,.62));border:1px solid rgba(120,175,255,.32);
+  box-shadow:inset 0 6px 14px rgba(1,10,40,.8),inset 0 -2px 3px rgba(150,200,255,.3),0 1px 0 rgba(170,215,255,.25)}
+.pwbox.lux input:not([type=checkbox]):focus{outline:0;border-color:rgba(150,205,255,.7);box-shadow:inset 0 6px 14px rgba(1,10,40,.8),inset 0 -2px 3px rgba(150,200,255,.3),0 0 0 3px rgba(70,160,255,.35),0 0 14px rgba(70,160,255,.55)}
+.pwbox.lux input:-webkit-autofill,.pwbox.lux input:-webkit-autofill:focus{-webkit-text-fill-color:#fff;transition:background-color 9999s ease-out 0s;box-shadow:inset 0 5px 12px rgba(1,10,40,.75),inset 0 -2px 3px rgba(150,200,255,.28),inset 0 0 0 100px #0a2468}
+.pwbox.lux .pwshow{padding:8px 12px;border-radius:14px;background:linear-gradient(180deg,rgba(4,24,84,.7),rgba(10,44,122,.45));border:1px solid rgba(120,175,255,.25);box-shadow:inset 0 3px 8px rgba(1,10,40,.65),inset 0 -1px 2px rgba(150,200,255,.22);margin:4px 0 10px}
+.pwbox.lux .pwshow input{appearance:none;-webkit-appearance:none;width:18px;height:18px;border-radius:6px;padding:0;min-height:0;cursor:pointer;display:grid;place-items:center;
+  background:rgba(2,16,60,.85);border:1px solid rgba(120,175,255,.4);box-shadow:inset 0 3px 6px rgba(1,10,40,.8),inset 0 -1px 1px rgba(150,200,255,.3)}
+.pwbox.lux .pwshow input:checked{background:linear-gradient(180deg,#2f8cff,#0a54d8);border-color:rgba(190,225,255,.7)}
+.pwbox.lux .pwshow input:checked::after{content:"✓";color:#fff;font-size:12px;line-height:1;font-weight:700}
+.pwbox.lux .pwstr .bars{padding:5px 8px;border-radius:999px;background:rgba(2,16,60,.7);box-shadow:inset 0 3px 6px rgba(1,10,40,.75),inset 0 -1px 1px rgba(150,200,255,.25)}
+.pwbox.lux .pwerr{border-radius:16px;box-shadow:inset 0 4px 10px rgba(60,0,10,.5),inset 0 -1px 2px rgba(255,190,200,.3)}
+.pwbox.lux .acts{margin-top:8px;padding:9px;gap:9px;flex-wrap:nowrap;border-radius:28px;background:linear-gradient(180deg,rgba(8,36,108,.7),rgba(18,64,160,.42));border:1px solid rgba(120,175,255,.3);
+  box-shadow:inset 0 6px 14px rgba(2,14,52,.7),inset 0 -2px 4px rgba(150,200,255,.28)}
+.pwbox.lux .acts .pri{flex:1.4;min-height:44px;justify-content:center;font-size:15px;font-weight:700;border-radius:999px;border:1px solid rgba(190,225,255,.65);color:#fff;
+  background:linear-gradient(180deg,#2f8cff 0%,#0a56e0 55%,#0640b8 100%);box-shadow:0 6px 16px rgba(0,36,130,.6),0 0 18px rgba(60,150,255,.5),inset 0 2px 2px rgba(255,255,255,.65),inset 0 -3px 6px rgba(0,30,110,.5)}
+.pwbox.lux .acts .pwcancel{flex:1;min-height:44px;justify-content:center;font-size:14px;font-weight:600;border-radius:999px;color:rgba(210,230,255,.9);
+  background:rgba(4,26,88,.55);border:1px solid rgba(110,165,255,.2);box-shadow:inset 0 4px 9px rgba(1,10,40,.7),inset 0 -1px 2px rgba(140,190,255,.22)}
+.pwbox.lux .pwfoot{color:#cfe2ff}
+
+/* ===== Daftar: kartu sama tinggi dengan Masuk, isiannya yang dipadatkan ===== */
+.auth .face{align-self:stretch;justify-content:center}
+.auth .face.b{padding:14px 20px 14px}
+.auth .face.b .logobox.alogo,.auth .face.b .logobox.alogo.videobox{padding:10px;margin:0 auto 4px;border-radius:24px}
+.auth .face.b .alogo .al-swap{height:36px}
+.auth .face.b h1{font-size:19px;margin:0}
+.auth .face.b>p.mute{font-size:12px;margin:0}
+.auth .face.b>p.mute::after{margin:6px 6% 2px}
+.auth .face.b .tabs{margin:2px 0 8px;padding:4px}
+.auth .face.b .tabs button{padding:5px 10px;font-size:13px}
+.auth .face.b label{font-size:12px;margin:0 0 3px 2px}
+.auth .face.b .fld{margin-bottom:6px}
+.auth .face.b input,.auth .face.b select{min-height:36px;padding:6px 14px;font-size:13.5px;border-radius:16px}
+.auth .face.b .fin input,.auth .face.b .pw input{padding-left:42px}
+.auth .face.b .fic{left:14px}
+.auth .face.b .btntray{margin-top:8px;padding:7px;border-radius:24px}
+.auth .face.b .pri.wide{min-height:40px;padding:7px 20px;font-size:15px}
+.auth .face.b .info{padding:6px 10px;font-size:11.5px;margin-bottom:6px}
+.auth .face.b{padding:10px 20px 10px}
+.auth .face.b .alogo .al-swap{height:50px}
+.auth .face.b>p.mute{font-size:0;line-height:0;margin:0}
+.auth .face.b>p.mute::after{margin:7px 6% 4px}
+.auth .face.b .tabs{margin:0 0 6px}
+.auth .face.b .fld{margin-bottom:4px}
+.auth .face.b label{font-size:11.5px;margin:0 0 2px 2px}
+.auth .face.b input,.auth .face.b select{min-height:32px;padding:4px 14px}
+.auth .face.b .btntray{margin-top:5px;padding:5px}
+.auth .face.b .pri.wide{min-height:36px;padding-top:6px;padding-bottom:6px}
+
+/* ===== Efek kaca (glass): kartu Masuk, Daftar & Ganti Password tembus pandang + blur latar + kilap diagonal ===== */
+.auth .face{isolation:isolate;
+  background:linear-gradient(150deg,rgba(70,140,255,calc(.30*var(--g,1) + .10)),rgba(20,70,175,calc(.26*var(--g,1) + .10)) 50%,rgba(40,110,235,calc(.30*var(--g,1) + .10)));
+  -webkit-backdrop-filter:blur(20px) saturate(1.7) brightness(1.05);backdrop-filter:blur(20px) saturate(1.7) brightness(1.05);
+  border:1px solid rgba(200,230,255,.6);
+  box-shadow:0 26px 60px rgba(2,14,48,.5),0 6px 14px rgba(2,14,48,.3),inset 0 1.5px 1px rgba(255,255,255,.8),inset 0 -2px 6px rgba(2,16,60,.4),inset 1px 0 1px rgba(255,255,255,.35),inset -1px 0 1px rgba(255,255,255,.12)}
+.auth .face::before{content:"";position:absolute;inset:0;border-radius:inherit;z-index:-1;pointer-events:none;
+  background:linear-gradient(125deg,rgba(255,255,255,.34) 0%,rgba(255,255,255,.1) 22%,rgba(255,255,255,0) 40%,rgba(255,255,255,0) 68%,rgba(255,255,255,.16) 100%),radial-gradient(90% 38% at 15% 0%,rgba(255,255,255,.3),transparent 70%)}
+.pwbox.lux{isolation:isolate;
+  background:linear-gradient(150deg,rgba(70,140,255,.5),rgba(20,70,175,.46) 50%,rgba(40,110,235,.5));
+  -webkit-backdrop-filter:blur(22px) saturate(1.7) brightness(1.05);backdrop-filter:blur(22px) saturate(1.7) brightness(1.05);
+  border:1px solid rgba(200,230,255,.6);
+  box-shadow:0 26px 60px rgba(2,14,48,.5),0 6px 14px rgba(2,14,48,.3),inset 0 1.5px 1px rgba(255,255,255,.8),inset 0 -2px 6px rgba(2,16,60,.4),inset 1px 0 1px rgba(255,255,255,.35),inset -1px 0 1px rgba(255,255,255,.12)}
+.pwbox.lux::before{content:"";position:absolute;inset:0;border-radius:inherit;z-index:0;pointer-events:none;
+  background:linear-gradient(125deg,rgba(255,255,255,.34) 0%,rgba(255,255,255,.1) 22%,rgba(255,255,255,0) 40%,rgba(255,255,255,0) 68%,rgba(255,255,255,.16) 100%),radial-gradient(90% 38% at 15% 0%,rgba(255,255,255,.3),transparent 70%)}
+
+/* ===== Ganti Password: dipadatkan agar seluruh kartu muat dalam satu layar tanpa scroll ===== */
+.pwbox.lux{margin:auto;padding:16px 22px 12px;border-radius:28px;max-height:calc(100vh - 16px);max-height:calc(100dvh - 16px)}
+.pwbox.lux .pwhead{margin-bottom:6px}
+.pwbox.lux .pwlock{width:44px;height:44px;margin-bottom:5px}
+.pwbox.lux .pwlock svg{width:22px;height:22px}
+.pwbox.lux h3{font-size:19px}
+.pwbox.lux .pwhead p{font-size:11.5px;margin-top:2px}
+.pwbox.lux .pwdiv{margin:7px 6% 0}
+.pwbox.lux label{font-size:12px;margin:0 0 3px 2px}
+.pwbox.lux .fld{margin-bottom:7px}
+.pwbox.lux input:not([type=checkbox]){min-height:36px;padding:6px 14px;font-size:13.5px;border-radius:16px}
+.pwbox.lux .pwstr{margin-top:5px}
+.pwbox.lux .pwdesc{font-size:10.5px;line-height:1.35;margin:3px 0 4px}
+.pwbox.lux .pwlegend{gap:6px;margin:4px 0 6px;padding:6px;border-radius:14px}
+.pwbox.lux .pwlegend>div{padding:5px 4px;text-align:center}
+.pwbox.lux .pwlegend b{margin:0;font-size:10.5px}
+.pwbox.lux .pwlegend small{display:none}
+.pwbox.lux .pwshow{padding:6px 12px;margin:2px 0 7px}
+.pwbox.lux .pwerr{margin:0 0 6px;padding:6px 10px;font-size:11.5px}
+.pwbox.lux .acts{margin-top:6px;padding:6px;border-radius:26px}
+.pwbox.lux .acts .pri,.pwbox.lux .acts .pwcancel{min-height:38px}
+.pwbox.lux .pwfoot{margin-top:6px;font-size:10.5px}
+@media(max-height:640px){.pwbox.lux .pwhead p,.pwbox.lux .pwdesc{display:none}.pwbox.lux .pwlock{display:none}.pwbox.lux .pwlegend{display:none}}
+
+/* ===== Tombol Cetak PO: hijau = boleh cetak, merah = sudah dicetak (user terkunci, admin yang bisa mengizinkan ulang) ===== */
+.ghost.prgreen,button.prgreen{background:linear-gradient(180deg,#2fcf86,#12985a)!important;color:#fff!important;border:1px solid #0d7a43!important;box-shadow:0 3px 10px rgba(18,152,90,.4)!important;font-weight:700}
+.ghost.prgreen:hover,button.prgreen:hover{filter:brightness(1.07)}
+.ghost.prred,button.prred{background:linear-gradient(180deg,#f0566a,#c1243a)!important;color:#fff!important;border:1px solid #9a1a2c!important;box-shadow:0 3px 10px rgba(193,36,58,.4)!important;font-weight:700;cursor:not-allowed}
+.ghost.prred.adm{cursor:pointer}
+.prnote{display:inline-block;margin-top:2px;font-size:11.5px;font-weight:600;color:#9a1a2c}
+/* ===== Sidebar rapi & stabil (tidak berubah saat hover) ===== */
+@media(min-width:901px){
+  .shell>.side .navlist,.shell>.side:not(.hov) .navlist{padding:0 7px}
+  .shell>.side .navpill,.shell>.side:not(.hov) .navpill{left:7px;right:7px}
+  .shell>.side .nv,.shell>.side:not(.hov) .nv,.shell>.side .sub .nv{height:40px;min-height:40px;padding:0 0 0 18px!important;gap:12px!important;justify-content:flex-start!important;font-size:13px!important;font-weight:500;line-height:1.2!important;overflow:hidden}
+  .shell>.side .nv .ic,.shell>.side .nv svg{width:17px;height:17px;flex:none}
+  .shell>.side .nv:hover>*:not(.bd),.shell>.side .nv:focus-visible>*:not(.bd){transform:none!important}
+  .shell>.side .nv>span,.shell>.side:not(.hov) .nv>span{max-width:none!important;transition:opacity .2s ease!important}
+  .shell>.side:not(.hov) .nv>span{opacity:0}
+  .shell>.side .nv.grp{justify-content:space-between!important;padding:0 12px 0 18px!important;height:34px;min-height:34px;font-size:12.5px!important}
+  .shell>.side:not(.hov) .nv .bd{position:absolute;top:4px;right:9px;margin:0}
+}
+/* ===== Dashboard: konten menyesuaikan sidebar; hanya font/susunan dalam kartu yang menyesuaikan lebar kartu ===== */
+.dtop>.dcard{container-type:inline-size;min-width:0}
+.ts b,.sc b{overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.ts .tl,.ts .tl2{line-height:1.25}
+.dtop .ts b{font-size:clamp(14px,2.7cqw,21px)}
+.dtop .sc b{font-size:clamp(14px,2.7cqw,20px)}
+.dtop .stleg .lt b{font-size:clamp(13px,2.9cqw,15px)}
+@container (max-width:640px){
+  .tstats{grid-template-columns:1fr 1fr}
+  .ts{border-bottom:1px solid rgba(150,190,235,.4);padding:10px 14px}
+  .ts:nth-child(2n){border-right:0}
+  .ts:nth-last-child(-n+2){border-bottom:0}
+}
+@container (max-width:480px){
+  .stwrap{grid-template-columns:1fr;gap:10px}
+  .sgrid{grid-template-columns:1fr}
+  .sc,.sc:first-child,.sc:last-child{border-right:0;padding:8px 0;border-bottom:1px solid rgba(150,190,235,.4)}
+  .sc:last-child{border-bottom:0}
+}
+/* ===== Card login lebih kecil & proporsional ===== */
+.auth .scene{zoom:.8}
+@media(max-width:700px){.auth .scene{zoom:.92}}
+`;
