@@ -314,6 +314,361 @@ const EMPTY: Vendor = {
   pic: '',
   email: '',
 };
+/* ================= MASTER SUPPLIER (admin upload Excel / CSV / PDF -> dipakai semua user) =================
+   Format kolom (urutan bebas, nama kolom dikenali otomatis):
+   Vendor Name | Alamat | Provinsi | NPWP | Phone | Fax | PIC | Departement | Email | No Rek | Bank | Cabang | Atas nama */
+type MSup = {
+  id: string;
+  nama: string;
+  alamat: string;
+  provinsi: string;
+  npwp: string;
+  telp: string;
+  fax: string;
+  pic: string;
+  dept: string;
+  email: string;
+  rek: string;
+  bank: string;
+  cabang: string;
+  an: string;
+};
+type MKey = Exclude<keyof MSup, 'id'>;
+type MsRow = Record<MKey, string>;
+type MsCell = string | number;
+const MS_KEYS: { k: MKey; l: string; syn: string[] }[] = [
+  { k: 'nama', l: 'Vendor Name', syn: ['vendorname', 'namavendor', 'vendor', 'namasupplier', 'supplier', 'suppliername', 'namaperusahaan', 'perusahaan', 'nama'] },
+  { k: 'alamat', l: 'Alamat', syn: ['alamat', 'alamatvendor', 'address'] },
+  { k: 'provinsi', l: 'Provinsi', syn: ['provinsi', 'province'] },
+  { k: 'npwp', l: 'NPWP', syn: ['npwp', 'nonpwp', 'nomornpwp'] },
+  { k: 'telp', l: 'Phone', syn: ['phone', 'telepon', 'telp', 'notelp', 'notelepon', 'notelpon', 'nohp', 'phonenumber', 'teleponvendor'] },
+  { k: 'fax', l: 'Fax', syn: ['fax', 'nofax'] },
+  { k: 'pic', l: 'PIC', syn: ['pic', 'namapic', 'picvendor', 'contactperson', 'kontak'] },
+  { k: 'dept', l: 'Departement', syn: ['departement', 'departemen', 'department', 'dept'] },
+  { k: 'email', l: 'Email', syn: ['email', 'emailvendor'] },
+  { k: 'rek', l: 'No Rek', syn: ['norek', 'norekening', 'nomorrekening', 'rekening', 'accountno', 'accountnumber', 'norekbank'] },
+  { k: 'bank', l: 'Bank', syn: ['bank', 'namabank'] },
+  { k: 'cabang', l: 'Cabang', syn: ['cabang', 'cabangbank', 'branch'] },
+  { k: 'an', l: 'Atas nama', syn: ['atasnama', 'an', 'namarekening', 'accountname', 'pemilikrekening', 'atasnamarekening'] },
+];
+const MS_PO_REQ: MKey[] = ['alamat', 'email', 'npwp', 'pic', 'telp', 'rek', 'bank', 'cabang', 'an']; // isian form PO yang wajib diisi (selain Fax)
+const msNorm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+const msTxt = (x: unknown) => String(x ?? '').replace(/\s+/g, ' ').trim();
+const msField = (h: string): MKey | null => {
+  const n = msNorm(h);
+  if (!n) return null;
+  return MS_KEYS.find((x) => x.syn.includes(n))?.k ?? null;
+};
+/** nilai sel -> teks rapi (angka Excel tidak jadi 1.68E+12, nol di depan nomor telepon dipulihkan, NPWP 15 digit diberi titik) */
+const msCell = (c: MsCell | undefined, k: MKey): string => {
+  if (c === undefined || c === null) return '';
+  let s = typeof c === 'number' ? (Number.isInteger(c) ? c.toFixed(0) : String(c)) : msTxt(c);
+  if (typeof c === 'number' && (k === 'telp' || k === 'fax') && /^[1-9]\d{7,11}$/.test(s)) s = '0' + s;
+  if (k === 'npwp' && /^\d{15}$/.test(s))
+    s = `${s.slice(0, 2)}.${s.slice(2, 5)}.${s.slice(5, 8)}.${s[8]}-${s.slice(9, 12)}.${s.slice(12)}`;
+  return s;
+};
+
+type MsParse = { rows: MsRow[]; skipped: number; fields: MKey[]; ok: boolean };
+/** kumpulan tabel (tiap sheet Excel / tiap halaman PDF) -> baris supplier. Header dicari otomatis & dipakai untuk halaman berikutnya. */
+function msParse(grids: MsCell[][][]): MsParse {
+  const rows: MsRow[] = [];
+  const found = new Set<MKey>();
+  let skipped = 0;
+  let map: (MKey | null)[] | null = null;
+  for (const g of grids) {
+    const width = g.reduce((m, r) => Math.max(m, r.length), 0);
+    let m: (MKey | null)[] | null = map && map.length === width ? map : null;
+    let start = 0;
+    for (let i = 0; i < Math.min(g.length, 40); i++) {
+      const hm = g[i].map((c) => msField(msTxt(c)));
+      const set = new Set(hm.filter(Boolean));
+      if (set.size >= 3 && set.has('nama')) {
+        m = hm;
+        map = hm;
+        start = i + 1;
+        break;
+      }
+    }
+    if (!m) continue;
+    m.forEach((k) => k && found.add(k));
+    for (let i = start; i < g.length; i++) {
+      const hm = new Set(g[i].map((c) => msField(msTxt(c))).filter(Boolean));
+      if (hm.size >= 3) continue; // baris judul kolom yang berulang di tiap halaman
+      const r = {} as MsRow;
+      MS_KEYS.forEach(({ k }) => (r[k] = ''));
+      m.forEach((k, j) => {
+        if (!k) return;
+        const v = msCell(g[i][j], k);
+        if (v && !r[k]) r[k] = v;
+      });
+      if (!MS_KEYS.some(({ k }) => r[k])) continue; // baris kosong
+      if (!r.nama) {
+        skipped++;
+        continue;
+      }
+      rows.push(r);
+    }
+  }
+  return { rows, skipped, fields: MS_KEYS.map((x) => x.k).filter((k) => found.has(k)), ok: rows.length > 0 };
+}
+
+/** gabungkan ke daftar master: nama sama = diperbarui (kolom kosong di file tidak menghapus data lama), selain itu = baru */
+function msMerge(cur: MSup[], inc: MsRow[], replace: boolean) {
+  const base: MSup[] = replace ? [] : cur.map((x) => ({ ...x }));
+  const byName = new Map<string, number>();
+  const ids = new Set<string>();
+  const idx = (m: MSup, i: number) => {
+    byName.set(msNorm(m.nama), i);
+    ids.add(m.id);
+  };
+  base.forEach(idx);
+  let add = 0,
+    upd = 0,
+    same = 0;
+  inc.forEach((r) => {
+    const i = byName.get(msNorm(r.nama));
+    if (i !== undefined) {
+      const o = base[i];
+      const n = { ...o };
+      MS_KEYS.forEach(({ k }) => {
+        if (r[k]) n[k] = r[k];
+      });
+      if (JSON.stringify(n) !== JSON.stringify(o)) upd++;
+      else same++;
+      base[i] = n;
+      idx(n, i);
+    } else {
+      let id = 'ms-' + hash32(msNorm(r.nama)).toString(36);
+      for (let c = 2; ids.has(id); c++) id = 'ms-' + hash32(msNorm(r.nama)).toString(36) + '-' + c;
+      const m: MSup = { id, ...r };
+      base.push(m);
+      idx(m, base.length - 1);
+      add++;
+    }
+  });
+  return { list: base, add, upd, same };
+}
+/** kolom wajib form PO yang masih kosong pada satu supplier */
+const msMissing = (m: MsRow | MSup) => MS_PO_REQ.filter((k) => !m[k].trim());
+
+/** data master -> isian form PO (Vendor + Pembayaran) */
+const msToVendor = (m: MSup): Vendor => {
+  const a = m.alamat.trim();
+  const pv = m.provinsi.trim();
+  return {
+    nama: m.nama,
+    alamat: pv && !a.toLowerCase().includes(pv.toLowerCase()) ? (a ? a + ', ' + pv : pv) : a,
+    npwp: m.npwp,
+    telp: m.telp,
+    fax: m.fax,
+    pic: m.pic,
+    email: m.email,
+  };
+};
+const msToPay = (m: MSup): Pay => ({ rek: m.rek, bank: m.bank, cabang: m.cabang, an: m.an });
+
+/* ---- pembaca file: SheetJS (Excel/CSV) & pdf.js (PDF) dimuat dari CDN saat dibutuhkan ---- */
+/* eslint-disable @typescript-eslint/no-explicit-any */
+const XLSX_URL = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+const PDFJS_URL = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+const PDFJS_WORKER = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+const msScript = (src: string, ready: () => unknown) =>
+  new Promise<void>((res, rej) => {
+    if (ready()) return res();
+    const s = document.createElement('script');
+    s.src = src;
+    s.async = true;
+    s.onload = () => (ready() ? res() : rej(new Error('Pustaka tidak termuat')));
+    s.onerror = () => rej(new Error('Tidak bisa memuat ' + src));
+    document.head.appendChild(s);
+  });
+const msXlsx = async (): Promise<any> => {
+  await msScript(XLSX_URL, () => (window as any).XLSX);
+  return (window as any).XLSX;
+};
+const msPdfLib = async (): Promise<any> => {
+  await msScript(PDFJS_URL, () => (window as any).pdfjsLib);
+  const lib = (window as any).pdfjsLib;
+  lib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER;
+  return lib;
+};
+const msCluster = (a: number[], tol: number) => {
+  const s = [...a].sort((x, y) => x - y);
+  const out: number[] = [];
+  let g: number[] = [];
+  const flush = () => g.length && out.push(g.reduce((x, y) => x + y, 0) / g.length);
+  s.forEach((v) => {
+    if (g.length && v - g[g.length - 1] > tol) {
+      flush();
+      g = [];
+    }
+    g.push(v);
+  });
+  flush();
+  return out;
+};
+/** PDF -> satu tabel per halaman. Kolom/baris dibaca dari garis tabel PDF (hasil cetak Excel); tanpa garis, memakai posisi judul kolom. */
+async function msPdfGrids(lib: any, data: Uint8Array): Promise<string[][][]> {
+  const doc = await lib.getDocument({ data }).promise;
+  const OPS = lib.OPS;
+  const out: string[][][] = [];
+  for (let p = 1; p <= doc.numPages; p++) {
+    const page = await doc.getPage(p);
+    const tc = await page.getTextContent();
+    const items = (tc.items as any[])
+      .map((i) => ({ s: String(i.str), x: i.transform[4] as number, y: i.transform[5] as number, w: i.width as number }))
+      .filter((i) => i.s.trim());
+    if (!items.length) continue;
+    const ol = await page.getOperatorList();
+    const vx: number[] = [];
+    const hy: number[] = [];
+    ol.fnArray.forEach((fn: number, n: number) => {
+      if (fn !== OPS.constructPath) return;
+      const pops: number[] = ol.argsArray[n][0];
+      const co: ArrayLike<number> = ol.argsArray[n][1];
+      let c = 0,
+        cx = 0,
+        cy = 0;
+      for (const op of pops) {
+        if (op === OPS.rectangle) {
+          const x = co[c],
+            y = co[c + 1],
+            w = co[c + 2],
+            h = co[c + 3];
+          c += 4;
+          if (Math.abs(w) < 4 && Math.abs(h) > 5) vx.push(x + w / 2);
+          else if (Math.abs(h) < 4 && Math.abs(w) > 5) hy.push(y + h / 2);
+        } else if (op === OPS.moveTo) {
+          cx = co[c];
+          cy = co[c + 1];
+          c += 2;
+        } else if (op === OPS.lineTo) {
+          const nx = co[c],
+            ny = co[c + 1];
+          c += 2;
+          if (Math.abs(nx - cx) < 0.6 && Math.abs(ny - cy) > 5) vx.push((nx + cx) / 2);
+          else if (Math.abs(ny - cy) < 0.6 && Math.abs(nx - cx) > 5) hy.push((ny + cy) / 2);
+          cx = nx;
+          cy = ny;
+        } else if (op === OPS.curveTo) c += 6;
+        else if (op === OPS.curveTo2 || op === OPS.curveTo3) c += 4;
+      }
+    });
+    let edges = msCluster(vx, 2);
+    const rlines = msCluster(hy, 1.5).sort((a, b) => b - a);
+    // tanpa garis kolom: batas kolom dari posisi judul kolom pada baris judul
+    if (edges.length < 4) {
+      const lines = new Map<number, typeof items>();
+      items.forEach((i) => {
+        const k = Math.round(i.y / 2);
+        lines.set(k, [...(lines.get(k) ?? []), i]);
+      });
+      let best: typeof items = [];
+      lines.forEach((l) => {
+        const hs = l.filter((i) => msField(i.s)).sort((a, b) => a.x - b.x);
+        if (hs.length > best.length) best = hs;
+      });
+      if (best.length < 3) continue;
+      edges = [-1e6];
+      for (let i = 0; i < best.length - 1; i++) edges.push((best[i].x + best[i].w + best[i + 1].x) / 2);
+      edges.push(1e6);
+    }
+    const colOf = (it: { x: number; w: number }) => {
+      const at = (x: number) => {
+        for (let i = 0; i < edges.length - 1; i++) if (x >= edges[i] - 0.5 && x < edges[i + 1] - 0.5) return i;
+        return -1;
+      };
+      const si = at(it.x + 0.5);
+      const ci = at(it.x + it.w / 2);
+      if (si === ci) return si;
+      if (si >= 0 && it.x - edges[si] <= 5) return si; // teks rata kiri yang melebar ke kolom sebelah
+      return ci >= 0 ? ci : si; // teks rata tengah / kanan
+    };
+    const ncol = edges.length - 1;
+    const cells = new Map<number, typeof items[]>(); // baris -> kolom -> item
+    const put = (r: number, c: number, it: (typeof items)[number]) => {
+      if (c < 0) return;
+      const row = cells.get(r) ?? Array.from({ length: ncol }, () => [] as typeof items);
+      row[c].push(it);
+      cells.set(r, row);
+    };
+    if (rlines.length >= 3) {
+      items.forEach((it) => {
+        for (let r = 0; r < rlines.length - 1; r++)
+          if (it.y <= rlines[r] + 0.5 && it.y > rlines[r + 1] - 0.5) {
+            put(r, colOf(it), it);
+            return;
+          }
+      });
+    } else {
+      // tanpa garis baris: tiap baris teks = satu baris; baris lanjutan (kolom pertama kosong) digabung ke baris di atasnya
+      // baris baru dikenali dari kolom pertama berisi teks + jarak antarbaris lebih lebar daripada jarak baris lanjutan (teks yang membungkus)
+      const ys = msCluster(items.map((i) => i.y), 2).sort((a, b) => b - a);
+      const gs = ys.slice(1).map((y, i) => ys[i] - y);
+      const gMin = gs.length ? Math.min(...gs) : 0;
+      const wraps = gs.some((g) => g > gMin * 1.04);
+      let cur = -1;
+      ys.forEach((y, n) => {
+        const its = items.filter((i) => Math.abs(i.y - y) <= 2);
+        const first = its.some((i) => colOf(i) === 0);
+        if (cur < 0 || (first && (!wraps || gs[n - 1] > gMin * 1.04))) cur = Math.round(y * 10);
+        its.forEach((i) => put(cur, colOf(i), i));
+      });
+    }
+    const keys = [...cells.keys()].sort((a, b) => (rlines.length >= 3 ? a - b : b - a));
+    const grid = keys.map((k) =>
+      cells.get(k)!.map((col) =>
+        msTxt([...col].sort((a, b) => b.y - a.y || a.x - b.x).map((i) => i.s).join(' '))
+      )
+    );
+    out.push(grid.filter((r) => r.some(Boolean)));
+  }
+  return out;
+}
+/** berkas Excel / CSV / PDF -> hasil baca */
+async function msReadFile(file: File): Promise<MsParse> {
+  const buf = await file.arrayBuffer();
+  const name = file.name.toLowerCase();
+  if (name.endsWith('.pdf')) {
+    const lib = await msPdfLib();
+    return msParse(await msPdfGrids(lib, new Uint8Array(buf)));
+  }
+  const X = await msXlsx();
+  const wb = X.read(new Uint8Array(buf), { type: 'array' });
+  const grids: MsCell[][][] = wb.SheetNames.map(
+    (n: string) => X.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: true, defval: '' }) as MsCell[][]
+  );
+  return msParse(grids);
+}
+/** unduh template Excel dengan susunan kolom yang sama seperti format PDF */
+async function msTemplate() {
+  const X = await msXlsx();
+  const ws = X.utils.aoa_to_sheet([
+    MS_KEYS.map((x) => x.l),
+    [
+      'CV. CONTOH SUPPLIER',
+      'Jl. Contoh No 1, Kel. Contoh, Kec. Contoh, Jakarta Barat',
+      'DKI Jakarta',
+      '00.000.000.0-000.000',
+      '021-12345678',
+      '',
+      'Nama PIC',
+      'LOGISTIK',
+      'contoh@supplier.com',
+      '1234567890',
+      'Bank Mandiri',
+      'KCP Jakarta Pluit',
+      'CV. CONTOH SUPPLIER',
+    ],
+  ]);
+  ws['!cols'] = MS_KEYS.map((_, i) => ({ wch: i === 1 ? 46 : 22 }));
+  const wb = X.utils.book_new();
+  X.utils.book_append_sheet(wb, ws, 'Master Supplier');
+  X.writeFile(wb, 'Template_Master_Supplier.xlsx');
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
 /* ================= KEAMANAN PASSWORD =================
    Password tidak lagi disimpan/di-sinkron sebagai teks biasa: disimpan sebagai hash PBKDF2-SHA256 + salt acak per akun
    (format "pbkdf2$iterasi$salt$hash"). Password lama (teks biasa) tetap bisa login satu kali lalu otomatis di-hash. */
@@ -2508,6 +2863,94 @@ function History({
   );
 }
 
+/* Cari supplier di Master Supplier (diunggah admin) lalu salin data umum + pembayaran ke form */
+function MasterPick({
+  list,
+  onApply,
+}: {
+  list: MSup[];
+  onApply: (m: MSup) => void;
+}) {
+  const [q, setQ] = useState('');
+  const key = q.trim().toLowerCase();
+  const sorted = useMemo(
+    () => [...list].sort((a, b) => a.nama.localeCompare(b.nama)),
+    [list]
+  );
+  const rows = sorted
+    .filter(
+      (m) =>
+        !key ||
+        (m.nama + ' ' + m.npwp + ' ' + m.pic).toLowerCase().includes(key)
+    )
+    .slice(0, 6);
+  return (
+    <Card ic="users" title="Cari Master Supplier">
+      <div className="body">
+        <p className="mute small">
+          Pilih supplier dari Master Supplier (dikelola admin) untuk mengisi
+          General Information dan Informasi Pembayaran otomatis, tanpa ketik
+          ulang.
+        </p>
+        <div className="ifld cmb">
+          <span className="ico">
+            <Ic n="search" s={18} />
+          </span>
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Ketik nama supplier, NPWP, atau PIC..."
+          />
+        </div>
+        {!list.length && (
+          <div className="mute">
+            Master Supplier belum diisi admin. Gunakan pencarian riwayat PO
+            atau isi manual.
+          </div>
+        )}
+        {list.length > 0 && key && !rows.length && (
+          <div className="mute">Tidak ada supplier yang cocok.</div>
+        )}
+        {rows.map((m) => {
+          const miss = msMissing(m);
+          return (
+            <div className="hist" key={m.id}>
+              <button
+                type="button"
+                className="hhead"
+                onClick={() => onApply(m)}
+              >
+                <span className="hi">
+                  <Ic n="building" s={22} />
+                </span>
+                <span className="ht">
+                  <b>{m.nama}</b>
+                  <small>
+                    {[m.pic, m.telp, m.bank && `${m.bank} ${m.rek}`]
+                      .filter(Boolean)
+                      .join(' · ')}
+                  </small>
+                  {miss.length > 0 && (
+                    <small className="msmiss">
+                      Data belum lengkap: perlu dilengkapi manual
+                    </small>
+                  )}
+                </span>
+                <span className="pri msuse">Gunakan</span>
+              </button>
+            </div>
+          );
+        })}
+        {list.length > 0 && !key && (
+          <div className="mute small" style={{ marginTop: 8 }}>
+            {list.length} supplier tersedia. Ketik untuk mencari.
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
 /* ================= PANDUAN KATEGORI (popup untuk user saat mengisi Form PO) ================= */
 function CatGuide({
   cats,
@@ -2621,6 +3064,7 @@ function Form({
   draft,
   cats,
   bps,
+  msup,
   cfg,
   onSubmit,
   notify,
@@ -2633,6 +3077,7 @@ function Form({
   draft: Draft | null;
   cats: Cat[];
   bps: BP[];
+  msup: MSup[];
   cfg: NumCfg;
   onSubmit: (p: PO) => void;
   notify: (m: string) => void;
@@ -2707,6 +3152,18 @@ function Form({
       picked
         ? 'Supplier & item disalin. Sesuaikan qty/harga. Nomor PO baru dibuat otomatis.'
         : 'Data supplier & pembayaran disalin. Lengkapi item barang.'
+    );
+  };
+
+  // Salin dari Master Supplier: General Information + Informasi Pembayaran. soft = hanya bila isian masih kosong (pengisian otomatis saat mengetik nama)
+  const applyMaster = (m: MSup, soft: boolean) => {
+    const payEmpty = Object.values(pay).every((x) => !x.trim());
+    setV(msToVendor(m));
+    if (!soft || payEmpty) setPay(msToPay(m));
+    notify(
+      msMissing(m).length
+        ? `Data ${m.nama} terisi dari Master Supplier. Lengkapi isian yang masih kosong.`
+        : `Data ${m.nama} terisi otomatis dari Master Supplier.`
     );
   };
 
@@ -2788,6 +3245,7 @@ function Form({
           disabled={readOnly}
           style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}
         >
+          <MasterPick list={msup} onApply={(m) => applyMaster(m, false)} />
           <History list={history} onApply={apply} />
         </fieldset>
       </div>
@@ -2901,16 +3359,39 @@ function Form({
                 <input
                   list="bp-list"
                   value={v.nama}
-                  onChange={(e) => sv('nama', e.target.value)}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    sv('nama', val);
+                    // nama cocok persis dengan Master Supplier & data umum masih kosong: isi otomatis
+                    const m = msup.find(
+                      (x) => msNorm(x.nama) === msNorm(val)
+                    );
+                    if (
+                      m &&
+                      !v.alamat.trim() &&
+                      !v.email.trim() &&
+                      !v.npwp.trim() &&
+                      !v.pic.trim() &&
+                      !v.telp.trim()
+                    )
+                      applyMaster(m, true);
+                  }}
                   placeholder="Masukkan nama vendor"
                 />
               </IF>
               <datalist id="bp-list">
-                {bps.map((b) => (
-                  <option key={b.id} value={b.nama}>
-                    {b.kode}
+                {msup.map((m) => (
+                  <option key={m.id} value={m.nama}>
+                    {m.npwp || m.pic}
                   </option>
                 ))}
+                {bps
+                  .filter((b) => !msup.some((m) => msNorm(m.nama) === msNorm(b.nama)))
+                  .map((b) => (
+                    <option key={b.id} value={b.nama}>
+                      {b.kode}
+                    </option>
+                  ))}
               </datalist>
               {bpWarn}
             </Field>
@@ -3862,6 +4343,387 @@ function SupplierPage({
                     )}
                   </tr>
                 ))}
+              </tbody>
+            </table>
+            <Pager page={pg.page} pages={pg.pages} onPage={pg.setPage} />
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+/* Halaman Master Supplier: admin unggah Excel/CSV/PDF, semua user memakainya di Form PO */
+function MasterSupplierPage({
+  msup,
+  setMsup,
+  canEdit,
+  onUse,
+  notify,
+}: {
+  msup: MSup[];
+  setMsup: (f: (l: MSup[]) => MSup[]) => void;
+  canEdit: boolean;
+  onUse?: (m: MSup) => void;
+  notify: (m: string) => void;
+}) {
+  const [q, setQ] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [drag, setDrag] = useState(false);
+  const [replace, setReplace] = useState(false);
+  const [pv, setPv] = useState<{ name: string; res: MsParse } | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const read = async (file?: File | null) => {
+    if (!file) return;
+    if (!/\.(xlsx|xlsm|xls|csv|pdf)$/i.test(file.name))
+      return notify('Format file harus Excel (.xlsx/.xls), CSV, atau PDF.');
+    if (file.size > 10 * 1024 * 1024)
+      return notify('Ukuran file maksimal 10 MB.');
+    setBusy(true);
+    try {
+      const res = await msReadFile(file);
+      if (!res.ok)
+        notify(
+          'Tidak ada data supplier yang terbaca. Pastikan ada baris judul kolom (Vendor Name, Alamat, NPWP, Phone, PIC, Email, No Rek, Bank, ...).'
+        );
+      else {
+        setPv({ name: file.name, res });
+        setReplace(false);
+      }
+    } catch (e) {
+      notify(
+        'Gagal membaca file: ' +
+          (e instanceof Error ? e.message : 'format tidak dikenali') +
+          '. Coba unggah versi Excel.'
+      );
+    } finally {
+      setBusy(false);
+      if (fileRef.current) fileRef.current.value = '';
+    }
+  };
+  const plan = useMemo(
+    () => (pv ? msMerge(msup, pv.res.rows, replace) : null),
+    [pv, msup, replace]
+  );
+  const exist = useMemo(
+    () => new Set(msup.map((m) => msNorm(m.nama))),
+    [msup]
+  );
+  const save = () => {
+    if (!pv || !plan) return;
+    if (
+      replace &&
+      !window.confirm(
+        `Ganti seluruh Master Supplier (${msup.length} data) dengan ${plan.list.length} data dari file ini?`
+      )
+    )
+      return;
+    setMsup(() => plan.list);
+    notify(
+      replace
+        ? `Master Supplier diganti: ${plan.list.length} supplier. Semua user langsung bisa memakainya.`
+        : `Master Supplier disimpan: ${plan.add} baru, ${plan.upd} diperbarui. Semua user langsung bisa memakainya.`
+    );
+    setPv(null);
+  };
+  const del = (m: MSup) => {
+    if (window.confirm(`Hapus "${m.nama}" dari Master Supplier?`))
+      setMsup((l) => l.filter((x) => x.id !== m.id));
+  };
+  const delAll = () => {
+    if (
+      window.confirm(
+        `Hapus SELURUH Master Supplier (${msup.length} data)? Tindakan ini tidak bisa dibatalkan.`
+      )
+    )
+      setMsup(() => []);
+  };
+  const rows = useMemo(() => {
+    const k = q.trim().toLowerCase();
+    return [...msup]
+      .filter(
+        (m) =>
+          !k ||
+          (m.nama + ' ' + m.npwp + ' ' + m.pic + ' ' + m.email)
+            .toLowerCase()
+            .includes(k)
+      )
+      .sort((a, b) => a.nama.localeCompare(b.nama));
+  }, [msup, q]);
+  const pg = usePager(rows, 15);
+  const incomplete = pv
+    ? pv.res.rows.filter((r) => msMissing(r).length).length
+    : 0;
+  const lack = pv
+    ? MS_KEYS.filter((x) => !pv.res.fields.includes(x.k)).map((x) => x.l)
+    : [];
+
+  return (
+    <Card
+      ic="users"
+      title={canEdit ? 'Master Supplier (Upload Excel / PDF)' : 'Master Supplier'}
+    >
+      <div className="body">
+        {canEdit ? (
+          <>
+            <div
+              className={'msdrop' + (drag ? ' on' : '')}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDrag(true);
+              }}
+              onDragLeave={() => setDrag(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setDrag(false);
+                void read(e.dataTransfer.files?.[0]);
+              }}
+            >
+              <span className="msico">
+                <Ic n="download" s={26} />
+              </span>
+              <div className="mst">
+                <b>
+                  {busy
+                    ? 'Membaca file...'
+                    : 'Tarik file ke sini atau pilih file'}
+                </b>
+                <small>
+                  Excel (.xlsx / .xls), CSV, atau PDF dengan kolom: Vendor
+                  Name, Alamat, Provinsi, NPWP, Phone, Fax, PIC, Departement,
+                  Email, No Rek, Bank, Cabang, Atas nama.
+                </small>
+              </div>
+              <div className="acts">
+                <button
+                  type="button"
+                  className="pri"
+                  disabled={busy}
+                  onClick={() => fileRef.current?.click()}
+                >
+                  <Ic n="plus" s={16} /> Pilih File
+                </button>
+                <button
+                  type="button"
+                  className="ghost"
+                  disabled={busy}
+                  onClick={() =>
+                    void msTemplate().catch(() =>
+                      notify('Template gagal dibuat. Periksa koneksi internet.')
+                    )
+                  }
+                >
+                  Unduh Template Excel
+                </button>
+              </div>
+              <input
+                ref={fileRef}
+                type="file"
+                hidden
+                accept=".xlsx,.xlsm,.xls,.csv,.pdf"
+                onChange={(e) => void read(e.target.files?.[0])}
+              />
+            </div>
+            {pv && plan && (
+              <div className="mspv">
+                <b>Pratinjau: {pv.name}</b>
+                <div className="mschips">
+                  <span className="mschip">{pv.res.rows.length} baris terbaca</span>
+                  <span className="mschip ok">{plan.add} supplier baru</span>
+                  {!replace && (
+                    <span className="mschip">{plan.upd} diperbarui</span>
+                  )}
+                  {!replace && plan.same > 0 && (
+                    <span className="mschip">{plan.same} tanpa perubahan</span>
+                  )}
+                  {incomplete > 0 && (
+                    <span className="mschip warn">
+                      {incomplete} data belum lengkap
+                    </span>
+                  )}
+                  {pv.res.skipped > 0 && (
+                    <span className="mschip warn">
+                      {pv.res.skipped} baris tanpa nama dilewati
+                    </span>
+                  )}
+                </div>
+                {lack.length > 0 && (
+                  <p className="mute small">
+                    Kolom tidak ditemukan di file: {lack.join(', ')}.
+                  </p>
+                )}
+                <div className="tbl">
+                  <table className="mst-t">
+                    <thead>
+                      <tr>
+                        <th>Vendor</th>
+                        <th>NPWP</th>
+                        <th>Phone</th>
+                        <th>PIC</th>
+                        <th>Email</th>
+                        <th>Bank / No Rek</th>
+                        <th>Status</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pv.res.rows.slice(0, 8).map((r, i) => (
+                        <tr key={i}>
+                          <td>
+                            <b>{r.nama}</b>
+                            <div className="mute small">
+                              {[r.alamat, r.provinsi].filter(Boolean).join(', ')}
+                            </div>
+                          </td>
+                          <td>{r.npwp}</td>
+                          <td>{r.telp}</td>
+                          <td>{r.pic}</td>
+                          <td>{r.email}</td>
+                          <td>
+                            {r.bank}
+                            <div className="mute small">{r.rek}</div>
+                          </td>
+                          <td>
+                            {!replace && exist.has(msNorm(r.nama))
+                              ? 'Update'
+                              : 'Baru'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                {pv.res.rows.length > 8 && (
+                  <p className="mute small">
+                    ...dan {pv.res.rows.length - 8} baris lainnya.
+                  </p>
+                )}
+                <label className="chk">
+                  <input
+                    type="checkbox"
+                    checked={replace}
+                    onChange={(e) => setReplace(e.target.checked)}
+                  />
+                  <span>
+                    Ganti seluruh Master Supplier (hapus data lama yang tidak
+                    ada di file ini)
+                  </span>
+                </label>
+                <div className="acts" style={{ marginTop: 10 }}>
+                  <button type="button" className="pri" onClick={save}>
+                    <Ic n="check" s={16} /> Simpan ke Master Supplier
+                  </button>
+                  <button type="button" onClick={() => setPv(null)}>
+                    Batal
+                  </button>
+                </div>
+              </div>
+            )}
+            <p className="mute small">
+              Supplier dengan nama yang sama otomatis diperbarui, jadi file
+              yang sama boleh diunggah ulang. Setelah disimpan, seluruh user
+              bisa memilih supplier ini di Form PO dan data umum + pembayaran
+              langsung terisi.
+            </p>
+          </>
+        ) : (
+          <p className="mute small">
+            Master Supplier dikelola admin. Pilih supplier di bawah (atau di
+            Form PO) agar data umum dan pembayaran terisi otomatis.
+          </p>
+        )}
+        <div className="bar">
+          <div className="ifld grow">
+            <span className="ico">
+              <Ic n="search" s={18} />
+            </span>
+            <input
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="Cari nama / NPWP / PIC / email..."
+            />
+          </div>
+          {canEdit && msup.length > 0 && (
+            <button type="button" className="ghost" onClick={delAll}>
+              Hapus Semua
+            </button>
+          )}
+        </div>
+        {!rows.length ? (
+          <div className="empty">
+            {msup.length
+              ? 'Tidak ada supplier yang cocok.'
+              : canEdit
+              ? 'Belum ada Master Supplier. Unggah file Excel/PDF di atas.'
+              : 'Master Supplier belum diisi admin.'}
+          </div>
+        ) : (
+          <div className="tbl">
+            <table className="mst-t">
+              <thead>
+                <tr>
+                  <th>Supplier</th>
+                  <th>PIC / Kontak</th>
+                  <th>Email</th>
+                  <th>NPWP</th>
+                  <th>Pembayaran</th>
+                  <th>Kelengkapan</th>
+                  {(canEdit || onUse) && <th>Keterangan</th>}
+                </tr>
+              </thead>
+              <tbody>
+                {pg.view.map((m) => {
+                  const miss = msMissing(m);
+                  return (
+                    <tr key={m.id}>
+                      <td>
+                        <b>{m.nama}</b>
+                        <div className="mute small">
+                          {[m.alamat, m.provinsi].filter(Boolean).join(', ')}
+                        </div>
+                      </td>
+                      <td>
+                        {m.pic}
+                        <div className="mute small">{m.telp}</div>
+                      </td>
+                      <td>{m.email}</td>
+                      <td>{m.npwp}</td>
+                      <td>
+                        {[m.bank, m.cabang].filter(Boolean).join(' · ')}
+                        <div className="mute small">
+                          {m.rek}
+                          {m.an ? ` a.n. ${m.an}` : ''}
+                        </div>
+                      </td>
+                      <td>
+                        {miss.length ? (
+                          <span className="msmiss">
+                            Kurang:{' '}
+                            {miss
+                              .map((k) => MS_KEYS.find((x) => x.k === k)?.l)
+                              .join(', ')}
+                          </span>
+                        ) : (
+                          <span className="msok">Lengkap</span>
+                        )}
+                      </td>
+                      {(canEdit || onUse) && (
+                        <td>
+                          {onUse && (
+                            <button className="ghost" onClick={() => onUse(m)}>
+                              Buat PO
+                            </button>
+                          )}
+                          {canEdit && (
+                            <button className="ghost" onClick={() => del(m)}>
+                              Hapus
+                            </button>
+                          )}
+                        </td>
+                      )}
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
             <Pager page={pg.page} pages={pg.pages} onPage={pg.setPage} />
@@ -8208,7 +9070,7 @@ const META: Record<string, { ic: string; t: string; s: string; c: string }> = {
   supplier: {
     ic: 'users',
     t: 'Data Supplier',
-    s: 'Daftar Supplier BP (Business Partner), status aktif dan tanggal expired.',
+    s: 'Master Supplier (unggah Excel/PDF oleh admin, dipakai semua user) dan Supplier BP (status aktif & tanggal expired).',
     c: 'Data Supplier',
   },
   history: {
@@ -9099,6 +9961,7 @@ type SyncData = {
   depts: Dept[];
   cats: Cat[];
   bps: BP[];
+  msup: MSup[];
   pos: PO[];
   hist: Hist[];
   numCfg: NumCfg;
@@ -9264,6 +10127,7 @@ function toTables(d: SyncData): STables {
       nama: b.nama,
       exp: toSheetD(b.exp),
     })),
+    Master_Supplier: d.msup.map((m) => ({ ...m })),
     PO: po,
     PO_Items: items,
     Change_History: d.hist.map((h) => ({
@@ -9332,6 +10196,17 @@ function fromTables(t: STables, cur: SyncData): SyncData {
       nama: r.nama,
       exp: parseExp(r.exp) ?? r.exp,
     }));
+  // Master Supplier (diunggah admin). Bila sheet belum punya tabel ini, pertahankan data yang ada di aplikasi.
+  const msup: MSup[] = t.Master_Supplier
+    ? g('Master_Supplier')
+        .filter((r) => msTxt(r.nama))
+        .map((r) => {
+          const o = {} as MSup;
+          MS_KEYS.forEach(({ k }) => (o[k] = msTxt(r[k])));
+          o.id = msTxt(r.id) || 'ms-' + hash32(msNorm(o.nama)).toString(36);
+          return o;
+        })
+    : cur.msup;
   const byNo = new Map<string, Line[]>();
   g('PO_Items').forEach((r) => {
     if (!r.no.trim()) return;
@@ -9423,6 +10298,7 @@ function fromTables(t: STables, cur: SyncData): SyncData {
     depts: depts.length ? depts : cur.depts,
     cats,
     bps,
+    msup,
     pos,
     hist,
     numCfg,
@@ -9442,6 +10318,7 @@ function useSheetSync(
     depts: (v: Dept[]) => void;
     cats: (v: Cat[]) => void;
     bps: (v: BP[]) => void;
+    msup: (v: MSup[]) => void;
     pos: (v: PO[]) => void;
     hist: (v: Hist[]) => void;
     numCfg: (v: NumCfg) => void;
@@ -9462,7 +10339,7 @@ function useSheetSync(
   setters.current = set;
   const tables = useMemo(
     () => toTables(d),
-    [d.users, d.depts, d.cats, d.bps, d.pos, d.hist, d.numCfg, d.theme, d.seen, d.brand]
+    [d.users, d.depts, d.cats, d.bps, d.msup, d.pos, d.hist, d.numCfg, d.theme, d.seen, d.brand]
   ); // eslint-disable-line react-hooks/exhaustive-deps
 
   const push = async (t: STables, key: string) => {
@@ -9520,6 +10397,7 @@ function useSheetSync(
           s.depts(st.depts);
           s.cats(st.cats);
           s.bps(st.bps);
+          s.msup(st.msup);
           s.pos(st.pos);
           s.hist(st.hist);
           s.numCfg(st.numCfg);
@@ -9645,6 +10523,7 @@ export default function App() {
   const setCats = (f: (c: Cat[]) => Cat[]) =>
     setCatsRaw((raw) => f(normCats(raw)));
   const [bps, setBps] = useLS<BP[]>('po_bp', DEF_BP);
+  const [msup, setMsup] = useLS<MSup[]>('po_msup', []); // Master Supplier: diunggah admin, dipakai semua user
   const [numCfg, setNumCfg] = useLS<NumCfg>('po_numcfg', {});
   const [depts, setDepts] = useLS<Dept[]>('po_depts', DEF_DEPTS);
   const deptNames = deptSort(depts);
@@ -9742,12 +10621,13 @@ export default function App() {
   });
   const [themeG, setThemeG] = useLS<number>('po_theme', 0); // tema bawaan sistem: diatur admin, tersimpan
   const syncSt = useSheetSync(
-    { users, depts, cats, bps, pos, hist, numCfg, theme: themeG, seen, brand },
+    { users, depts, cats, bps, msup, pos, hist, numCfg, theme: themeG, seen, brand },
     {
       users: setUsers,
       depts: setDepts,
       cats: setCatsRaw,
       bps: setBps,
+      msup: setMsup,
       pos: setPos,
       hist: setHist,
       numCfg: setNumCfg,
@@ -10139,6 +11019,18 @@ export default function App() {
     setFk((k) => k + 1);
     setPage('form');
     notify('Data supplier disalin. Lengkapi item barang.');
+  };
+  const useMaster = (m: MSup) => {
+    setFixedNo(null);
+    setFormRO(false);
+    setDraft({
+      v: msToVendor(m),
+      pay: msToPay(m),
+      items: [newItem()],
+    });
+    setFk((k) => k + 1);
+    setPage('form');
+    notify('Data supplier & pembayaran terisi dari Master Supplier. Lengkapi item barang.');
   };
   const useBarang = (r: ItemRow) => {
     setFixedNo(null);
@@ -10899,6 +11791,7 @@ export default function App() {
                 draft={draft}
                 cats={cats}
                 bps={bps}
+                msup={msup}
                 cfg={numCfg}
                 notify={notify}
                 fixedNo={fixedNo}
@@ -11025,6 +11918,13 @@ export default function App() {
             )}
             {cur === 'supplier' && (
               <>
+                <MasterSupplierPage
+                  msup={msup}
+                  setMsup={setMsup}
+                  canEdit={admin}
+                  onUse={admin ? undefined : useMaster}
+                  notify={notify}
+                />
                 <BPPage
                   bps={bps}
                   setBps={setBps}
@@ -12101,6 +13001,19 @@ button{font:inherit;cursor:pointer;border-radius:10px;border:1px solid var(--lin
 .tedit{display:flex;gap:8px;align-items:center;margin-top:8px}.tedit input{width:auto;min-height:38px;padding:6px 10px}
 .s-wait{background:#eef2f7;color:#6b7c95}
 @media(prefers-reduced-motion:reduce){.tl li.cur>i{animation:none}}
+/* ---- Master Supplier ---- */
+.msdrop{border:2px dashed #9cc7f2;border-radius:14px;background:#f6faff;padding:16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:14px;transition:background .15s,border-color .15s}
+.msdrop.on{background:#e3f1ff;border-color:var(--brand)}
+.msdrop .msico{width:46px;height:46px;border-radius:50%;display:grid;place-items:center;background:var(--soft);color:var(--brand);flex:none}
+.msdrop .mst{flex:1;min-width:240px}.msdrop .mst b{display:block;color:#0d2a57}.msdrop .mst small{color:var(--mute);display:block;margin-top:2px}
+.mspv{border:1px solid var(--line);border-radius:14px;background:#fff;padding:14px 16px;margin-bottom:16px}
+.mspv>b{display:block;color:#0d2a57}
+.mschips{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 12px}
+.mschip{padding:3px 11px;border-radius:999px;font-size:12.5px;font-weight:700;background:#eef5ff;color:#0d3b7a;white-space:nowrap}
+.mschip.ok{background:#e4f6ec;color:#157347}.mschip.warn{background:#fff3d6;color:#8a5b00}
+.msmiss{color:#8a5b00;font-size:12px;font-weight:600}.msok{color:#157347;font-size:12.5px;font-weight:700}
+.msuse{padding:4px 14px;border-radius:12px;font-size:12.5px;font-weight:700;white-space:nowrap}
+.mst-t td .ghost+.ghost{margin-left:6px}
 /* ---- Supplier BP ---- */
 .bpbox{border:1px solid var(--line);border-radius:14px;background:#f6faff;padding:14px 16px;margin-bottom:16px}
 .bpbox>b{display:block;margin-bottom:10px;color:#0d2a57}.bpbox p{margin:8px 0 0}
