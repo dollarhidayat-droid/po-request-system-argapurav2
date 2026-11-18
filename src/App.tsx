@@ -102,6 +102,24 @@ const BRAND0: Brand = { logo: '', bg: '', side: '', glass: 50 };
 
 /** Master departemen untuk pilihan. Admin dapat menambah/ubah/hapus di Pengaturan. Nomor PO memakai kode tetap PO_CODE. */
 type Dept = { nama: string };
+/** Master pajak (diatur admin di Pengaturan). tipe 'tambah' = PPN (menambah total), 'kurang' = PPh (mengurangi total). */
+type Tax = { id: string; nama: string; persen: number; tipe: 'tambah' | 'kurang'; aktif: boolean };
+const DEF_TAXES: Tax[] = [
+  { id: 'ppn11', nama: 'PPN', persen: 11, tipe: 'tambah', aktif: true },
+  { id: 'ppn12', nama: 'PPN', persen: 12, tipe: 'tambah', aktif: true },
+  { id: 'pph23', nama: 'PPh 23', persen: 2, tipe: 'kurang', aktif: true },
+];
+/** rate bertanda pada PO: PPN = +0.11, PPh = -0.02 */
+const taxRate = (t: Tax) => (t.tipe === 'kurang' ? -1 : 1) * Math.round(t.persen * 100) / 10000;
+const pctTxt = (n: number) => String(Math.round(n * 100) / 100).replace('.', ',');
+const taxText = (t: Tax) => `${t.nama} ${pctTxt(t.persen)}%`;
+/** nama pajak untuk rate bertanda (cari di master, kalau tidak ada: PPN/PPh bawaan) */
+const taxName = (rate: number, taxes?: Tax[]) => {
+  const k = Math.round(rate * 10000);
+  const t = (taxes ?? []).find((x) => Math.round(taxRate(x) * 10000) === k);
+  if (t) return taxText(t);
+  return `${rate < 0 ? 'PPh' : 'PPN'} ${pctTxt(Math.abs(rate) * 100)}%`;
+};
 /** Format nomor PO: <urut>/AGP-PO/GA/<bulan romawi>/<tahun>, mis. 174/AGP-PO/GA/X/2026 */
 const PO_CODE = 'GA';
 const DEF_DEPTS: Dept[] = [
@@ -808,7 +826,7 @@ const nextNo = (pos: PO[], cfg: NumCfg = {}) => {
     ROMAN[d.getMonth()]
   }/${y}`;
 };
-// Sub Total 2 = Sub Total 1 - Diskon; PPN dihitung dari Sub Total 2; TOTAL = Sub Total 2 + PPN + Ongkir
+// rate bertanda: PPN positif (menambah), PPh negatif (mengurangi). Sub Total 2 = Sub Total 1 - Diskon; pajak dihitung dari Sub Total 2; TOTAL = Sub Total 2 + PPN + Ongkir
 const calc = (sub: number, rate: number, disc: number, ong: number) => {
   const s2 = Math.max(0, sub - disc);
   const ppn = Math.round(s2 * rate);
@@ -2466,7 +2484,7 @@ function poHtml(po: PO): string {
         'Sub Total 1',
         'Diskon',
         'Sub Total 2',
-        `Ppn ${Math.round(po.rate * 100)}%`,
+        taxName(po.rate),
         'Ongkir',
         'TOTAL',
       ];
@@ -3066,12 +3084,14 @@ function Form({
   bps,
   msup,
   cfg,
+  taxes,
   onSubmit,
   notify,
   fixedNo,
   readOnly,
   onBack,
 }: {
+  taxes: Tax[];
   me: User;
   pos: PO[];
   draft: Draft | null;
@@ -3325,7 +3345,7 @@ function Form({
               <div>
                 <span>
                   <Ic n="receipt" s={18} />
-                  Pajak{rate ? ` (${Math.round(rate * 100)}%)` : ''}
+                  Pajak{rate ? ` (${taxName(rate, taxes)})` : ''}
                 </span>
                 <span>{rp(ppn)}</span>
               </div>
@@ -3465,8 +3485,24 @@ function Form({
             <Field label="1. Pajak" req>
               <select value={tax} onChange={(e) => setTax(e.target.value)}>
                 <option value="">Pilih Pajak</option>
-                <option value="0.11">PPN 11%</option>
-                <option value="0.12">PPN 12%</option>
+                {taxes
+                  .filter(
+                    (t) =>
+                      t.aktif ||
+                      Math.round(taxRate(t) * 10000) ===
+                        Math.round(Number(tax) * 10000)
+                  )
+                  .map((t) => (
+                    <option key={t.id} value={String(taxRate(t))}>
+                      {taxText(t)} ({t.tipe === 'kurang' ? '−' : '+'})
+                    </option>
+                  ))}
+                {tax !== '' &&
+                  !taxes.some(
+                    (t) =>
+                      Math.round(taxRate(t) * 10000) ===
+                      Math.round(Number(tax) * 10000)
+                  ) && <option value={tax}>{taxName(Number(tax))}</option>}
               </select>
             </Field>
             <Field label="2. Discount (Nominal)">
@@ -4029,7 +4065,7 @@ function PoTable({
                       </ul>
                       <div>
                         Subtotal {rp(p.sub)} · Discount {rp(p.disc)} · Pajak{' '}
-                        {Math.round(p.rate * 100)}%
+                        {taxName(p.rate)}
                         {p.ong ? ` · Ongkir ${rp(p.ong)}` : ''} ·{' '}
                         <b>Grand Total {rp(p.total)}</b>
                       </div>
@@ -4370,7 +4406,7 @@ function MasterSupplierPage({
   const [q, setQ] = useState('');
   const [busy, setBusy] = useState(false);
   const [drag, setDrag] = useState(false);
-  const [replace, setReplace] = useState(false);
+  const replace = true; // unggah file = ganti seluruh Master Supplier (data lama hilang)
   const [pv, setPv] = useState<{ name: string; res: MsParse } | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -4389,7 +4425,6 @@ function MasterSupplierPage({
         );
       else {
         setPv({ name: file.name, res });
-        setReplace(false);
       }
     } catch (e) {
       notify(
@@ -4426,6 +4461,51 @@ function MasterSupplierPage({
         : `Master Supplier disimpan: ${plan.add} baru, ${plan.upd} diperbarui. Semua user langsung bisa memakainya.`
     );
     setPv(null);
+  };
+  const blank = () => {
+    const r = {} as MsRow;
+    MS_KEYS.forEach(({ k }) => (r[k] = ''));
+    return r;
+  };
+  const [mf, setMf] = useState<MsRow>(blank);
+  const [eid, setEid] = useState('');
+  const resetOne = () => {
+    setMf(blank());
+    setEid('');
+  };
+  const editOne = (m: MSup) => {
+    const r = blank();
+    MS_KEYS.forEach(({ k }) => (r[k] = m[k]));
+    setMf(r);
+    setEid(m.id);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+  const saveOne = () => {
+    const r = {} as MsRow;
+    MS_KEYS.forEach(({ k }) => (r[k] = msTxt(mf[k])));
+    if (!r.nama) return notify('Isi Vendor Name.');
+    if (msup.some((m) => m.id !== eid && msNorm(m.nama) === msNorm(r.nama)))
+      return notify('Supplier dengan nama ini sudah ada. Gunakan Ubah pada daftar.');
+    const miss = msMissing(r);
+    if (eid) {
+      setMsup((l) => l.map((m) => (m.id === eid ? { ...m, ...r } : m)));
+      notify('Supplier diperbarui.');
+    } else {
+      const base = 'ms-' + hash32(msNorm(r.nama)).toString(36);
+      setMsup((l) => {
+        let id = base;
+        for (let c = 2; l.some((m) => m.id === id); c++) id = base + '-' + c;
+        return [...l, { id, ...r }];
+      });
+      notify(
+        miss.length
+          ? `Supplier ditambahkan (data belum lengkap: ${miss
+              .map((k) => MS_KEYS.find((x) => x.k === k)?.l)
+              .join(', ')}).`
+          : 'Supplier ditambahkan ke Master Supplier dan langsung tersedia untuk semua user.'
+      );
+    }
+    resetOne();
   };
   const del = (m: MSup) => {
     if (window.confirm(`Hapus "${m.nama}" dari Master Supplier?`))
@@ -4598,17 +4678,11 @@ function MasterSupplierPage({
                     ...dan {pv.res.rows.length - 8} baris lainnya.
                   </p>
                 )}
-                <label className="chk">
-                  <input
-                    type="checkbox"
-                    checked={replace}
-                    onChange={(e) => setReplace(e.target.checked)}
-                  />
-                  <span>
-                    Ganti seluruh Master Supplier (hapus data lama yang tidak
-                    ada di file ini)
-                  </span>
-                </label>
+                <p className="msmiss small">
+                  Menyimpan file ini akan MENGGANTI seluruh Master Supplier
+                  ({msup.length} data lama dihapus, diganti {plan.list.length}{' '}
+                  data dari file).
+                </p>
                 <div className="acts" style={{ marginTop: 10 }}>
                   <button type="button" className="pri" onClick={save}>
                     <Ic n="check" s={16} /> Simpan ke Master Supplier
@@ -4620,11 +4694,77 @@ function MasterSupplierPage({
               </div>
             )}
             <p className="mute small">
-              Supplier dengan nama yang sama otomatis diperbarui, jadi file
-              yang sama boleh diunggah ulang. Setelah disimpan, seluruh user
-              bisa memilih supplier ini di Form PO dan data umum + pembayaran
-              langsung terisi.
+              Unggah file akan menimpa seluruh daftar: supplier lama hilang dan
+              diganti data dari file. Untuk menambah satu supplier tanpa
+              menghapus yang lama, pakai form "Tambah Supplier Manual" di bawah.
+              Setelah disimpan, seluruh user bisa memilih supplier ini di Form
+              PO dan data umum + pembayaran langsung terisi.
             </p>
+            <div className="bpbox">
+              <b>{eid ? 'Ubah Supplier' : 'Tambah Supplier Manual'}</b>
+              <p className="mute small" style={{ margin: '4px 0 8px' }}>
+                General Info Supplier
+              </p>
+              <div className="grid3">
+                {(
+                  [
+                    ['nama', 'Vendor Name', true],
+                    ['alamat', 'Alamat', true],
+                    ['provinsi', 'Provinsi', false],
+                    ['npwp', 'NPWP', true],
+                    ['telp', 'Phone', true],
+                    ['fax', 'Fax', false],
+                    ['pic', 'PIC', true],
+                    ['dept', 'Departemen', false],
+                    ['email', 'Email', true],
+                  ] as [MKey, string, boolean][]
+                ).map(([k, l, r]) => (
+                  <Field key={k} label={l} req={r}>
+                    <input
+                      value={mf[k]}
+                      onChange={(e) =>
+                        setMf((x) => ({ ...x, [k]: e.target.value }))
+                      }
+                      placeholder={l}
+                    />
+                  </Field>
+                ))}
+              </div>
+              <p className="mute small" style={{ margin: '10px 0 8px' }}>
+                Pembayaran
+              </p>
+              <div className="grid3">
+                {(
+                  [
+                    ['rek', 'No Rekening', true],
+                    ['bank', 'Bank', true],
+                    ['cabang', 'Cabang', true],
+                    ['an', 'Atas Nama', true],
+                  ] as [MKey, string, boolean][]
+                ).map(([k, l, r]) => (
+                  <Field key={k} label={l} req={r}>
+                    <input
+                      value={mf[k]}
+                      onChange={(e) =>
+                        setMf((x) => ({ ...x, [k]: e.target.value }))
+                      }
+                      placeholder={l}
+                    />
+                  </Field>
+                ))}
+              </div>
+              <div className="acts" style={{ marginTop: 10 }}>
+                <button type="button" className="pri" onClick={saveOne}>
+                  <Ic n={eid ? 'check' : 'plus'} s={16} />{' '}
+                  {eid ? 'Simpan Perubahan' : 'Tambah Supplier'}
+                </button>
+                {(eid || Object.values(mf).some(Boolean)) && (
+                  <button type="button" onClick={resetOne}>
+                    Batal
+                  </button>
+                )}
+              </div>
+            </div>
           </>
         ) : (
           <p className="mute small">
@@ -4712,6 +4852,11 @@ function MasterSupplierPage({
                           {onUse && (
                             <button className="ghost" onClick={() => onUse(m)}>
                               Buat PO
+                            </button>
+                          )}
+                          {canEdit && (
+                            <button className="ghost" onClick={() => editOne(m)}>
+                              Ubah
                             </button>
                           )}
                           {canEdit && (
@@ -6162,6 +6307,146 @@ function DeptSettings({
   );
 }
 
+/* ================= PAJAK (admin): daftar pilihan pajak di form PO. PPN menambah total, PPh mengurangi total ================= */
+function TaxSettings({
+  taxes,
+  setTaxes,
+  pos,
+  notify,
+}: {
+  taxes: Tax[];
+  setTaxes: (f: (t: Tax[]) => Tax[]) => void;
+  pos: PO[];
+  notify: (m: string) => void;
+}) {
+  const E = { nama: '', persen: '', tipe: 'tambah' as Tax['tipe'] };
+  const [f, setF] = useState(E);
+  const [eid, setEid] = useState('');
+  const used = (t: Tax) =>
+    pos.filter(
+      (p) => Math.round(p.rate * 10000) === Math.round(taxRate(t) * 10000)
+    ).length;
+  const reset = () => {
+    setF(E);
+    setEid('');
+  };
+  const save = () => {
+    const nama = f.nama.trim().replace(/\s+/g, ' ');
+    const persen = Number(String(f.persen).replace(',', '.'));
+    if (!nama) return notify('Isi nama pajak, mis. PPN atau PPh 23.');
+    if (!(persen > 0 && persen < 100)) return notify('Persen pajak harus antara 0 dan 100.');
+    const cand: Tax = { id: eid || 'tx-' + Date.now().toString(36), nama, persen, tipe: f.tipe, aktif: true };
+    if (
+      taxes.some(
+        (t) => t.id !== eid && taxText(t).toLowerCase() === taxText(cand).toLowerCase() && t.tipe === cand.tipe
+      )
+    )
+      return notify('Pajak tersebut sudah ada.');
+    if (eid) {
+      setTaxes((l) => l.map((t) => (t.id === eid ? { ...cand, aktif: t.aktif } : t)));
+      notify('Pajak diperbarui.');
+    } else {
+      setTaxes((l) => [...l, cand]);
+      notify('Pajak ditambahkan.');
+    }
+    reset();
+  };
+  const edit = (t: Tax) => {
+    setEid(t.id);
+    setF({ nama: t.nama, persen: String(t.persen), tipe: t.tipe });
+  };
+  const toggle = (t: Tax) =>
+    setTaxes((l) => l.map((x) => (x.id === t.id ? { ...x, aktif: !x.aktif } : x)));
+  const del = (t: Tax) => {
+    const n = used(t);
+    if (n) return notify(`Pajak dipakai ${n} PO, tidak bisa dihapus. Nonaktifkan saja.`);
+    if (window.confirm(`Hapus pajak "${taxText(t)}"?`))
+      setTaxes((l) => l.filter((x) => x.id !== t.id));
+  };
+  return (
+    <Card ic="receipt" title="Pajak">
+      <div className="body">
+        <p className="mute small">
+          Daftar ini dipakai pada dropdown "Pajak" di form PO. Jenis <b>PPN</b> menambah
+          total, jenis <b>PPh</b> mengurangi total. Pajak yang sudah dipakai PO tidak bisa
+          dihapus, cukup dinonaktifkan agar tidak muncul di form.
+        </p>
+        <div className="bpbox">
+          <b>{eid ? 'Ubah Pajak' : 'Tambah Pajak'}</b>
+          <div className="dpf">
+            <Field label="Nama Pajak" req>
+              <input
+                value={f.nama}
+                onChange={(e) => setF((x) => ({ ...x, nama: e.target.value }))}
+                placeholder="mis. PPN / PPh 23"
+              />
+            </Field>
+            <Field label="Persen (%)" req>
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                value={f.persen}
+                onChange={(e) => setF((x) => ({ ...x, persen: e.target.value }))}
+                placeholder="mis. 11"
+              />
+            </Field>
+            <Field label="Jenis" req>
+              <select
+                value={f.tipe}
+                onChange={(e) => setF((x) => ({ ...x, tipe: e.target.value as Tax['tipe'] }))}
+              >
+                <option value="tambah">PPN (menambah total)</option>
+                <option value="kurang">PPh (mengurangi total)</option>
+              </select>
+            </Field>
+            <div className="acts">
+              <button className="pri" onClick={save}>
+                <Ic n={eid ? 'check' : 'plus'} s={16} /> {eid ? 'Simpan' : 'Tambah'}
+              </button>
+              {(eid || f.nama || f.persen) && <button onClick={reset}>Batal</button>}
+            </div>
+          </div>
+        </div>
+        <div className="tbl">
+          <table>
+            <thead>
+              <tr>
+                <th>Pajak</th>
+                <th>Jenis</th>
+                <th>Status</th>
+                <th>PO</th>
+                <th>Aksi</th>
+              </tr>
+            </thead>
+            <tbody>
+              {taxes.map((t) => (
+                <tr key={t.id}>
+                  <td>
+                    <b>{taxText(t)}</b>
+                  </td>
+                  <td>{t.tipe === 'kurang' ? 'PPh · mengurangi (−)' : 'PPN · menambah (+)'}</td>
+                  <td>{t.aktif ? 'Aktif' : 'Nonaktif'}</td>
+                  <td>{used(t)}</td>
+                  <td>
+                    <div className="acts">
+                      <button className="ghost" onClick={() => edit(t)}>Ubah</button>
+                      <button className="ghost" onClick={() => toggle(t)}>
+                        {t.aktif ? 'Nonaktifkan' : 'Aktifkan'}
+                      </button>
+                      <button className="ghost" onClick={() => del(t)}>Hapus</button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 /* ================= PENGATURAN PENOMORAN PO & PERIODE TAHUN (admin) ================= */
 function NumberSettings({
   pos,
@@ -6380,7 +6665,11 @@ function SettingsPage({
   setDepts,
   setPos,
   users,
+  taxes,
+  setTaxes,
 }: {
+  taxes: Tax[];
+  setTaxes: (f: (t: Tax[]) => Tax[]) => void;
   changePw: (o: string, n: string) => Promise<string>;
   depts: Dept[];
   setDepts: (f: (d: Dept[]) => Dept[]) => void;
@@ -6477,6 +6766,9 @@ function SettingsPage({
           setPos={setPos}
           notify={notify}
         />
+      )}
+      {admin && (
+        <TaxSettings taxes={taxes} setTaxes={setTaxes} pos={pos} notify={notify} />
       )}
       {admin && (
         <NumberSettings
@@ -9014,7 +9306,7 @@ function AllPage({
                             </ul>
                             <div>
                               Subtotal {rp(p.sub)} · Discount {rp(p.disc)} ·
-                              Pajak {Math.round(p.rate * 100)}%
+                              Pajak {taxName(p.rate)}
                               {p.ong ? ` · Ongkir ${rp(p.ong)}` : ''} ·{' '}
                               <b>Grand Total {rp(p.total)}</b>
                             </div>
@@ -9959,6 +10251,7 @@ type STables = Record<string, STable>;
 type SyncData = {
   users: User[];
   depts: Dept[];
+  taxes: Tax[];
   cats: Cat[];
   bps: BP[];
   msup: MSup[];
@@ -10114,6 +10407,13 @@ function toTables(d: SyncData): STables {
       status: u.status,
     })),
     Departemen: d.depts.map((x) => ({ nama: x.nama })),
+    Pajak: d.taxes.map((t) => ({
+      id: t.id,
+      nama: t.nama,
+      persen: String(t.persen),
+      tipe: t.tipe,
+      aktif: t.aktif ? 'ya' : 'tidak',
+    })),
     Kategori: d.cats.map((c) => ({
       name: c.name,
       type: c.type,
@@ -10179,6 +10479,15 @@ function fromTables(t: STables, cur: SyncData): SyncData {
   const depts: Dept[] = g('Departemen')
     .filter((r) => r.nama.trim())
     .map((r) => ({ nama: r.nama.trim() }));
+  const taxes: Tax[] = g('Pajak')
+    .filter((r) => (r.nama ?? '').trim() && sn_(r.persen) > 0)
+    .map((r, i) => ({
+      id: (r.id ?? '').trim() || 'tx-' + i,
+      nama: r.nama.trim(),
+      persen: sn_(r.persen),
+      tipe: (r.tipe ?? '').trim().toLowerCase() === 'kurang' ? 'kurang' : 'tambah',
+      aktif: (r.aktif ?? 'ya').trim().toLowerCase() !== 'tidak',
+    }));
   const cats: Cat[] = g('Kategori')
     .filter((r) => r.name.trim())
     .map((r) => ({
@@ -10296,6 +10605,7 @@ function fromTables(t: STables, cur: SyncData): SyncData {
   return {
     users: users.length ? users : cur.users,
     depts: depts.length ? depts : cur.depts,
+    taxes: taxes.length ? taxes : cur.taxes,
     cats,
     bps,
     msup,
@@ -10310,12 +10620,123 @@ function fromTables(t: STables, cur: SyncData): SyncData {
   };
 }
 
+/* ================= PENGGABUNGAN DATA (cegah data hilang saat banyak user menyimpan bersamaan) =================
+   Dulu setiap browser mengirim SELURUH data dan menimpa sheet, sehingga user baru yang didaftarkan orang lain
+   ikut terhapus (yang terakhir menyimpan "menang"). Sekarang: tiap perubahan digabung per-baris & per-kolom
+   (3 arah: data terakhir yang diketahui / data lokal / data terbaru di sheet), lalu dikirim. */
+type SRow = Record<string, string>;
+const SYNC_KEYS: Record<string, (r: SRow) => string> = {
+  Users: (r) => r.id || 'e:' + (r.email ?? '').toLowerCase(),
+  Departemen: (r) => (r.nama ?? '').toLowerCase(),
+  Pajak: (r) => r.id || (r.nama ?? '') + '|' + (r.persen ?? '') + '|' + (r.tipe ?? ''),
+  Kategori: (r) => (r.name ?? '').toLowerCase(),
+  Supplier_BP: (r) => r.id || r.kode || '',
+  Master_Supplier: (r) => r.id || msNorm(r.nama ?? ''),
+  PO: (r) => r.no ?? '',
+  Change_History: (r) => r.id || (r.iso ?? '') + '|' + (r.by ?? '') + '|' + (r.what ?? ''),
+  Penomoran: (r) => r.tahun ?? '',
+  Notif_Dibaca: (r) => r.kunci ?? '',
+};
+const rowSig = (r?: SRow) =>
+  r
+    ? JSON.stringify(
+        Object.keys(r)
+          .sort()
+          .filter((k) => (r[k] ?? '') !== '')
+          .map((k) => [k, r[k]])
+      )
+    : '';
+/** item PO ikut di baris PO-nya agar PO + itemnya digabung sebagai satu kesatuan */
+const foldPO = (t: STables): STables => {
+  const items = new Map<string, SRow[]>();
+  (t.PO_Items ?? []).forEach((r) => {
+    const l = items.get(r.no) ?? [];
+    l.push(r);
+    items.set(r.no, l);
+  });
+  const o: STables = { ...t };
+  delete o.PO_Items;
+  o.PO = (t.PO ?? []).map((r) => ({ ...r, __items: JSON.stringify(items.get(r.no) ?? []) }));
+  return o;
+};
+const unfoldPO = (t: STables): STables => {
+  const o: STables = { ...t };
+  const items: SRow[] = [];
+  o.PO = (t.PO ?? []).map((r) => {
+    const { __items, ...rest } = r;
+    try {
+      (JSON.parse(__items || '[]') as SRow[]).forEach((x) => items.push(x));
+    } catch {
+      /* abaikan */
+    }
+    return rest;
+  });
+  o.PO_Items = items;
+  return o;
+};
+function mergeTable(name: string, base: SRow[], local: SRow[], remote: SRow[]): SRow[] {
+  const kf = SYNC_KEYS[name];
+  if (!kf) return JSON.stringify(local) !== JSON.stringify(base) ? local : remote; // tabel tunggal (tema, tampilan)
+  const idx = (t: SRow[]) => {
+    const m = new Map<string, SRow>();
+    t.forEach((r) => m.set(kf(r), r));
+    return m;
+  };
+  const B = idx(base),
+    L = idx(local),
+    R = idx(remote);
+  const pick = (k: string): SRow | undefined => {
+    const b = B.get(k),
+      l = L.get(k),
+      r = R.get(k);
+    if (rowSig(l) === rowSig(b)) return r; // lokal tidak mengubah: ikuti sheet
+    if (rowSig(r) === rowSig(b)) return l; // sheet tidak berubah: pakai perubahan lokal
+    if (!l) return r; // dihapus lokal tapi diubah orang lain: pertahankan
+    if (!r) return l; // dihapus orang lain tapi diubah lokal: pertahankan
+    const o: SRow = { ...r }; // sama-sama diubah: gabung per kolom
+    new Set([...Object.keys(l), ...Object.keys(b ?? {})]).forEach((c) => {
+      if ((l[c] ?? '') !== (b?.[c] ?? '')) o[c] = l[c] ?? '';
+    });
+    return o;
+  };
+  const out: SRow[] = [];
+  const seen = new Set<string>();
+  [remote, local, base].forEach((t) =>
+    t.forEach((x) => {
+      const k = kf(x);
+      if (seen.has(k)) return;
+      seen.add(k);
+      const v = pick(k);
+      if (v) out.push(v);
+    })
+  );
+  return out;
+}
+function mergeTables(base: STables, local: STables, remote: STables): STables {
+  const b = foldPO(base),
+    l = foldPO(local),
+    r = foldPO(remote);
+  const out: STables = {};
+  new Set([...Object.keys(b), ...Object.keys(l), ...Object.keys(r)]).forEach((n) => {
+    out[n] = mergeTable(n, b[n] ?? [], l[n] ?? [], r[n] ?? []);
+  });
+  return unfoldPO(out);
+}
+/** sheet terbaca kosong / menyusut drastis dibanding yang kita ketahui = gangguan atau terhapus, bukan perubahan sah */
+function looksWiped(base: STables, remote: STables) {
+  const g = (t: STables, n: string) => (t[n] ?? []).length;
+  if (['Users', 'PO', 'Master_Supplier', 'Supplier_BP', 'Kategori', 'Departemen'].some((n) => g(base, n) >= 3 && g(remote, n) === 0))
+    return true;
+  return ['Users', 'PO'].some((n) => g(base, n) >= 6 && g(remote, n) < g(base, n) * 0.5);
+}
+
 /** Hook sinkron dua arah. Gambar (logo/background) TIDAK ikut: tetap tersimpan di aplikasi (po_brand). */
 function useSheetSync(
   d: SyncData,
   set: {
     users: (v: User[]) => void;
     depts: (v: Dept[]) => void;
+    taxes: (v: Tax[]) => void;
     cats: (v: Cat[]) => void;
     bps: (v: BP[]) => void;
     msup: (v: MSup[]) => void;
@@ -10328,88 +10749,143 @@ function useSheetSync(
   }
 ) {
   const [ok, setOk] = useState(false);
-  const [kick, setKick] = useState(0); // memicu kirim ulang (mis. tampilan admin yang belum ada di sheet)
+  const [kick, setKick] = useState(0); // memicu kirim ulang
   const brandKicked = useRef(false);
   const [status, setStatus] = useState<'' | 'sync' | 'saved' | 'error'>('');
-  const last = useRef(''); // isi sheet terakhir yang diketahui sama dengan aplikasi
+  const last = useRef(''); // JSON isi sheet terakhir yang diketahui (basis penggabungan)
+  const baseT = useRef<STables | null>(null); // isi sheet terakhir yang diketahui, dipakai untuk penggabungan 3 arah
+  const rev = useRef<string | undefined>(undefined); // nomor revisi sheet (dari Code.gs baru)
+  const wipe = useRef(0); // berapa kali berturut-turut sheet terbaca "kosong mencurigakan"
   const busy = useRef(false);
+  const again = useRef(false);
   const cur = useRef(d);
   cur.current = d;
+  const tablesRef = useRef<STables>({});
   const setters = useRef(set);
   setters.current = set;
   const tables = useMemo(
     () => toTables(d),
-    [d.users, d.depts, d.cats, d.bps, d.msup, d.pos, d.hist, d.numCfg, d.theme, d.seen, d.brand]
+    [d.users, d.depts, d.taxes, d.cats, d.bps, d.msup, d.pos, d.hist, d.numCfg, d.theme, d.seen, d.brand]
   ); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const push = async (t: STables, key: string) => {
+  tablesRef.current = tables;
+  const applyState = (st: SyncData) => {
+    const s = setters.current;
+    s.users(st.users);
+    s.depts(st.depts);
+    s.taxes(st.taxes);
+    s.cats(st.cats);
+    s.bps(st.bps);
+    s.msup(st.msup);
+    s.pos(st.pos);
+    s.hist(st.hist);
+    s.numCfg(st.numCfg);
+    s.theme(st.theme);
+    s.seen(st.seen);
+    s.brand(st.brand);
+  };
+  const api = async (body: Record<string, unknown>) => {
+    const r = await fetch(SHEET_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ token: SHEET_TOKEN, ...body }),
+    });
+    return (await r.json()) as {
+      ok: boolean;
+      error?: string;
+      data?: STables;
+      rev?: string;
+    };
+  };
+
+  /** Satu putaran sinkron: BACA sheet -> GABUNG perubahan lokal ke data terbaru -> KIRIM hasil gabungan. Tidak pernah menimpa sheet dengan data lama. */
+  const sync = async (first: boolean) => {
+    if (busy.current) {
+      again.current = true;
+      return;
+    }
     busy.current = true;
     setStatus('sync');
     try {
-      const r = await fetch(SHEET_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({ token: SHEET_TOKEN, tables: t }),
-      });
-      const j = await r.json();
-      if (!j.ok) throw new Error(j.error || 'gagal');
-      last.current = key;
-      setStatus('saved');
-    } catch {
-      setStatus('error');
-    } finally {
-      busy.current = false;
-    }
-  };
-
-  const pull = async (first: boolean) => {
-    if (busy.current) return;
-    busy.current = true;
-    try {
-      const r = await fetch(
-        SHEET_URL + '?token=' + encodeURIComponent(SHEET_TOKEN),
-        { cache: 'no-store' }
-      );
-      const j = await r.json();
-      if (!j.ok) throw new Error(j.error || 'gagal');
-      const remote = j.data as STables;
-      const sheetEmpty = Object.values(remote).every((x) => !x.length);
-      if (sheetEmpty) {
-        // sheet masih kosong: isi dengan data aplikasi saat ini (data dummy)
-        busy.current = false;
-        if (first) {
-          const t = toTables(cur.current);
-          await push(t, JSON.stringify(t));
+      for (let attempt = 0; attempt < 4; attempt++) {
+        let j = await api({ action: 'read' }).catch(() => ({ ok: false } as Awaited<ReturnType<typeof api>>));
+        if (!j.ok || !j.data) {
+          // Code.gs lama belum diganti: baca lewat cara lama (GET)
+          const r = await fetch(SHEET_URL + '?token=' + encodeURIComponent(SHEET_TOKEN), { cache: 'no-store' });
+          j = await r.json();
         }
-        setOk(true);
-        return;
-      }
-      const st = fromTables(remote, cur.current);
-      const norm = JSON.stringify(toTables(st));
-      if (norm !== last.current) {
-        const localDirty =
-          JSON.stringify(toTables(cur.current)) !== last.current;
-        if (first || !localDirty) {
-          // sheet berubah & tidak ada perubahan lokal yang belum terkirim: ikuti sheet
-          last.current = norm;
-          const s = setters.current;
-          s.users(st.users);
-          s.depts(st.depts);
-          s.cats(st.cats);
-          s.bps(st.bps);
-          s.msup(st.msup);
-          s.pos(st.pos);
-          s.hist(st.hist);
-          s.numCfg(st.numCfg);
-          s.theme(st.theme);
-          s.seen(st.seen);
-          s.brand(st.brand);
+        if (!j.ok || !j.data) throw new Error(j.error || 'gagal');
+        const remote = j.data;
+        rev.current = j.rev;
+        const sheetEmpty = Object.values(remote).every((x) => !x.length);
+        if (sheetEmpty) {
+          if (first && !baseT.current) {
+            // sheet benar-benar baru: isi dengan data aplikasi saat ini
+            const t = toTables(cur.current);
+            const w = await api({ action: 'write', tables: t, rev: rev.current });
+            if (w.ok) {
+              baseT.current = t;
+              last.current = JSON.stringify(t);
+              rev.current = w.rev;
+            }
+          }
+          setOk(true);
+          setStatus('saved');
+          return;
         }
+        // PENGAMAN: sheet tiba-tiba kosong / menyusut drastis dibanding yang kita ketahui = gangguan baca atau terhapus -> JANGAN diikuti
+        if (baseT.current && looksWiped(baseT.current, remote)) {
+          wipe.current++;
+          if (wipe.current >= 3) {
+            // tetap bermasalah: pulihkan sheet dari data lengkap yang ada di aplikasi ini
+            const w = await api({ action: 'write', tables: baseT.current, rev: rev.current, restore: true });
+            if (w.ok) {
+              rev.current = w.rev;
+              wipe.current = 0;
+            }
+          }
+          setStatus('error');
+          return;
+        }
+        wipe.current = 0;
+        const localT = toTables(cur.current);
+        const dirty = !!baseT.current && JSON.stringify(localT) !== last.current;
+        const merged =
+          !baseT.current || !dirty
+            ? remote
+            : mergeTables(baseT.current, localT, remote);
+        const st = fromTables(merged, cur.current);
+        const norm = toTables(st);
+        const normKey = JSON.stringify(norm);
+        const remoteKey = JSON.stringify(toTables(fromTables(remote, cur.current)));
+        if (normKey !== JSON.stringify(localT)) applyState(st);
+        if (normKey === remoteKey) {
+          baseT.current = norm;
+          last.current = normKey;
+          break; // tidak ada yang perlu dikirim
+        }
+        const w = await api({ action: 'write', tables: norm, rev: rev.current });
+        if (w.ok) {
+          baseT.current = norm;
+          last.current = normKey;
+          rev.current = w.rev;
+          break;
+        }
+        if (w.error === 'conflict') continue; // ada user lain menyimpan lebih dulu: baca ulang & gabung lagi
+        if (w.error === 'shrink') {
+          // server menolak karena data akan menyusut drastis: buang perubahan lokal, ikuti sheet
+          baseT.current = remote;
+          last.current = JSON.stringify(toTables(fromTables(remote, cur.current)));
+          applyState(fromTables(remote, cur.current));
+          throw new Error('shrink');
+        }
+        throw new Error(w.error || 'gagal');
       }
       // sheet belum menyimpan logo/background tetapi aplikasi ini punya: kirim sekali agar user lain ikut melihat
       if (
         !brandKicked.current &&
-        !(remote.Tampilan && remote.Tampilan.length) &&
+        baseT.current &&
+        !(baseT.current.Tampilan && baseT.current.Tampilan.length) &&
         brandHas(cur.current.brand)
       ) {
         brandKicked.current = true;
@@ -10422,16 +10898,20 @@ function useSheetSync(
       setStatus('error');
     } finally {
       busy.current = false;
+      if (again.current) {
+        again.current = false;
+        window.setTimeout(() => void sync(false), 300);
+      }
     }
   };
 
   useEffect(() => {
-    void pull(true);
+    void sync(true);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (!ok) return;
     const tick = () => {
-      if (!document.hidden) void pull(false);
+      if (!document.hidden) void sync(false);
     };
     const id = window.setInterval(tick, SHEET_POLL_MS);
     document.addEventListener('visibilitychange', tick);
@@ -10441,23 +10921,32 @@ function useSheetSync(
     };
   }, [ok]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
-    // kirim perubahan aplikasi ke sheet (ditunda 1,5 dtk agar tidak terlalu sering)
+    // perubahan aplikasi dikirim (setelah digabung dengan data terbaru) ditunda 1,5 dtk
     if (!ok) return;
     const key = JSON.stringify(tables);
     if (key === last.current) return;
-    const id = window.setTimeout(() => {
-      if (!busy.current) void push(tables, key);
-    }, 1500);
+    const id = window.setTimeout(() => void sync(false), 1500);
     return () => clearTimeout(id);
   }, [tables, ok, kick]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     // belum pernah berhasil terhubung ke Google Sheet: coba lagi otomatis tiap 8 detik
     if (ok) return;
     const id = window.setInterval(() => {
-      if (!document.hidden) void pull(true);
+      if (!document.hidden) void sync(true);
     }, 8000);
     return () => clearInterval(id);
   }, [ok]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    // jangan biarkan perubahan yang belum terkirim hilang saat tab ditutup
+    const h = (e: BeforeUnloadEvent) => {
+      if (last.current && JSON.stringify(tablesRef.current) !== last.current) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+    window.addEventListener('beforeunload', h);
+    return () => window.removeEventListener('beforeunload', h);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const out: SyncStatus = ok
     ? status || 'saved'
     : status === 'error'
@@ -10526,6 +11015,7 @@ export default function App() {
   const [msup, setMsup] = useLS<MSup[]>('po_msup', []); // Master Supplier: diunggah admin, dipakai semua user
   const [numCfg, setNumCfg] = useLS<NumCfg>('po_numcfg', {});
   const [depts, setDepts] = useLS<Dept[]>('po_depts', DEF_DEPTS);
+  const [taxes, setTaxes] = useLS<Tax[]>('po_taxes', DEF_TAXES);
   const deptNames = deptSort(depts);
   const [seen, setSeen] = useLS<string[]>('po_seen', []);
   const [hist, setHist] = useLS<Hist[]>('po_hist', []);
@@ -10621,10 +11111,11 @@ export default function App() {
   });
   const [themeG, setThemeG] = useLS<number>('po_theme', 0); // tema bawaan sistem: diatur admin, tersimpan
   const syncSt = useSheetSync(
-    { users, depts, cats, bps, msup, pos, hist, numCfg, theme: themeG, seen, brand },
+    { users, depts, taxes, cats, bps, msup, pos, hist, numCfg, theme: themeG, seen, brand },
     {
       users: setUsers,
       depts: setDepts,
+      taxes: setTaxes,
       cats: setCatsRaw,
       bps: setBps,
       msup: setMsup,
@@ -11308,14 +11799,16 @@ export default function App() {
     notify(`Hak akses ${u.nama} diubah menjadi ${lbl(role)}.`);
   };
   /** Admin: reset password user menjadi password sementara (ditampilkan di tabel agar bisa diberikan ke user). */
+  const [shownPw, setShownPw] = useState<Record<string, string>>({}); // password sementara hasil reset, hanya di layar admin (tidak disimpan)
   const resetPw = async (u: User) => {
     if (
       !window.confirm(
-        `Reset password ${u.nama}? Password akan diganti dengan password sementara.`
+        `Password asli ${u.nama} tidak bisa dilihat karena disimpan terenkripsi (hash).\n\nLanjut membuat password sementara baru? Password lama akan diganti dan password baru ditampilkan di tabel agar bisa diberikan ke user.`
       )
     )
       return;
     const tmp = tmpPw();
+    setShownPw((m) => ({ ...m, [u.id]: tmp }));
     const th = await hashPw(tmp);
     setUsers((l) => l.map((x) => (x.id === u.id ? { ...x, pass: th } : x)));
     logH('-', `Reset password akun ${u.nama} (${u.email})`);
@@ -11401,7 +11894,7 @@ export default function App() {
           l.s,
           String(l.p),
           String(l.q * l.p),
-          `${Math.round(p.rate * 100)}%`,
+          taxName(p.rate),
           String(p.disc),
           String(p.ong ?? 0),
           String(p.total),
@@ -11793,6 +12286,7 @@ export default function App() {
                 bps={bps}
                 msup={msup}
                 cfg={numCfg}
+                taxes={taxes}
                 notify={notify}
                 fixedNo={fixedNo}
                 readOnly={formRO}
@@ -11993,6 +12487,8 @@ export default function App() {
                   setDepts={setDepts}
                   setPos={setPos}
                   users={users}
+                  taxes={taxes}
+                  setTaxes={setTaxes}
                 />
                 {admin && (
                   <IntegrityCard
@@ -12110,9 +12606,51 @@ export default function App() {
                               <td>{u.email}</td>
                               <td>
                                 <span className="pwcell">
-                                  <code title="Password disimpan terenkripsi (hash) dan tidak bisa dilihat. Gunakan Reset untuk membuat password sementara.">
-                                    ••••••••
-                                  </code>
+                                  {shownPw[u.id] ? (
+                                    <>
+                                      <code title="Password sementara (hanya tampil di layar ini)">
+                                        {shownPw[u.id]}
+                                      </code>{' '}
+                                      <button
+                                        type="button"
+                                        className="ghost"
+                                        onClick={() => {
+                                          void navigator.clipboard
+                                            ?.writeText(shownPw[u.id])
+                                            .then(() => notify('Password disalin.'));
+                                        }}
+                                      >
+                                        Salin
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="ghost"
+                                        onClick={() =>
+                                          setShownPw((m) => {
+                                            const { [u.id]: _x, ...r } = m;
+                                            return r;
+                                          })
+                                        }
+                                      >
+                                        Sembunyikan
+                                      </button>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <code title="Password disimpan terenkripsi (hash) dan tidak bisa dilihat.">
+                                        ••••••••
+                                      </code>{' '}
+                                      <button
+                                        type="button"
+                                        className="ghost"
+                                        disabled={u.id === me.id}
+                                        title="Buat password sementara baru dan tampilkan"
+                                        onClick={() => void resetPw(u)}
+                                      >
+                                        Lihat
+                                      </button>
+                                    </>
+                                  )}
                                 </span>
                               </td>
                               <td>{u.dept}</td>
