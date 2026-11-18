@@ -10239,11 +10239,11 @@ const makeRefPO = (taken: Set<string>): PO => {
    ===================================================================== */
 
 const ENV_ = ((import.meta as unknown as { env?: Record<string, string> }).env ?? {});
-// Taruh URL & token di file .env (VITE_SHEET_URL, VITE_SHEET_TOKEN), lalu HAPUS nilai cadangan di bawah. Token lama sudah terlanjur terbuka: ganti token baru di Code.gs.
+// URL & token diambil dari file .env (VITE_SHEET_URL, VITE_SHEET_TOKEN). Token tidak lagi punya nilai cadangan di kode.
 const SHEET_URL: string =
   ENV_.VITE_SHEET_URL ||
   'https://script.google.com/macros/s/AKfycbwUQI5PJkgXKLFgoxV4jI_GzNHg5zS14RjMbcTH9TMHpPgUR-vbJoCKLcORK0Zxmkk6/exec'; // URL hasil Deploy Apps Script
-const SHEET_TOKEN: string = ENV_.VITE_SHEET_TOKEN || 'argapura-PO-Agp2026'; // sama persis dengan TOKEN di Code.gs
+const SHEET_TOKEN: string = ENV_.VITE_SHEET_TOKEN || ''; // WAJIB diisi lewat .env (VITE_SHEET_TOKEN), sama persis dengan Script property TOKEN di Apps Script. Jangan ditulis di kode.
 const SHEET_POLL_MS = 20000; // aplikasi membaca ulang sheet tiap 20 detik
 
 type STable = Record<string, string>[];
@@ -11332,6 +11332,8 @@ export default function App() {
     window.setTimeout(() => setToast(''), 2300);
   };
 
+  // (hook harus di atas 'if (!me)' agar urutan hook tetap sama saat logout)
+  const [shownPw, setShownPw] = useState<Record<string, string>>({}); // password sementara hasil reset, hanya di layar admin (tidak disimpan)
   const hue = me?.role === 'admin' ? themeG : themeU ?? themeG;
   if (!me)
     return (
@@ -11799,7 +11801,6 @@ export default function App() {
     notify(`Hak akses ${u.nama} diubah menjadi ${lbl(role)}.`);
   };
   /** Admin: reset password user menjadi password sementara (ditampilkan di tabel agar bisa diberikan ke user). */
-  const [shownPw, setShownPw] = useState<Record<string, string>>({}); // password sementara hasil reset, hanya di layar admin (tidak disimpan)
   const resetPw = async (u: User) => {
     if (
       !window.confirm(
