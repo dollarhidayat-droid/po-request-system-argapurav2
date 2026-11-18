@@ -10807,6 +10807,7 @@ function useSheetSync(
     busy.current = true;
     setStatus('sync');
     try {
+      if (!SHEET_TOKEN) throw new Error('Token belum diisi: set VITE_SHEET_TOKEN di Vercel (Environment Variables) lalu Redeploy');
       for (let attempt = 0; attempt < 4; attempt++) {
         let j = await api({ action: 'read' }).catch(() => ({ ok: false } as Awaited<ReturnType<typeof api>>));
         if (!j.ok || !j.data) {
@@ -10892,9 +10893,20 @@ function useSheetSync(
         last.current = '';
         setKick((k) => k + 1);
       }
+      SYNC_ERR = '';
       setStatus('saved');
       setOk(true);
-    } catch {
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      SYNC_ERR = /VITE_/.test(m)
+        ? m
+        : /token/i.test(m)
+        ? 'Token salah / belum sama dengan Script property TOKEN di Apps Script'
+        : /Failed to fetch|NetworkError|Unexpected token|JSON/i.test(m)
+        ? 'Apps Script tidak bisa dijangkau: pastikan sudah di-Deploy versi baru dengan akses "Anyone", dan URL benar'
+        : m === 'shrink'
+        ? 'Perubahan ditolak server karena data akan menyusut drastis'
+        : m;
       setStatus('error');
     } finally {
       busy.current = false;
@@ -10957,38 +10969,40 @@ function useSheetSync(
 
 type SyncStatus = 'loading' | 'offline' | 'sync' | 'saved' | 'error';
 
+let SYNC_ERR = ''; // alasan gagal sinkron terakhir (tampil di tooltip ikon)
 function SyncChip({ st }: { st: SyncStatus }) {
-  const m: Record<SyncStatus, [string, string, string]> = {
-    loading: ['Menghubungkan ke Google Sheet\u2026', '#8a5b00', '#fff4d6'],
-    offline: ['Tidak terhubung ke Google Sheet \u2013 data belum dibagikan. Mencoba ulang\u2026', '#b42318', '#fde8e8'],
-    sync: ['Menyinkronkan\u2026', '#0f5fc0', '#e6f1ff'],
-    error: ['Gagal sinkron, dicoba lagi otomatis', '#b42318', '#fde8e8'],
-    saved: ['\u25CF Tersinkron dengan Google Sheet', '#157347', '#e6f6ec'],
+  const m: Record<SyncStatus, [string, string]> = {
+    loading: ['Menghubungkan ke Google Sheet\u2026', '#d99100'],
+    offline: ['Tidak terhubung ke Google Sheet \u2013 data belum dibagikan. Mencoba ulang\u2026', '#d92d20'],
+    sync: ['Menyinkronkan\u2026', '#2e7bd6'],
+    error: ['Gagal sinkron, dicoba lagi otomatis', '#d92d20'],
+    saved: ['Terhubung & tersinkron dengan Google Sheet', '#16a34a'],
   };
-  const [text, fg, bg] = m[st];
+  const [text, col] = m[st];
+  const bad = st === 'offline' || st === 'error';
+  const tip = text + (bad && SYNC_ERR ? '\nPenyebab: ' + SYNC_ERR : '');
   return (
     <div
       role="status"
       aria-live="polite"
+      aria-label={tip}
+      title={tip}
       style={{
         position: 'fixed',
-        left: 10,
-        bottom: 10,
+        top: 10,
+        right: 12,
         zIndex: 99999,
-        maxWidth: 'calc(100vw - 20px)',
-        padding: '5px 12px',
-        borderRadius: 999,
-        fontSize: 12,
-        fontWeight: 600,
-        fontFamily: 'Arial,sans-serif',
-        color: fg,
-        background: bg,
-        border: '1px solid ' + fg + '55',
-        boxShadow: '0 1px 4px rgba(0,0,0,.15)',
-        pointerEvents: 'none',
+        width: 16,
+        height: 16,
+        borderRadius: '50%',
+        background: col,
+        border: '2px solid #fff',
+        boxShadow: '0 0 0 1px ' + col + '88, 0 2px 6px rgba(0,0,0,.3)',
+        cursor: 'help',
+        animation: st === 'sync' || st === 'loading' ? 'agpPulse 1s ease-in-out infinite' : undefined,
       }}
     >
-      {text}
+      <style>{'@keyframes agpPulse{0%,100%{opacity:1}50%{opacity:.35}}'}</style>
     </div>
   );
 }
