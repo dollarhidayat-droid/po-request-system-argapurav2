@@ -11909,24 +11909,22 @@ export default function App() {
   const resetPw = async (u: User) => {
     if (
       !window.confirm(
-        `Password asli ${u.nama} tidak bisa dilihat karena disimpan terenkripsi (hash).\n\nLanjut membuat password sementara baru? Password lama akan diganti dan password baru ditampilkan di tabel agar bisa diberikan ke user.`
+        `Reset password ${u.nama}?\n\nPassword lama diganti dengan password sementara baru yang dikirim otomatis ke ${u.email}.`
       )
     )
       return;
     const tmp = tmpPw();
-    setShownPw((m) => ({ ...m, [u.id]: tmp }));
     const th = await hashPw(tmp);
     setUsers((l) => l.map((x) => (x.id === u.id ? { ...x, pass: th } : x)));
     logH('-', `Reset password akun ${u.nama} (${u.email})`);
-    notify(`Password ${u.nama} direset: ${tmp}`);
-    void sendMail(u.email, 'Password akun PO Request System direset', mailReset(u, tmp)).then(
-      (ok) =>
-        notify(
-          ok
-            ? `Password ${u.nama} direset: ${tmp}. Email terkirim ke ${u.email}.`
-            : `Password ${u.nama} direset: ${tmp}. Email GAGAL terkirim, berikan password ini secara manual.`
-        )
-    );
+    notify(`Password ${u.nama} direset. Mengirim email ke ${u.email}...`);
+    const ok = await sendMail(u.email, 'Password akun PO Request System direset', mailReset(u, tmp));
+    if (ok) notify(`Password baru ${u.nama} sudah dikirim ke ${u.email}.`);
+    else {
+      // email gagal: tampilkan password di tabel agar admin bisa memberikannya manual
+      setShownPw((m) => ({ ...m, [u.id]: tmp }));
+      notify(`Email ke ${u.email} GAGAL terkirim. Password sementara ditampilkan di tabel, berikan ke user secara manual.`);
+    }
   };
   const readOne = (no: string) => {
     const p = pos.find((x) => x.no === no);
@@ -12721,18 +12719,22 @@ export default function App() {
                                       </code>{' '}
                                       <button
                                         type="button"
-                                        className="ghost"
+                                        className="pweye"
+                                        title="Salin password"
+                                        aria-label="Salin password"
                                         onClick={() => {
                                           void navigator.clipboard
                                             ?.writeText(shownPw[u.id])
                                             .then(() => notify('Password disalin.'));
                                         }}
                                       >
-                                        Salin
+                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
                                       </button>
                                       <button
                                         type="button"
-                                        className="ghost"
+                                        className="pweye"
+                                        title="Sembunyikan password"
+                                        aria-label="Sembunyikan password"
                                         onClick={() =>
                                           setShownPw((m) => {
                                             const { [u.id]: _x, ...r } = m;
@@ -12740,7 +12742,7 @@ export default function App() {
                                           })
                                         }
                                       >
-                                        Sembunyikan
+                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M17.9 17.9A10.6 10.6 0 0 1 12 19C5.6 19 2 12 2 12a18.5 18.5 0 0 1 5-5.9M9.9 5.2A10 10 0 0 1 12 5c6.4 0 10 7 10 7a18.6 18.6 0 0 1-2.2 3.2M1 1l22 22"/></svg>
                                       </button>
                                     </>
                                   ) : (
@@ -12750,12 +12752,12 @@ export default function App() {
                                       </code>{' '}
                                       <button
                                         type="button"
-                                        className="ghost"
+                                        className="pwreset"
                                         disabled={u.id === me.id}
-                                        title="Buat password sementara baru dan tampilkan"
+                                        title="Reset password dan kirim password baru ke email user"
                                         onClick={() => void resetPw(u)}
                                       >
-                                        Lihat
+                                        Reset
                                       </button>
                                     </>
                                   )}
@@ -14345,6 +14347,11 @@ th,td{border-color:rgba(160,195,235,.45)}
 .utbl .pwcell code{display:inline-block;box-sizing:border-box;width:80px;height:17px;line-height:17px;padding:0 7px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;letter-spacing:1px;border-radius:9px}
 .utbl .pwcell code,.pwcell code{color:#fff!important;font-weight:600;background:linear-gradient(135deg,#0a3a8e,#0b5fba 55%,#1295d6)!important;border:1px solid rgba(255,255,255,.55);box-shadow:0 2px 8px rgba(10,60,140,.3),inset 0 1px 0 rgba(255,255,255,.35);text-shadow:0 1px 1px rgba(0,20,70,.45)}
 .utbl .pwcell .pweye{width:18px;height:18px;min-width:18px;padding:0;margin:0;display:inline-grid;place-items:center;border-radius:9px;color:#0f5fc0;background:linear-gradient(145deg,#fff,rgba(200,225,252,.85));border:1px solid rgba(15,95,192,.35);box-shadow:0 2px 6px rgba(30,90,170,.18),inset 0 1px 0 #fff;transition:transform .15s,box-shadow .2s,background .2s}
+.utbl .pwcell code[title^="Password sementara"]{width:auto;min-width:80px;max-width:170px;font-size:11px;letter-spacing:.5px;user-select:all}
+.utbl .pwcell .pwreset{height:18px;padding:0 9px;font-size:10px;font-weight:700;line-height:1;border-radius:9px;color:#0f5fc0;background:linear-gradient(145deg,#fff,rgba(200,225,252,.85));border:1px solid rgba(15,95,192,.35);box-shadow:0 2px 6px rgba(30,90,170,.18),inset 0 1px 0 #fff;cursor:pointer;transition:transform .15s,box-shadow .2s,background .2s}
+.utbl .pwcell .pwreset:hover:not(:disabled){transform:translateY(-1px);background:linear-gradient(135deg,#1e7fe0,#0f5fc0);color:#fff}
+.utbl .pwcell .pwreset:disabled{opacity:.4;cursor:not-allowed}
+.utbl .pwcell .pweye:disabled{opacity:.4;cursor:not-allowed}
 .utbl .pwcell .pweye:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(30,90,170,.3);background:linear-gradient(135deg,#1e7fe0,#0f5fc0);color:#fff}
 .auth .face .eye{display:grid;place-items:center;padding:4px 7px}
 .utbl .actsel{height:18px;min-height:0;width:140px;max-width:100%;padding:0 20px 0 9px;border-radius:9px;font-size:10.5px;font-weight:700;cursor:pointer}.utbl .actsel:disabled{opacity:.55;cursor:not-allowed}
