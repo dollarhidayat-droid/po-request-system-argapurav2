@@ -10892,9 +10892,21 @@ function useSheetSync(
         wipe.current = 0;
         const localT = toTables(cur.current);
         const dirty = !!baseT.current && JSON.stringify(localT) !== last.current;
+        // SINKRON PERTAMA di browser ini: tabel Supplier BP / Master Supplier yang masih KOSONG di sheet tetapi berisi di aplikasi
+        // dikirim ke sheet, bukan dibuang. (Dulu isi aplikasi diganti dengan tabel sheet yang kosong, sehingga data BP hilang.)
+        let seeded = remote;
+        if (!baseT.current) {
+          const bpL = cur.current.bps;
+          const seed: STables = { ...remote };
+          if (!(remote.Supplier_BP ?? []).length && bpL.length && JSON.stringify(bpL) !== JSON.stringify(DEF_BP))
+            seed.Supplier_BP = localT.Supplier_BP ?? [];
+          if (!(remote.Master_Supplier ?? []).length && cur.current.msup.length)
+            seed.Master_Supplier = localT.Master_Supplier ?? [];
+          seeded = seed;
+        }
         const merged =
           !baseT.current || !dirty
-            ? remote
+            ? seeded
             : mergeTables(baseT.current, localT, remote);
         const st = fromTables(merged, cur.current);
         const norm = toTables(st);
