@@ -268,7 +268,7 @@ const bpInfo = (exp: string) => {
 /** Supplier BP milik vendor sebuah PO (dicocokkan lewat nama) + status expired-nya. */
 const bpOfPo = (bps: BP[], p: PO) => {
   const bp = bps.find(
-    (b) => b.nama.trim().toLowerCase() === p.v.nama.trim().toLowerCase()
+    (b) => supKey(b.nama) === supKey(p.v.nama)
   );
   return { bp, bi: bp ? bpInfo(bp.exp) : null };
 };
@@ -371,6 +371,20 @@ const MS_KEYS: { k: MKey; l: string; syn: string[] }[] = [
 ];
 const MS_PO_REQ: MKey[] = ['alamat', 'email', 'npwp', 'pic', 'telp', 'rek', 'bank', 'cabang', 'an']; // isian form PO yang wajib diisi (selain Fax)
 const msNorm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+/** Kunci nama supplier: bentuk badan usaha (PT, CV, UD, PD, FA, Tbk, Persero) dan tanda baca diabaikan, di depan maupun di belakang.
+    "PT VICTORINDO KIMIATAMA", "VICTORINDO KIMIATAMA, PT" dan "P.T. Victorindo Kimiatama" → kunci yang sama. */
+const ENTITY_WORDS = new Set(['pt', 'cv', 'ud', 'pd', 'fa', 'tbk', 'persero']);
+const supKey = (s: string) => {
+  const t = (s ?? '')
+    .toLowerCase()
+    .replace(/\bp\.\s?t\b\.?/g, ' pt ')
+    .replace(/\bc\.\s?v\b\.?/g, ' cv ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(' ')
+    .filter((w) => w && !ENTITY_WORDS.has(w))
+    .join('');
+  return t || msNorm(s ?? '');
+};
 const msTxt = (x: unknown) => String(x ?? '').replace(/\s+/g, ' ').trim();
 const msField = (h: string): MKey | null => {
   const n = msNorm(h);
@@ -437,7 +451,7 @@ function msMerge(cur: MSup[], inc: MsRow[], replace: boolean) {
   const byName = new Map<string, number>();
   const ids = new Set<string>();
   const idx = (m: MSup, i: number) => {
-    byName.set(msNorm(m.nama), i);
+    byName.set(supKey(m.nama), i);
     ids.add(m.id);
   };
   base.forEach(idx);
@@ -445,7 +459,7 @@ function msMerge(cur: MSup[], inc: MsRow[], replace: boolean) {
     upd = 0,
     same = 0;
   inc.forEach((r) => {
-    const i = byName.get(msNorm(r.nama));
+    const i = byName.get(supKey(r.nama));
     if (i !== undefined) {
       const o = base[i];
       const n = { ...o };
@@ -457,8 +471,8 @@ function msMerge(cur: MSup[], inc: MsRow[], replace: boolean) {
       base[i] = n;
       idx(n, i);
     } else {
-      let id = 'ms-' + hash32(msNorm(r.nama)).toString(36);
-      for (let c = 2; ids.has(id); c++) id = 'ms-' + hash32(msNorm(r.nama)).toString(36) + '-' + c;
+      let id = 'ms-' + hash32(supKey(r.nama)).toString(36);
+      for (let c = 2; ids.has(id); c++) id = 'ms-' + hash32(supKey(r.nama)).toString(36) + '-' + c;
       const m: MSup = { id, ...r };
       base.push(m);
       idx(m, base.length - 1);
@@ -3134,7 +3148,7 @@ function Form({
     setItems((l) => l.map((i) => (i.id === id ? { ...i, [k]: val } : i)));
   const history = pos.filter((p) => sameDept(p.dept, me.dept));
   const bp = v.nama.trim()
-    ? bps.find((b) => b.nama.toLowerCase() === v.nama.trim().toLowerCase())
+    ? bps.find((b) => supKey(b.nama) === supKey(v.nama))
     : undefined;
   const bi = bp ? bpInfo(bp.exp) : null;
   const bpWarn =
@@ -3384,7 +3398,7 @@ function Form({
                     sv('nama', val);
                     // nama cocok persis dengan Master Supplier & data umum masih kosong: isi otomatis
                     const m = msup.find(
-                      (x) => msNorm(x.nama) === msNorm(val)
+                      (x) => supKey(x.nama) === supKey(val)
                     );
                     if (
                       m &&
@@ -3406,7 +3420,7 @@ function Form({
                   </option>
                 ))}
                 {bps
-                  .filter((b) => !msup.some((m) => msNorm(m.nama) === msNorm(b.nama)))
+                  .filter((b) => !msup.some((m) => supKey(m.nama) === supKey(b.nama)))
                   .map((b) => (
                     <option key={b.id} value={b.nama}>
                       {b.kode}
@@ -4227,7 +4241,7 @@ const supplierRows = (list: PO[]): SupRow[] => {
   [...list]
     .sort((a, b) => a.iso.localeCompare(b.iso))
     .forEach((p) => {
-      const k = p.v.nama.trim().toLowerCase();
+      const k = supKey(p.v.nama);
       const x = m.get(k);
       m.set(k, {
         v: p.v,
@@ -4442,7 +4456,7 @@ function MasterSupplierPage({
     [pv, msup, replace]
   );
   const exist = useMemo(
-    () => new Set(msup.map((m) => msNorm(m.nama))),
+    () => new Set(msup.map((m) => supKey(m.nama))),
     [msup]
   );
   const save = () => {
@@ -4484,14 +4498,14 @@ function MasterSupplierPage({
     const r = {} as MsRow;
     MS_KEYS.forEach(({ k }) => (r[k] = msTxt(mf[k])));
     if (!r.nama) return notify('Isi Vendor Name.');
-    if (msup.some((m) => m.id !== eid && msNorm(m.nama) === msNorm(r.nama)))
+    if (msup.some((m) => m.id !== eid && supKey(m.nama) === supKey(r.nama)))
       return notify('Supplier dengan nama ini sudah ada. Gunakan Ubah pada daftar.');
     const miss = msMissing(r);
     if (eid) {
       setMsup((l) => l.map((m) => (m.id === eid ? { ...m, ...r } : m)));
       notify('Supplier diperbarui.');
     } else {
-      const base = 'ms-' + hash32(msNorm(r.nama)).toString(36);
+      const base = 'ms-' + hash32(supKey(r.nama)).toString(36);
       setMsup((l) => {
         let id = base;
         for (let c = 2; l.some((m) => m.id === id); c++) id = base + '-' + c;
@@ -4664,7 +4678,7 @@ function MasterSupplierPage({
                             <div className="mute small">{r.rek}</div>
                           </td>
                           <td>
-                            {!replace && exist.has(msNorm(r.nama))
+                            {!replace && exist.has(supKey(r.nama))
                               ? 'Update'
                               : 'Baru'}
                           </td>
@@ -4927,7 +4941,7 @@ function BPPage({
       return notify('Kode BP sudah dipakai.');
     if (
       bps.some(
-        (b) => b.id !== eid && b.nama.toLowerCase() === nama.toLowerCase()
+        (b) => b.id !== eid && supKey(b.nama) === supKey(nama)
       )
     )
       return notify('Nama supplier BP sudah terdaftar.');
@@ -7970,7 +7984,7 @@ function Dashboard({
 
   const sm = new Map<string, { nama: string; n: number; t: number }>();
   cur.forEach((p) => {
-    const k = p.v.nama.trim().toLowerCase();
+    const k = supKey(p.v.nama);
     const x = sm.get(k);
     sm.set(k, { nama: p.v.nama, n: (x?.n ?? 0) + 1, t: (x?.t ?? 0) + p.total });
   });
@@ -10512,7 +10526,7 @@ function fromTables(t: STables, cur: SyncData): SyncData {
         .map((r) => {
           const o = {} as MSup;
           MS_KEYS.forEach(({ k }) => (o[k] = msTxt(r[k])));
-          o.id = msTxt(r.id) || 'ms-' + hash32(msNorm(o.nama)).toString(36);
+          o.id = msTxt(r.id) || 'ms-' + hash32(supKey(o.nama)).toString(36);
           return o;
         })
     : cur.msup;
@@ -10631,7 +10645,7 @@ const SYNC_KEYS: Record<string, (r: SRow) => string> = {
   Pajak: (r) => r.id || (r.nama ?? '') + '|' + (r.persen ?? '') + '|' + (r.tipe ?? ''),
   Kategori: (r) => (r.name ?? '').toLowerCase(),
   Supplier_BP: (r) => r.id || r.kode || '',
-  Master_Supplier: (r) => r.id || msNorm(r.nama ?? ''),
+  Master_Supplier: (r) => supKey(r.nama ?? '') || r.id || '', // kunci = nama supplier: dua user menambah supplier yang sama bersamaan menyatu, tidak dobel
   PO: (r) => r.no ?? '',
   Change_History: (r) => r.id || (r.iso ?? '') + '|' + (r.by ?? '') + '|' + (r.what ?? ''),
   Penomoran: (r) => r.tahun ?? '',
@@ -10712,7 +10726,34 @@ function mergeTable(name: string, base: SRow[], local: SRow[], remote: SRow[]): 
   );
   return out;
 }
-function mergeTables(base: STables, local: STables, remote: STables): STables {
+/** Dua user mengirim PO bersamaan dan sama-sama mendapat nomor yang sama: PO lokal yang baru diberi nomor berikutnya,
+    sehingga PO milik user lain TIDAK tertimpa. Item, riwayat, dan tautan PO pengganti ikut diperbarui. */
+function fixPoClash(base: STables, local: STables, remote: STables): STables {
+  const inBase = new Set((base.PO ?? []).map((r) => r.no));
+  const rMap = new Map((remote.PO ?? []).map((r) => [r.no, r] as const));
+  const taken = new Set<string>([...(remote.PO ?? []), ...(local.PO ?? [])].map((r) => r.no));
+  const ren = new Map<string, string>();
+  (local.PO ?? []).forEach((r) => {
+    const x = rMap.get(r.no);
+    if (!inBase.has(r.no) && x && (x.iso ?? '') !== (r.iso ?? '')) {
+      const nn = uniqueNo(r.no, taken);
+      taken.add(nn);
+      ren.set(r.no, nn);
+    }
+  });
+  if (!ren.size) return local;
+  const mv = (v?: string) => (v !== undefined && ren.has(v) ? (ren.get(v) as string) : v);
+  const o: STables = { ...local };
+  o.PO = (local.PO ?? []).map((r) => {
+    const isNew = ren.has(r.no) && !inBase.has(r.no);
+    return { ...r, no: isNew ? (mv(r.no) as string) : r.no, ...(r.prevNo ? { prevNo: mv(r.prevNo) as string } : {}) };
+  });
+  o.PO_Items = (local.PO_Items ?? []).map((r) => ({ ...r, no: mv(r.no) as string }));
+  o.Change_History = (local.Change_History ?? []).map((r) => ({ ...r, no: inBase.has(r.no) ? r.no : (mv(r.no) as string) }));
+  return o;
+}
+function mergeTables(base: STables, local0: STables, remote: STables): STables {
+  const local = fixPoClash(base, local0, remote);
   const b = foldPO(base),
     l = foldPO(local),
     r = foldPO(remote);
@@ -11323,6 +11364,44 @@ export default function App() {
       evs.forEach((e) => window.removeEventListener(e, reset, true));
     };
   }, [me?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  /** Supplier yang diketik di form PO otomatis masuk Master Supplier (bila belum ada) dan ikut tersinkron ke semua user.
+      Bila sudah ada, hanya kolom yang masih kosong yang dilengkapi; data lama tidak ditimpa. */
+  const autoSupplier = (p: PO) => {
+    const nama = p.v.nama.trim();
+    if (!nama) return;
+    const k = supKey(nama);
+    const pay = p.pay ?? EMPTY_PAY;
+    const inc: MsRow = {
+      nama,
+      alamat: p.v.alamat.trim(),
+      provinsi: '',
+      npwp: p.v.npwp.trim(),
+      telp: p.v.telp.trim(),
+      fax: p.v.fax.trim(),
+      pic: p.v.pic.trim(),
+      dept: p.dept ?? '',
+      email: p.v.email.trim(),
+      rek: pay.rek.trim(),
+      bank: pay.bank.trim(),
+      cabang: pay.cabang.trim(),
+      an: pay.an.trim(),
+    };
+    setMsup((l) => {
+      const i = l.findIndex((m) => supKey(m.nama) === k);
+      if (i < 0) {
+        const ids = new Set(l.map((m) => m.id));
+        let id = 'ms-' + hash32(k).toString(36);
+        for (let c = 2; ids.has(id); c++) id = 'ms-' + hash32(k).toString(36) + '-' + c;
+        return [...l, { id, ...inc }];
+      }
+      const o = l[i];
+      const n = { ...o };
+      MS_KEYS.forEach(({ k: f }) => {
+        if (!(n[f] ?? '').trim() && inc[f]) n[f] = inc[f];
+      });
+      return JSON.stringify(n) === JSON.stringify(o) ? l : l.map((m, j) => (j === i ? n : m));
+    });
+  };
   // Catat siapa mengubah apa, kapan, pada PO mana (maks. 1000 baris terakhir disimpan)
   const logH = (no: string, what: string) => {
     if (!me) return;
@@ -12327,6 +12406,7 @@ export default function App() {
                       resent: new Date().toISOString(),
                     };
                     setPos((l) => l.map((x) => (x.no === fixedNo ? p : x)));
+                    autoSupplier(p);
                     logH(
                       fixedNo,
                       'Pengajuan diperbaiki & dikirim ulang oleh user (setelah ditolak)'
@@ -12349,6 +12429,7 @@ export default function App() {
                       p.prevNo && x.no === p.prevNo ? { ...x, newNo: p.no } : x
                     ),
                   ]);
+                  autoSupplier(p);
                   logH(
                     p.no,
                     p.prevNo
