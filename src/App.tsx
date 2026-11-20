@@ -11457,6 +11457,9 @@ export default function App() {
   const [prevPg, setPrevPg] = useState(''); // halaman sebelum membuka Dokumen PO (untuk tombol Kembali)
   const [, setBackTo] = useState(''); // halaman asal dokumen PO (mis. "tracking"); kosong = dibuka langsung, tanpa tombol kembali
   const [trkFocus, setTrkFocus] = useState(''); // nomor PO yang dibuka dari drilldown dashboard
+  useEffect(() => {
+    if (page !== 'tracking') setTrkFocus('');
+  }, [page]);
   const [mdOpen, setMdOpen] = useState(true);
   /* Mode HP/tablet: sidebar menjadi drawer geser (dibuka lewat tombol hamburger) */
   const [navOpen, setNavOpen] = useState(false);
@@ -12340,9 +12343,6 @@ export default function App() {
     setTrkFocus(no);
     go('tracking');
   };
-  useEffect(() => {
-    if (cur !== 'tracking') setTrkFocus('');
-  }, [cur]);
   const viewAll = (f: string) => {
     if (admin) {
       setFStat(f);
