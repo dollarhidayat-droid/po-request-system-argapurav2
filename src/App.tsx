@@ -8167,6 +8167,14 @@ function Dashboard({
     })
     .sort((x, y) => y.t - x.t || x.d.localeCompare(y.d, 'id'));
 
+  // tabel Tahap Tracking: departemen dengan progres (%) terendah di atas; yang belum punya PO aktif di bawah
+  const stgRows = [...dRows].sort(
+    (x, y) =>
+      Number(x.na === 0) - Number(y.na === 0) ||
+      x.pct - y.pct ||
+      y.na - x.na ||
+      x.d.localeCompare(y.d, 'id')
+  );
   const sm = new Map<string, { nama: string; n: number; t: number }>();
   cur.forEach((p) => {
     const k = supKey(p.v.nama);
@@ -8695,61 +8703,108 @@ function Dashboard({
               : `Jumlah PO (dan persentasenya) pada tiap tahap tracking, departemen ${me.dept}`
           }
         >
-          <div className="tbl" style={{ maxHeight: 340, overflow: 'auto' }}>
-            <table className="dtbl">
-              <thead>
-                <tr>
-                  <th>Departemen</th>
-                  {TSTEPS.map((s, i) => (
-                    <th key={s.k} className="stg" title={s.l}>
-                      {i + 1}/{TSTEPS.length}
-                    </th>
+          <div className="stgscroll">
+            <div className="tbl stgbox" style={{ maxHeight: 340, overflow: 'auto' }}>
+              <table className="dtbl stgtbl">
+                <colgroup>
+                  <col style={{ width: '32%' }} />
+                  {TSTEPS.map((x) => (
+                    <col key={x.k} style={{ width: '8.1%' }} />
                   ))}
-                  <th className="stg" title="Rata-rata tahap selesai">
-                    Rata-rata
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {dRows.map((r) => (
-                  <tr key={'s' + r.d}>
-                    <td>
-                      <span className="dpn">
-                        <span className="dpi">
-                          <Ic n="users" s={14} />
+                  <col style={{ width: '11.3%' }} />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th
+                      className="hd0"
+                      style={{ zIndex: 30, '--c': '#0b3590' } as CSSProperties}
+                    >
+                      Departemen
+                    </th>
+                    {TSTEPS.map((s, i) => (
+                      <th
+                        key={s.k}
+                        className="stg hs"
+                        title={s.l}
+                        style={{ zIndex: 29 - i, '--c': STG_COL[i] } as CSSProperties}
+                      >
+                        {i + 1}/{TSTEPS.length}
+                      </th>
+                    ))}
+                    <th className="stg hl" title="Rata-rata tahap selesai">
+                      Rata-rata
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {stgRows.map((r) => (
+                    <tr key={'s' + r.d}>
+                      <td>
+                        <span className="sdn">
+                          <span className="sdi">
+                            <Ic n={deptIc(r.d)} s={16} />
+                          </span>
+                          {r.d}
                         </span>
-                        {r.d}
-                      </span>
-                    </td>
-                    {r.stg.map((n, i) => (
-                      <td key={i} className={'stg' + (n ? '' : ' z')}>
-                        {n ? (
+                      </td>
+                      {r.stg.map((n, i) => (
+                        <td key={i} className={'stg' + (n ? ' on' : ' z')}>
+                          {n ? (
+                            <>
+                              <b>{n}</b>
+                              <small>{Math.round((n / r.na) * 100)}%</small>
+                            </>
+                          ) : (
+                            '–'
+                          )}
+                        </td>
+                      ))}
+                      <td className={'stg' + (r.na ? ' on avg' : ' z')}>
+                        {r.na ? (
                           <>
-                            <b>{n}</b>
-                            <small>{Math.round((n / r.na) * 100)}%</small>
+                            <b>{r.avgDone.toFixed(1)}</b>
+                            <small>{r.pct}%</small>
                           </>
                         ) : (
                           '–'
                         )}
                       </td>
-                    ))}
-                    <td className="stg">
-                      <b>{r.na ? r.avgDone.toFixed(1) : '–'}</b>
-                      {r.na > 0 && <small>{r.pct}%</small>}
-                    </td>
-                  </tr>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="stgleg" aria-label="Legenda alur tahap tracking">
+              <div className="sl-title">
+                <b>
+                  Legenda
+                  <br />
+                  Alur ({TSTEPS.length} Tahap)
+                </b>
+                <Ic n="right" s={18} />
+              </div>
+              <ol className="sl-flow">
+                {TSTEPS.map((x, i) => (
+                  <li key={x.k} style={{ '--c': STG_COL[i] } as CSSProperties}>
+                    <span className="sl-no">
+                      {i + 1}/{TSTEPS.length}
+                    </span>
+                    <span className="sl-ic">
+                      <Ic n={STG_IC[i] ?? 'check'} s={26} />
+                    </span>
+                    <span className="sl-tx">
+                      {x.l}
+                      <em>({x.who})</em>
+                    </span>
+                  </li>
                 ))}
-              </tbody>
-            </table>
+              </ol>
+            </div>
           </div>
-          <div className="stglg" aria-label="Keterangan tahap tracking">
-            {TSTEPS.map((x, i) => (
-              <span key={x.k}>
-                <b>{i + 1}/{TSTEPS.length}</b> {x.l} <em>({x.who})</em>
-              </span>
-            ))}
-          </div>
-          <p className="mute small" style={{ margin: '8px 4px 0' }}>
+          <p className="stginfo">
+            <span className="i">
+              <Ic n="info" s={14} />
+            </span>
             Contoh: 2/7 = PO sudah melewati 2 dari 7 tahap tracking (dibuat dan di-approve).
             PO yang ditolak tidak dihitung.
           </p>
@@ -8889,6 +8944,22 @@ const poState = (p: PO) =>
 /** Batas nilai PO: di atas Rp 10 juta wajib approve Managing Director. */
 const PO_LIMIT = 10_000_000;
 /** Nominal untuk dashboard: PO yang di-Reject tidak dihitung (PO yang di-Cancel sudah tidak ada di daftar). */
+/** warna header/legend tiap tahap (biru -> ungu) dan ikonnya */
+const STG_COL = ['#1d6bdc', '#2f6be0', '#4467e0', '#5864de', '#6a60da', '#795fd5', '#845dcf'];
+const STG_IC = ['filePlus', 'user', 'truck', 'box', 'fileList', 'check', 'card'];
+/** ikon departemen untuk tabel tahap tracking (cocokkan dari nama, default: users) */
+const deptIc = (d: string) => {
+  const n = d.toLowerCase();
+  if (/product/.test(n)) return 'gear';
+  if (/account/.test(n)) return 'receipt';
+  if (/automotive|vehicle|otomotif/.test(n)) return 'truck';
+  if (/business|bisnis/.test(n)) return 'chart';
+  if (/engineer|project/.test(n)) return 'grid';
+  if (/facility|service/.test(n)) return 'building';
+  if (/financ|keuangan/.test(n)) return 'coins';
+  if (/hr|human|people/.test(n)) return 'user';
+  return 'users';
+};
 const nomOf = (p: PO) => (p.rej ? 0 : p.total);
 const isBig = (p: PO) => p.total > PO_LIMIT;
 
@@ -15365,6 +15436,37 @@ button,.nv,.bell,.mebtn{touch-action:manipulation}
 .dtbl td.stg.z{color:#a0a9b8}
 .dtbl tr.drill:hover{background:rgba(21,150,214,.07)}.dtbl tr.drillrow>td{padding:6px 10px 12px;background:rgba(21,150,214,.04)}.dtbl tr.drillrow .dtbl{margin:0}
 .stglg{display:flex;flex-wrap:wrap;gap:6px 16px;margin:10px 4px 0;font-size:12px;color:#33445c}.stglg em{font-style:normal;color:#6b7c95}.stglg b{display:inline-block;min-width:30px;margin-right:4px;padding:1px 6px;border-radius:8px;background:rgba(21,150,214,.14);color:#0f5fc0;text-align:center;font-weight:700}
+/* ===== Tabel tahap tracking: header panah + legenda alur ===== */
+.stgscroll{overflow-x:auto;padding-bottom:2px}.stgscroll>*{min-width:860px}
+.dash .dcard table.dtbl.stgtbl{table-layout:fixed;border-collapse:separate;border-spacing:0;width:100%}
+.dash .dcard table.dtbl.stgtbl thead th{position:sticky;top:0;height:44px;padding:0 4px;border:0;background:var(--c,#1d6bdc);color:#fff;font-size:15px;font-weight:800;text-align:center;box-shadow:inset 0 1px 0 rgba(255,255,255,.35);overflow:visible}
+.dash .dcard table.dtbl.stgtbl thead th.hd0{text-align:left;padding-left:20px;font-size:17px;border-radius:22px 0 0 22px;background:linear-gradient(90deg,#0a2a85,#0b3590)}
+.dash .dcard table.dtbl.stgtbl thead th.hl{border-radius:0 22px 22px 0;background:linear-gradient(90deg,#2a3a9c,#1f3085);z-index:1;padding-left:10px}
+.dash .dcard table.dtbl.stgtbl thead th.hd0::before,.dash .dcard table.dtbl.stgtbl thead th.hs::before,.dash .dcard table.dtbl.stgtbl thead th.hd0::after,.dash .dcard table.dtbl.stgtbl thead th.hs::after{content:"";position:absolute;top:0;width:0;height:0;border-top:22px solid transparent;border-bottom:22px solid transparent}
+.dash .dcard table.dtbl.stgtbl thead th::before{right:-17px;border-left:17px solid rgba(255,255,255,.92)}
+.dash .dcard table.dtbl.stgtbl thead th::after{right:-14px;border-left:14px solid var(--c)}
+.dash .dcard table.dtbl.stgtbl thead th.hl::before,.dash .dcard table.dtbl.stgtbl thead th.hl::after{display:none}
+.dash .dcard table.dtbl.stgtbl thead th.hs{padding-left:16px}
+.dash .dcard table.dtbl.stgtbl tbody td{padding:5px 6px;border:0;font-size:13px;vertical-align:middle;background:rgba(255,255,255,.55);color:#0d2a57}
+.dash .dcard table.dtbl.stgtbl tbody tr:nth-child(even) td{background:rgba(196,210,250,.4)}
+.dash .dcard table.dtbl.stgtbl tbody td.stg{text-align:center}
+.dash .dcard table.dtbl.stgtbl tbody td.stg.z{font-weight:800;color:#0d2a57}
+.dash .dcard table.dtbl.stgtbl tbody td.stg.on{background:rgba(255,255,255,.9);border-radius:12px;box-shadow:0 0 0 2px rgba(120,150,240,.18) inset}
+.dash .dcard table.dtbl.stgtbl tbody td.stg b{display:block;font-size:16px;font-weight:800;color:#0d2a57;line-height:1.1}
+.dash .dcard table.dtbl.stgtbl tbody td.stg small{display:inline-block;margin-top:3px;padding:1px 9px;border-radius:10px;background:#e6edff;border:1px solid rgba(40,90,220,.3);color:#1d4fd0;font-size:11px;font-weight:700}
+.sdn{display:inline-flex;align-items:center;gap:12px;font-weight:700;color:#0d2a57;font-size:14px}
+.sdi{flex:none;width:30px;height:30px;border-radius:50%;display:inline-grid;place-items:center;color:#fff;background:linear-gradient(145deg,#4a8cf5,#1d4fd0);box-shadow:0 2px 6px rgba(29,79,208,.35)}
+.stgleg{display:grid;grid-template-columns:150px 1fr;gap:14px;align-items:stretch;margin-top:16px;padding:12px;border-radius:22px;background:rgba(255,255,255,.35);border:1px solid rgba(255,255,255,.8)}
+.stgleg .sl-title{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:10px 14px;border-radius:18px;color:#fff;background:linear-gradient(135deg,#7a5fe0,#5b7be8);font-size:15px;line-height:1.25;box-shadow:0 4px 12px rgba(91,123,232,.35)}
+.stgleg .sl-flow{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:14px}
+.stgleg .sl-flow li{position:relative;display:grid;grid-template-columns:auto 1fr;grid-template-rows:auto 1fr;align-items:center;row-gap:6px;padding:8px 8px 10px;border-radius:14px;background:rgba(255,255,255,.7);border:1px solid rgba(255,255,255,.9);box-shadow:0 2px 8px rgba(60,90,200,.1)}
+.stgleg .sl-no{justify-self:start;padding:2px 9px;border-radius:12px;background:var(--c);color:#fff;font-size:12px;font-weight:800}
+.stgleg .sl-ic{justify-self:end;color:var(--c);display:inline-flex}
+.stgleg .sl-tx{grid-column:1/-1;text-align:center;font-size:12px;line-height:1.3;color:#1b2f5a}
+.stgleg .sl-tx em{display:block;font-style:normal;color:#4a5d86}
+.stgleg .sl-flow li:not(:last-child)::after{content:"›";position:absolute;right:-13px;top:50%;transform:translateY(-50%);width:16px;height:16px;border-radius:50%;background:#fff;color:#4467e0;font-weight:800;font-size:14px;line-height:15px;text-align:center;box-shadow:0 1px 4px rgba(60,90,200,.3);z-index:2}
+.stginfo{display:flex;align-items:center;gap:8px;margin:10px 4px 0;font-size:12.5px;color:#33445c}
+.stginfo .i{flex:none;width:22px;height:22px;border-radius:50%;display:inline-grid;place-items:center;color:#fff;background:#6a60da}
 .auth .scene{zoom:.8}
 @media(max-width:700px){.auth .scene{zoom:.92}}
 `;
