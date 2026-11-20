@@ -9091,7 +9091,14 @@ function AllPage({
               <span>PO</span>
               <em>{rp(sumOf(l))}</em>
             </div>
-            <span className="ap-lims">{sub}</span>
+            <span
+              className="ap-lims"
+              style={k === 'atas' && !l.length ? { color: '#6b7280' } : undefined}
+            >
+              {k === 'atas' && !l.length
+                ? 'Tidak ada PO di atas Rp 10 juta (tidak perlu approve Managing Director)'
+                : sub}
+            </span>
           </button>
         ))}
       </div>
