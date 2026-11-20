@@ -2651,7 +2651,7 @@ function PoViewer({
 }) {
   const html = useMemo(() => poHtml(po), [po]);
   const pn = po.printN ?? 0;
-  const blocked = !admin && pn > 0 && !po.printOk; // user: sudah dicetak, tunggu izin admin
+  const blocked = false; // batas cetak 1× dihapus: PO yang sudah di-approve boleh dicetak/diunduh berulang kali
   const blockTip = `Sudah dicetak ${pn}× — hanya admin yang bisa mengizinkan cetak ulang`;
   const frame = useRef<HTMLIFrameElement>(null);
   const box = useRef<HTMLDivElement>(null);
@@ -2676,14 +2676,6 @@ function PoViewer({
   const print = () => {
     const w = frame.current?.contentWindow;
     if (!w) return;
-    if (
-      admin &&
-      pn > 0 &&
-      !window.confirm(
-        `PO ini sudah dicetak ${pn}×. Cetak lagi? (akan tercatat di riwayat perubahan)`
-      )
-    )
-      return;
     const t = document.title;
     document.title = 'PO ' + po.no.split('/').join('-'); // nama file default saat Simpan sebagai PDF
     w.focus();
@@ -2695,7 +2687,6 @@ function PoViewer({
   };
   // membuka tab baru = bisa dicetak dari sana, jadi dihitung sebagai cetak juga
   const newTab = () => {
-    if (admin && pn > 0 && !window.confirm(`PO ini sudah dicetak ${pn}×. Buka & cetak lagi?`)) return;
     window.open(
       URL.createObjectURL(new Blob([html], { type: 'text/html' })),
       '_blank'
@@ -3877,7 +3868,7 @@ function PoTable({
             const done = p.status === 'Done';
             const lk = lockedOf?.(p) ?? false;
             const pn = p.printN ?? 0;
-            const printLocked = pn > 0 && !p.printOk; // sudah dicetak: user tidak bisa cetak lagi sampai admin mengizinkan
+            const printLocked = false; // batas cetak 1× dihapus
             return (
               <Fragment key={p.no}>
                 <tr>
@@ -11752,11 +11743,7 @@ export default function App() {
     const n = (p0.printN ?? 0) + 1;
     logH(
       no,
-      n === 1
-        ? 'PO dicetak (cetak pertama)'
-        : `Cetak ulang PO — dicetak lebih dari satu kali (cetak ke-${n}${
-            me?.role === 'admin' ? '' : ', diizinkan admin'
-          })`
+      n === 1 ? 'PO dicetak/diunduh (pertama kali)' : `PO dicetak/diunduh (ke-${n})`
     );
     setPos((l) =>
       l.map((p) =>
