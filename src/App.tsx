@@ -11295,6 +11295,32 @@ export default function App() {
     );
   }, [setPos]);
 
+  // Migrasi satu kali: dulu tombol Done admin otomatis mengisi tanggal tahap "PO di-approve" (tanda tangan atasan).
+  // Bersihkan tanggal otomatis itu: PO Done, tanggal appr = tanggal doneAt, dan belum ada tahap sesudahnya yang terisi.
+  // Untuk menjalankan ulang: hapus kunci "po_appr_fix_v1" di localStorage.
+  useEffect(() => {
+    try {
+      if (localStorage.getItem('po_appr_fix_v1')) return;
+      localStorage.setItem('po_appr_fix_v1', '1');
+    } catch {
+      return;
+    }
+    setPos((l) =>
+      l.map((x) => {
+        const a = x.trk?.appr;
+        if (!a || !x.doneAt || x.uid.startsWith('demo-') || x.uid === 'dummy-ref')
+          return x;
+        const later = (['supp', 'hoSend', 'hoRecv', 'recv', 'pay'] as TKey[]).some(
+          (k) => !!x.trk?.[k]
+        );
+        if (later || a !== ymd(new Date(x.doneAt))) return x;
+        const trk = { ...x.trk };
+        delete trk.appr;
+        return { ...x, trk };
+      })
+    );
+  }, [setPos]);
+
   // Data contoh Change History (dummy) untuk admin: dibuat sekali dari data contoh user & PO yang ada. Muat ulang: hapus kunci "po_hist_seed_v1".
   useEffect(() => {
     if (!pos.some((x) => x.uid.startsWith('demo-'))) return;
