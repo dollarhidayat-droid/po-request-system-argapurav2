@@ -8755,7 +8755,17 @@ function Dashboard({
                               <small>{Math.round((n / r.na) * 100)}%</small>
                             </>
                           ) : (
-                            '–'
+                            (() => {
+                              // PO aktif yang sudah melewati tahap ini = jumlah PO di tahap ini atau sesudahnya
+                              const passed = r.stg.slice(i).reduce((a, b) => a + b, 0);
+                              const cls = !r.na ? 'n' : passed >= r.na ? 'g' : 'y';
+                              const tip = !r.na
+                                ? 'Belum ada PO'
+                                : cls === 'g'
+                                ? 'Selesai (100%)'
+                                : `Belum selesai (${passed} dari ${r.na} PO sudah melewati tahap ini)`;
+                              return <i className={'stdot ' + cls} title={tip} aria-label={tip} />;
+                            })()
                           )}
                         </td>
                       ))}
@@ -8766,7 +8776,7 @@ function Dashboard({
                             <small>{r.pct}%</small>
                           </>
                         ) : (
-                          '–'
+                          <i className="stdot n" title="Belum ada PO" aria-label="Belum ada PO" />
                         )}
                       </td>
                     </tr>
@@ -15467,6 +15477,14 @@ button,.nv,.bell,.mebtn{touch-action:manipulation}
 .stgleg .sl-flow li:not(:last-child)::after{content:"›";position:absolute;right:-13px;top:50%;transform:translateY(-50%);width:16px;height:16px;border-radius:50%;background:#fff;color:#4467e0;font-weight:800;font-size:14px;line-height:15px;text-align:center;box-shadow:0 1px 4px rgba(60,90,200,.3);z-index:2}
 .stginfo{display:flex;align-items:center;gap:8px;margin:10px 4px 0;font-size:12.5px;color:#33445c}
 .stginfo .i{flex:none;width:22px;height:22px;border-radius:50%;display:inline-grid;place-items:center;color:#fff;background:#6a60da}
+.dash .dcard table.dtbl.stgtbl thead th{vertical-align:middle}
+.dash .dcard table.dtbl.stgtbl thead th.hl{padding:0;text-align:center;font-size:13px;font-weight:700;line-height:44px}
+.stdot{display:inline-block;width:10px;height:10px;border-radius:50%;vertical-align:middle}
+.stdot.g{background:#22b573;box-shadow:0 0 0 3px rgba(34,181,115,.18),0 0 6px rgba(34,181,115,.55)}
+.stdot.y{background:#f5b82e;box-shadow:0 0 0 3px rgba(245,184,46,.25),0 0 8px rgba(245,184,46,.8);animation:stBlink 1.1s ease-in-out infinite}
+.stdot.n{background:#c3cbe0}
+@keyframes stBlink{0%,100%{opacity:1;transform:scale(1);box-shadow:0 0 0 3px rgba(245,184,46,.3),0 0 10px rgba(245,184,46,.9)}50%{opacity:.35;transform:scale(.78);box-shadow:0 0 0 1px rgba(245,184,46,.1),0 0 2px rgba(245,184,46,.3)}}
+@media(prefers-reduced-motion:reduce){.stdot.y{animation:none}}
 .auth .scene{zoom:.8}
 @media(max-width:700px){.auth .scene{zoom:.92}}
 `;
