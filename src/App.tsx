@@ -14911,8 +14911,6 @@ button,.nv,.bell,.mebtn{touch-action:manipulation}
 /* ===== Tombol Cetak PO: hijau = boleh cetak, merah = sudah dicetak (user terkunci, admin yang bisa mengizinkan ulang) ===== */
 .ghost.prgreen,button.prgreen{background:linear-gradient(180deg,#2fcf86,#12985a)!important;color:#fff!important;border:1px solid #0d7a43!important;box-shadow:0 3px 10px rgba(18,152,90,.4)!important;font-weight:700}
 .ghost.prgreen:hover,button.prgreen:hover{filter:brightness(1.07)}
-.ghost.prred,button.prred{background:linear-gradient(180deg,#f0566a,#c1243a)!important;color:#fff!important;border:1px solid #9a1a2c!important;box-shadow:0 3px 10px rgba(193,36,58,.4)!important;font-weight:700;cursor:not-allowed}
-.ghost.prred.adm{cursor:pointer}
 .prnote{display:inline-block;margin-top:2px;font-size:11.5px;font-weight:600;color:#5b6b7a}
 /* ===== Sidebar rapi & stabil (tidak berubah saat hover) ===== */
 @media(min-width:901px){
