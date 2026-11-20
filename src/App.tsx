@@ -11277,11 +11277,19 @@ function useSheetSync(
     s.brand(st.brand);
   };
   const api = async (body: Record<string, unknown>) => {
-    const r = await fetch(SHEET_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ token: SHEET_TOKEN, ...body }),
-    });
+    const ac = new AbortController();
+    const to = window.setTimeout(() => ac.abort(), 45000); // jangan menggantung selamanya bila Apps Script tidak menjawab
+    let r: Response;
+    try {
+      r = await fetch(SHEET_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ token: SHEET_TOKEN, ...body }),
+        signal: ac.signal,
+      });
+    } finally {
+      clearTimeout(to);
+    }
     return (await r.json()) as {
       ok: boolean;
       error?: string;
@@ -11304,7 +11312,12 @@ function useSheetSync(
         let j = await api({ action: 'read' }).catch(() => ({ ok: false } as Awaited<ReturnType<typeof api>>));
         if (!j.ok || !j.data) {
           // Code.gs lama belum diganti: baca lewat cara lama (GET)
-          const r = await fetch(SHEET_URL + '?token=' + encodeURIComponent(SHEET_TOKEN), { cache: 'no-store' });
+          const ac2 = new AbortController();
+          const to2 = window.setTimeout(() => ac2.abort(), 45000);
+          const r = await fetch(SHEET_URL + '?token=' + encodeURIComponent(SHEET_TOKEN), {
+            cache: 'no-store',
+            signal: ac2.signal,
+          }).finally(() => clearTimeout(to2));
           j = await r.json();
         }
         if (!j.ok || !j.data) throw new Error(j.error || 'gagal');
@@ -11406,6 +11419,8 @@ function useSheetSync(
         ? m
         : /token/i.test(m)
         ? 'Token salah / belum sama dengan Script property TOKEN di Apps Script'
+        : /abort|timeout/i.test(m)
+        ? 'Apps Script tidak menjawab dalam 45 detik: cek Deploy (akses \"Anyone\", versi terbaru) dan koneksi internet / ad-blocker'
         : /Failed to fetch|NetworkError|Unexpected token|JSON/i.test(m)
         ? 'Apps Script tidak bisa dijangkau: pastikan sudah di-Deploy versi baru dengan akses "Anyone", dan URL benar'
         : m === 'shrink'
