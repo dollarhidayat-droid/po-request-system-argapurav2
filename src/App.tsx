@@ -321,7 +321,10 @@ const DEF_BP: BP[] = [
   },
 ];
 const isAppr = (p: PO) => p.status === 'Done'; // approved (admin) = ditandai Done. Tanggal tracker "PO di-approve" (tanda tangan atasan) terpisah, diisi manual
-const isWait = (p: PO) => !p.rej && !isAppr(p); // menunggu approval (rej = tanggal ditolak admin)
+const isWait = (p: PO) => !p.rej && !isAppr(p); // antrean admin: belum ditandai Done (rej = tanggal ditolak admin)
+/** Dashboard: PO dianggap disetujui hanya bila tanggal tahap "PO di-approve" (tanda tangan atasan) sudah diisi. */
+const isSigned = (p: PO) => !p.rej && !!p.trk?.appr;
+const isSignWait = (p: PO) => !p.rej && !p.trk?.appr;
 const EMPTY_PAY: Pay = { rek: '', bank: '', cabang: '', an: '' };
 const EMPTY: Vendor = {
   nama: '',
@@ -7222,16 +7225,23 @@ const lite = (hex: string, t: number) => {
 };
 
 /** grafik batang (nilai PO) + garis (jumlah PO) bergaya kaca berkilau. Batang tumbuh dari bawah, garis tergambar. */
+type PoStat = { no: string; v: number; iso: string };
 function TrendChart({
   data,
   sel,
   onPick,
   avgSub,
+  poHi,
+  poLo,
+  poAvg,
 }: {
   data: { l: string; t: number; n: number; m: number }[];
   sel: number | null;
   onPick: (m: number | null) => void;
   avgSub: string;
+  poHi: PoStat | null; // PO bernilai tertinggi pada jendela tren (per PO, bukan akumulasi bulan)
+  poLo: PoStat | null; // PO bernilai terendah
+  poAvg: number | null; // rata-rata nilai per PO
 }) {
   const act = sel === null ? -1 : data.findIndex((d) => d.m === sel); // bar bulan yang sedang menjadi filter
   const rest = act >= 0 ? act : data.length - 1;
@@ -7276,16 +7286,14 @@ function TrendChart({
       return `C${mid},${py} ${mid},${y} ${x},${y}`;
     })
     .join('');
-  // ringkasan: tertinggi / rata-rata (total / jumlah bulan) / terendah (dari bulan yang ada PO-nya)
-  const nz = data.filter((d) => d.t > 0);
-  const hi = nz.length ? nz.reduce((a, b) => (b.t > a.t ? b : a)) : null;
-  const lo = nz.length ? nz.reduce((a, b) => (b.t < a.t ? b : a)) : null;
+  // ringkasan: tertinggi / rata-rata / terendah dihitung per PO (bukan akumulasi per bulan)
+  const hi = poHi;
+  const lo = poLo;
   const tot = data.reduce((a, d) => a + d.t, 0);
-  const mLbl = (m: number) =>
-    new Date(Math.floor(m / 12), m % 12, 1).toLocaleDateString('id-ID', {
-      month: 'short',
-      year: 'numeric',
-    });
+  const poLbl = (x: PoStat) => {
+    const q = seqOf(x.no);
+    return `PO ${q ? q.n : x.no} · ${fmt(x.iso)}`;
+  };
   const cc = (c: string) => ({ '--c': c } as CSSProperties);
   return (
     <>
@@ -7558,24 +7566,24 @@ function TrendChart({
             <i style={cc('#22b573')} />
             Tertinggi
           </span>
-          <b>{hi ? short(hi.t, 1) : '—'}</b>
-          <small>{hi ? mLbl(hi.m) : '—'}</small>
+          <b>{hi ? short(hi.v, 1) : '—'}</b>
+          <small>{hi ? poLbl(hi) : '—'}</small>
         </div>
         <div className="ts">
           <span className="tl">
             <i style={cc('#f5b82e')} />
             Rata-rata
           </span>
-          <b>{short(tot / Math.max(1, data.length), 1)}</b>
-          <small>{avgSub}</small>
+          <b>{poAvg === null ? '—' : short(poAvg, 1)}</b>
+          <small>Per PO · {avgSub}</small>
         </div>
         <div className="ts">
           <span className="tl">
             <i style={cc('#ef4a5a')} />
             Terendah
           </span>
-          <b>{lo ? short(lo.t, 1) : '—'}</b>
-          <small>{lo ? mLbl(lo.m) : '—'}</small>
+          <b>{lo ? short(lo.v, 1) : '—'}</b>
+          <small>{lo ? poLbl(lo) : '—'}</small>
         </div>
         <div className="ts tot">
           <span className="tico">
@@ -7950,26 +7958,28 @@ function Dashboard({
   const prv = pp === null ? [] : list.filter((p) => inR(p, pRange(pp)));
   const sum = (a: PO[]) => ({
     n: a.length,
-    appr: a.filter((p) => !p.rej && isAppr(p)).length,
+    appr: a.filter(isSigned).length,
     rej: a.filter((p) => p.rej).length,
-    wait: a.filter(isWait).length,
+    wait: a.filter(isSignWait).length,
     v: a.reduce((x, p) => x + nomOf(p), 0),
   });
   const c = sum(cur),
     pv = sum(prv);
   const waitAt = (p: PO, t: number) => {
     if (new Date(p.iso).getTime() > t) return false;
-    const ap = p.doneAt ? new Date(p.doneAt).getTime() : Infinity;
+    const ap = p.trk?.appr
+      ? new Date(p.trk.appr + 'T00:00:00').getTime()
+      : Infinity;
     return ap > t && (p.rej ? new Date(p.rej).getTime() : Infinity) > t;
   };
   const wWeek = cur.filter((p) => waitAt(p, now - 7 * 86400000)).length;
   const vs = pp === null ? 'Semua periode' : `vs ${pLabel(pp)}`;
   // rata-rata waktu approval (hari) dari PO yang sudah disetujui
   const apprTs = (p: PO) =>
-    p.doneAt ? new Date(p.doneAt).getTime() : Infinity;
+    p.trk?.appr ? new Date(p.trk.appr + 'T00:00:00').getTime() : Infinity;
   const avgAppr = (a: PO[]) => {
     const xs = a
-      .filter((p) => !p.rej && isAppr(p))
+      .filter(isSigned)
       .map((p) => (apprTs(p) - new Date(p.iso).getTime()) / 86400000)
       .filter((x) => isFinite(x))
       .map((x) => Math.max(0, x));
@@ -7986,9 +7996,9 @@ function Dashboard({
     };
   }
   const apprV = cur
-    .filter((p) => !p.rej && isAppr(p))
+    .filter(isSigned)
     .reduce((x, p) => x + nomOf(p), 0);
-  const waitV = cur.filter(isWait).reduce((x, p) => x + nomOf(p), 0);
+  const waitV = cur.filter(isSignWait).reduce((x, p) => x + nomOf(p), 0);
   const kpis: {
     ic: string;
     g: string;
@@ -8072,6 +8082,22 @@ function Dashboard({
     };
   });
 
+  // tertinggi / terendah / rata-rata nilai PO tunggal pada jendela tren (PO ditolak tidak dihitung)
+  const winPos = list.filter((p) => {
+    const m = mkey(new Date(p.iso));
+    return !p.rej && m >= base - 5 && m <= base;
+  });
+  const asStat = (p: PO): PoStat => ({ no: p.no, v: p.total, iso: p.iso });
+  const poHi = winPos.length
+    ? asStat(winPos.reduce((a, b) => (b.total > a.total ? b : a)))
+    : null;
+  const poLo = winPos.length
+    ? asStat(winPos.reduce((a, b) => (b.total < a.total ? b : a)))
+    : null;
+  const poAvg = winPos.length
+    ? winPos.reduce((x, p) => x + p.total, 0) / winPos.length
+    : null;
+
   const cm = new Map<string, number>();
   const typeOf = new Map(catList.map((x) => [x.name, x.type] as const));
   cur.forEach((p) =>
@@ -8093,7 +8119,25 @@ function Dashboard({
   const dRows = depts
     .map((d) => {
       const a = cur.filter((p) => p.dept === d);
-      return { d, n: a.length, t: a.reduce((x, p) => x + nomOf(p), 0) };
+      // progres tracking hanya dari PO aktif (tidak ditolak): jumlah tahap selesai dari 7
+      const act = a.filter((p) => !p.rej);
+      const stg = Array.from({ length: TSTEPS.length }, () => 0); // stg[i] = jumlah PO di tahap (i+1)/7
+      act.forEach((p) => {
+        const dn = trackOf(p).done;
+        if (dn >= 1) stg[Math.min(dn, TSTEPS.length) - 1]++;
+      });
+      const avgDone = act.length
+        ? act.reduce((x, p) => x + trackOf(p).done, 0) / act.length
+        : 0;
+      return {
+        d,
+        n: a.length,
+        t: a.reduce((x, p) => x + nomOf(p), 0),
+        na: act.length,
+        stg,
+        avgDone,
+        pct: Math.round((avgDone / TSTEPS.length) * 100),
+      };
     })
     .sort((x, y) => y.t - x.t || x.d.localeCompare(y.d, 'id'));
 
@@ -8109,7 +8153,7 @@ function Dashboard({
     .sort((a, b) => b.iso.localeCompare(a.iso))
     .slice(0, 5);
   const waiting = list
-    .filter(isWait)
+    .filter(isSignWait)
     .sort((a, b) => a.iso.localeCompare(b.iso))
     .slice(0, 5);
   const days = (iso: string) =>
@@ -8117,7 +8161,7 @@ function Dashboard({
   const pill = (p: PO) =>
     p.rej
       ? ['Rejected', 's-rejected']
-      : isAppr(p)
+      : isSigned(p)
       ? ['Approved', 's-Done']
       : ['Menunggu', 's-Open'];
   const link = (txt: string, f: string) => (
@@ -8299,6 +8343,9 @@ function Dashboard({
             data={trend}
             sel={mi}
             avgSub={sem ? pLabel(sem) : '6 Bulan Terakhir'}
+            poHi={poHi}
+            poLo={poLo}
+            poAvg={poAvg}
             onPick={(m) =>
               onPer(
                 m === null
@@ -8447,12 +8494,14 @@ function Dashboard({
                   <th>Departemen</th>
                   <th>Jumlah PO</th>
                   <th>Total Nilai</th>
-                  <th>Persentase</th>
+                  <th title="Rata-rata progres tracking semua PO departemen (tahap selesai dari 7)">
+                    Progres Tracking
+                  </th>
                 </tr>
               </thead>
               <tbody>
                 {dRows.map((r, i) => {
-                  const pc = c.v ? Math.round((r.t / c.v) * 100) : 0;
+                  const pc = r.pct;
                   return (
                     <tr key={r.d}>
                       <td>
@@ -8477,7 +8526,9 @@ function Dashboard({
                               }}
                             />
                           </span>
-                          <span>{pc}%</span>
+                          <span title={`Rata-rata ${r.avgDone.toFixed(1)} dari ${TSTEPS.length} tahap`}>
+                            {pc}%
+                          </span>
                         </div>
                       </td>
                     </tr>
@@ -8521,6 +8572,70 @@ function Dashboard({
               </table>
             </div>
           )}
+        </DCard>
+      </div>
+
+      <div className="drow" key={'g' + k}>
+        <DCard
+          ic="building"
+          title="Tahap Tracking PO per Departemen"
+          sub={
+            admin
+              ? 'Jumlah PO (dan persentasenya) pada tiap tahap tracking, per departemen'
+              : `Jumlah PO (dan persentasenya) pada tiap tahap tracking, departemen ${me.dept}`
+          }
+        >
+          <div className="tbl" style={{ maxHeight: 340, overflow: 'auto' }}>
+            <table className="dtbl">
+              <thead>
+                <tr>
+                  <th>Departemen</th>
+                  {TSTEPS.map((s, i) => (
+                    <th key={s.k} className="stg" title={s.l}>
+                      {i + 1}/{TSTEPS.length}
+                    </th>
+                  ))}
+                  <th className="stg" title="Rata-rata tahap selesai">
+                    Rata-rata
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {dRows.map((r) => (
+                  <tr key={'s' + r.d}>
+                    <td>
+                      <span className="dpn">
+                        <span className="dpi">
+                          <Ic n="users" s={14} />
+                        </span>
+                        {r.d}
+                      </span>
+                    </td>
+                    {r.stg.map((n, i) => (
+                      <td key={i} className={'stg' + (n ? '' : ' z')}>
+                        {n ? (
+                          <>
+                            <b>{n}</b>
+                            <small>{Math.round((n / r.na) * 100)}%</small>
+                          </>
+                        ) : (
+                          '–'
+                        )}
+                      </td>
+                    ))}
+                    <td className="stg">
+                      <b>{r.na ? r.avgDone.toFixed(1) : '–'}</b>
+                      {r.na > 0 && <small>{r.pct}%</small>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="mute small" style={{ margin: '8px 4px 0' }}>
+            Contoh: 2/7 = PO sudah melewati 2 dari 7 tahap tracking (dibuat dan di-approve).
+            PO yang ditolak tidak dihitung.
+          </p>
         </DCard>
       </div>
 
@@ -15116,6 +15231,11 @@ button,.nv,.bell,.mebtn{touch-action:manipulation}
   .sc:last-child{border-bottom:0}
 }
 /* ===== Card login lebih kecil & proporsional ===== */
+/* ===== Tabel tahap tracking per departemen ===== */
+.dtbl th.stg,.dtbl td.stg{text-align:center;white-space:nowrap}
+.dtbl td.stg b{display:block;font-size:13px}
+.dtbl td.stg small{display:block;font-size:10.5px;color:#5b6b7a;font-weight:600}
+.dtbl td.stg.z{color:#a0a9b8}
 .auth .scene{zoom:.8}
 @media(max-width:700px){.auth .scene{zoom:.92}}
 `;
