@@ -166,15 +166,16 @@ const STATUSES: Status[] = ['Open', 'Done'];
 const TSTEPS: {
   k: 'made' | TKey;
   l: string;
-  by: 'auto' | 'admin' | 'user' | 'creator' | 'both';
+  who: string; // penanggung jawab tahap (ditampilkan di legend & kartu tracking)
+  by: 'auto' | 'admin' | 'user' | 'creator' | 'both' | 'finance';
 }[] = [
-  { k: 'made', l: 'PO dibuat', by: 'auto' },
-  { k: 'appr', l: 'PO di-approve', by: 'both' }, // = PO sudah ditandatangani atasan. Diisi manual (admin atau user pembuat PO), TIDAK otomatis dari tombol Done admin
-  { k: 'supp', l: 'PO dikirim ke supplier', by: 'creator' }, // diisi tanggal oleh user pembuat PO
-  { k: 'hoSend', l: 'PO dikirim ke kantor pusat', by: 'admin' },
-  { k: 'hoRecv', l: 'PO sampai di kantor pusat', by: 'admin' },
-  { k: 'recv', l: 'Barang diterima', by: 'both' }, // diisi user pembuat PO atau admin
-  { k: 'pay', l: 'PO proses pembayaran', by: 'admin' },
+  { k: 'made', l: 'PO dibuat', who: 'User', by: 'auto' },
+  { k: 'appr', l: 'PO di-approve', who: 'User / Admin HR', by: 'both' }, // = PO sudah ditandatangani atasan. Diisi manual, TIDAK otomatis dari tombol Done admin
+  { k: 'supp', l: 'PO dikirim ke supplier', who: 'Scan email / User', by: 'creator' }, // diisi tanggal oleh user pembuat PO
+  { k: 'recv', l: 'Barang / dokumen diterima dari supplier', who: 'User', by: 'both' }, // user pembuat PO (admin tetap boleh mengoreksi)
+  { k: 'hoSend', l: 'Dokumen dikirim ke finance kantor pusat', who: 'Admin HR', by: 'admin' },
+  { k: 'hoRecv', l: 'Dokumen diterima finance kantor pusat', who: 'Finance', by: 'finance' },
+  { k: 'pay', l: 'PO selesai proses pembayaran', who: 'Finance', by: 'finance' },
 ];
 const pad2 = (n: number) => String(n).padStart(2, '0');
 /** Satu departemen = sama (abaikan huruf besar/kecil & spasi), siapa pun pembuatnya. Dipakai untuk membatasi data user ke departemennya. */
@@ -6077,7 +6078,7 @@ function TrackingPage({
                         : 'open';
                       // Tanggal "PO dikirim ke supplier" & "Barang diterima" penting: user pembuat PO boleh mengisi/mengubahnya kapan saja (tidak harus menunggu tahap sebelumnya). Tahap milik admin (di-approve, ke kantor pusat, sampai di kantor pusat, pembayaran) juga selalu bisa diisi admin tanpa menunggu giliran
                       const keyStep =
-                        s.k === 'supp' || s.k === 'recv' || s.k === 'appr' || s.by === 'admin';
+                        s.k === 'supp' || s.k === 'recv' || s.k === 'appr' || s.by === 'admin' || s.by === 'finance';
                       const can =
                         !lk &&
                         !p.rej &&
@@ -6086,6 +6087,8 @@ function TrackingPage({
                           ? p.uid === me.id
                           : s.by === 'both'
                           ? admin || p.uid === me.id
+                          : s.by === 'finance'
+                          ? admin || sameDept(me.dept, 'Finance')
                           : admin) &&
                         (keyStep || !!dt || i === t.cur);
                       const prev = t.dates.slice(0, i).filter(Boolean).pop(); // tanggal terisi terakhir sebelum tahap ini
@@ -6125,6 +6128,7 @@ function TrackingPage({
                           <div className="tc">
                             <div className="th">
                               <b>{s.l}</b>
+                              <small className="mute"> ({s.who})</small>
                               <span
                                 className={
                                   'tag ' +
@@ -6156,6 +6160,8 @@ function TrackingPage({
                                   ? `Menunggu update dari pembuat PO (${p.by})`
                                   : s.by === 'both'
                                   ? `Menunggu update dari pembuat PO (${p.by}) atau admin`
+                                  : s.by === 'finance'
+                                  ? 'Menunggu update dari Finance'
                                   : 'Menunggu update dari admin'
                                 : 'Belum dimulai'}
                             </small>
@@ -8736,6 +8742,13 @@ function Dashboard({
               </tbody>
             </table>
           </div>
+          <div className="stglg" aria-label="Keterangan tahap tracking">
+            {TSTEPS.map((x, i) => (
+              <span key={x.k}>
+                <b>{i + 1}/{TSTEPS.length}</b> {x.l} <em>({x.who})</em>
+              </span>
+            ))}
+          </div>
           <p className="mute small" style={{ margin: '8px 4px 0' }}>
             Contoh: 2/7 = PO sudah melewati 2 dari 7 tahap tracking (dibuat dan di-approve).
             PO yang ditolak tidak dihitung.
@@ -10399,7 +10412,7 @@ function makeDemoPOs(seqBase: Record<number, number>): PO[] {
   }
   dates.sort((x, y) => x.getTime() - y.getTime());
   const seq: Record<number, number> = { ...seqBase };
-  const keys: TKey[] = ['appr', 'supp', 'hoSend', 'hoRecv', 'recv', 'pay'];
+  const keys: TKey[] = ['appr', 'supp', 'recv', 'hoSend', 'hoRecv', 'pay'];
   const gaps = [
     [1, 3],
     [1, 3],
@@ -15351,6 +15364,7 @@ button,.nv,.bell,.mebtn{touch-action:manipulation}
 .dtbl td.stg small{display:block;font-size:10.5px;color:#5b6b7a;font-weight:600}
 .dtbl td.stg.z{color:#a0a9b8}
 .dtbl tr.drill:hover{background:rgba(21,150,214,.07)}.dtbl tr.drillrow>td{padding:6px 10px 12px;background:rgba(21,150,214,.04)}.dtbl tr.drillrow .dtbl{margin:0}
+.stglg{display:flex;flex-wrap:wrap;gap:6px 16px;margin:10px 4px 0;font-size:12px;color:#33445c}.stglg em{font-style:normal;color:#6b7c95}.stglg b{display:inline-block;min-width:30px;margin-right:4px;padding:1px 6px;border-radius:8px;background:rgba(21,150,214,.14);color:#0f5fc0;text-align:center;font-weight:700}
 .auth .scene{zoom:.8}
 @media(max-width:700px){.auth .scene{zoom:.92}}
 `;
