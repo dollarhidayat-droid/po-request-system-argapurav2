@@ -2254,6 +2254,27 @@ const BODY_H = 221.78,
   LINE_H = 10.44;
 const COLS = [29.4, 354.91, 398.59, 443.26, 510.46];
 
+// Unduh/cetak PO langsung dari tabel (tanpa membuka viewer): dialog cetak muncul, pilih "Simpan sebagai PDF" untuk mengunduh
+function downloadPoPdf(po: PO) {
+  const ifr = document.createElement('iframe');
+  ifr.style.cssText =
+    'position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden';
+  ifr.srcdoc = poHtml(po);
+  ifr.onload = () => {
+    const w = ifr.contentWindow;
+    if (!w) return;
+    const t = document.title;
+    document.title = 'PO ' + po.no.split('/').join('-');
+    w.focus();
+    w.print();
+    window.setTimeout(() => {
+      document.title = t;
+      ifr.remove();
+    }, 2000);
+  };
+  document.body.appendChild(ifr);
+}
+
 function poHtml(po: PO): string {
   const v = po.v,
     pay = po.pay ?? EMPTY_PAY,
@@ -4003,6 +4024,15 @@ function PoTable({
                             Cetak PO
                           </button>
                         </span>
+                      )}
+                      {done && (
+                        <button
+                          className="ghost"
+                          title="Unduh PO sebagai PDF (atau cetak langsung)"
+                          onClick={() => downloadPoPdf(p)}
+                        >
+                          ⬇ Download PDF
+                        </button>
                       )}
                       <button
                         className="ghost"
