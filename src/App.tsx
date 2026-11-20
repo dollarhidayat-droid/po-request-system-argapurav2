@@ -2657,7 +2657,6 @@ function PoViewer({
   onBack,
   backLabel,
   canPrint = true,
-  admin = false,
   onPrinted,
 }: {
   po: PO;
@@ -2671,7 +2670,6 @@ function PoViewer({
   onPrinted?: (no: string) => void;
 }) {
   const html = useMemo(() => poHtml(po), [po]);
-  const pn = po.printN ?? 0;
   const frame = useRef<HTMLIFrameElement>(null);
   const box = useRef<HTMLDivElement>(null);
   const [h, setH] = useState(1140);
@@ -3832,7 +3830,6 @@ function PoTable({
   lockedOf,
   onResend,
   resendOf,
-  onAllowReprint,
   onEdit,
   onNewFrom,
   aksiLabel,
