@@ -169,7 +169,7 @@ const TSTEPS: {
   by: 'auto' | 'admin' | 'user' | 'creator' | 'both';
 }[] = [
   { k: 'made', l: 'PO dibuat', by: 'auto' },
-  { k: 'appr', l: 'PO di-approve', by: 'admin' },
+  { k: 'appr', l: 'PO di-approve', by: 'both' }, // = PO sudah ditandatangani atasan. Diisi manual (admin atau user pembuat PO), TIDAK otomatis dari tombol Done admin
   { k: 'supp', l: 'PO dikirim ke supplier', by: 'creator' }, // diisi tanggal oleh user pembuat PO
   { k: 'hoSend', l: 'PO dikirim ke kantor pusat', by: 'admin' },
   { k: 'hoRecv', l: 'PO sampai di kantor pusat', by: 'admin' },
@@ -320,7 +320,7 @@ const DEF_BP: BP[] = [
     exp: '2027-09-30',
   },
 ];
-const isAppr = (p: PO) => p.status === 'Done' || !!p.trk?.appr; // approved = ditandai Done atau tahap "PO di-approve" sudah terisi
+const isAppr = (p: PO) => p.status === 'Done'; // approved (admin) = ditandai Done. Tanggal tracker "PO di-approve" (tanda tangan atasan) terpisah, diisi manual
 const isWait = (p: PO) => !p.rej && !isAppr(p); // menunggu approval (rej = tanggal ditolak admin)
 const EMPTY_PAY: Pay = { rek: '', bank: '', cabang: '', an: '' };
 const EMPTY: Vendor = {
@@ -5943,7 +5943,7 @@ function TrackingPage({
                         : 'open';
                       // Tanggal "PO dikirim ke supplier" & "Barang diterima" penting: user pembuat PO boleh mengisi/mengubahnya kapan saja (tidak harus menunggu tahap sebelumnya). Tahap milik admin (di-approve, ke kantor pusat, sampai di kantor pusat, pembayaran) juga selalu bisa diisi admin tanpa menunggu giliran
                       const keyStep =
-                        s.k === 'supp' || s.k === 'recv' || s.by === 'admin';
+                        s.k === 'supp' || s.k === 'recv' || s.k === 'appr' || s.by === 'admin';
                       const can =
                         !lk &&
                         !p.rej &&
@@ -6014,7 +6014,9 @@ function TrackingPage({
                                   ? fmtDT(dt)
                                   : fmtD(dt)
                                 : can
-                                ? 'Isi tanggal untuk menyelesaikan tahap ini'
+                                ? s.k === 'appr'
+                                  ? 'Isi tanggal PO ditandatangani atasan untuk menyelesaikan tahap ini'
+                                  : 'Isi tanggal untuk menyelesaikan tahap ini'
                                 : st === 'cur'
                                 ? s.by === 'creator'
                                   ? `Menunggu update dari pembuat PO (${p.by})`
@@ -7836,20 +7838,14 @@ function Dashboard({
     pv = sum(prv);
   const waitAt = (p: PO, t: number) => {
     if (new Date(p.iso).getTime() > t) return false;
-    const ap = Math.min(
-      p.trk?.appr ? new Date(p.trk.appr + 'T00:00:00').getTime() : Infinity,
-      p.doneAt ? new Date(p.doneAt).getTime() : Infinity
-    );
+    const ap = p.doneAt ? new Date(p.doneAt).getTime() : Infinity;
     return ap > t && (p.rej ? new Date(p.rej).getTime() : Infinity) > t;
   };
   const wWeek = cur.filter((p) => waitAt(p, now - 7 * 86400000)).length;
   const vs = pp === null ? 'Semua periode' : `vs ${pLabel(pp)}`;
   // rata-rata waktu approval (hari) dari PO yang sudah disetujui
   const apprTs = (p: PO) =>
-    Math.min(
-      p.trk?.appr ? new Date(p.trk.appr + 'T00:00:00').getTime() : Infinity,
-      p.doneAt ? new Date(p.doneAt).getTime() : Infinity
-    );
+    p.doneAt ? new Date(p.doneAt).getTime() : Infinity;
   const avgAppr = (a: PO[]) => {
     const xs = a
       .filter((p) => !p.rej && isAppr(p))
@@ -11709,7 +11705,7 @@ export default function App() {
       )
         return;
     }
-    logH(no, 'Status PO ditandai Done (PO di-approve)');
+    logH(no, 'Status PO ditandai Done (disetujui admin)');
     setPos((l) =>
       l.map((p) =>
         p.no === no
@@ -11717,7 +11713,6 @@ export default function App() {
               ...p,
               status: 'Done',
               doneAt: new Date().toISOString(),
-              trk: { ...p.trk, appr: p.trk?.appr ?? ymd(new Date()) },
             }
           : p
       )
