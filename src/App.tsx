@@ -5889,7 +5889,9 @@ function TrackingPage({
   onSet,
   notify,
   lockedOf,
+  focusNo = '',
 }: {
+  focusNo?: string; // dari drilldown dashboard: langsung tampilkan PO ini
   lockedOf: (p: PO) => boolean;
   list: PO[];
   me: User;
@@ -5897,8 +5899,8 @@ function TrackingPage({
   onSet: (no: string, k: TKey, v: string) => void;
   notify: (m: string) => void;
 }) {
-  const [q, setQ] = useState('');
-  const [sel, setSel] = useState('');
+  const [q, setQ] = useState(focusNo);
+  const [sel, setSel] = useState(focusNo);
   const admin = me.role === 'admin';
   const today = ymd(new Date());
   const key = q.trim().toLowerCase();
@@ -5918,6 +5920,14 @@ function TrackingPage({
     .map((p) => ({ p, t: trackOf(p) }))
     .sort((a, b) => a.t.done - b.t.done || b.p.iso.localeCompare(a.p.iso));
   const lowPg = usePager(lowAll, 5);
+  useEffect(() => {
+    if (focusNo) {
+      setQ(focusNo);
+      setSel(focusNo);
+      pg.setPage(1);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusNo]);
   if (!list.length)
     return (
       <Card>
@@ -7065,6 +7075,8 @@ const short = (n: number, d = 0) => {
   if (n >= 1e3) return `Rp ${f(n / 1e3)} rb`;
   return `Rp ${f(n)}`;
 };
+/** seperti short(), tapi tidak membulatkan: 19.980.000 -> "Rp 19,98 jt" (bukan "Rp 20 jt") */
+const shortX = (n: number) => short(n, 3);
 type Dl = { t: string; tone: 'good' | 'bad' | 'flat' };
 const dl = (
   a: number,
@@ -7429,7 +7441,7 @@ function TrendChart({
                 className="bv"
                 fill={on && tall ? '#fff' : '#2a5ca8'}
               >
-                {short(d.t, 1)}
+                {shortX(d.t)}
               </text>
             </g>
           );
@@ -7566,7 +7578,7 @@ function TrendChart({
             <i style={cc('#22b573')} />
             Tertinggi
           </span>
-          <b>{hi ? short(hi.v, 1) : '—'}</b>
+          <b>{hi ? shortX(hi.v) : '—'}</b>
           <small>{hi ? poLbl(hi) : '—'}</small>
         </div>
         <div className="ts">
@@ -7574,7 +7586,7 @@ function TrendChart({
             <i style={cc('#f5b82e')} />
             Rata-rata
           </span>
-          <b>{poAvg === null ? '—' : short(poAvg, 1)}</b>
+          <b>{poAvg === null ? '—' : shortX(poAvg)}</b>
           <small>Per PO · {avgSub}</small>
         </div>
         <div className="ts">
@@ -7582,7 +7594,7 @@ function TrendChart({
             <i style={cc('#ef4a5a')} />
             Terendah
           </span>
-          <b>{lo ? short(lo.v, 1) : '—'}</b>
+          <b>{lo ? shortX(lo.v) : '—'}</b>
           <small>{lo ? poLbl(lo) : '—'}</small>
         </div>
         <div className="ts tot">
@@ -7591,7 +7603,7 @@ function TrendChart({
           </span>
           <span className="tb">
             <span className="tl2">Total Nilai PO</span>
-            <b>{short(tot, 1)}</b>
+            <b>{shortX(tot)}</b>
             <small>{data.length} Bulan</small>
           </span>
         </div>
@@ -7931,10 +7943,12 @@ function Dashboard({
   per,
   onPrint,
   onAll,
+  onTrack,
   onPer,
   deptList,
   cats: catList,
 }: {
+  onTrack: (no: string) => void;
   onPer: (p: PSel) => void;
   cats: Cat[];
   deptList: string[];
@@ -7946,6 +7960,7 @@ function Dashboard({
   onAll: (f: string) => void;
 }) {
   const [ctype, setCtype] = useState<'all' | CatType>('all');
+  const [openD, setOpenD] = useState<string | null>(null); // departemen yang drilldown-nya terbuka
   const now = Date.now();
   const inM = (p: PO, m: number) => mkey(new Date(p.iso)) === m;
   const mi = per && per.type === 'monthly' ? per.year * 12 + per.n : null;
@@ -8109,7 +8124,11 @@ function Dashboard({
       )
         return;
       const k = l.k || 'Tanpa Kategori';
-      cm.set(k, (cm.get(k) ?? 0) + l.q * l.p);
+      // pakai GRAND TOTAL PO (setelah diskon, pajak, ongkir) dibagi proporsional ke tiap item,
+      // supaya sama dengan widget Departemen/Supplier (mis. 18.000.000 -> 19.980.000)
+      const poSub = p.items.reduce((x, i) => x + i.q * i.p, 0);
+      const share = poSub > 0 ? ((l.q * l.p) / poSub) * p.total : 0;
+      cm.set(k, (cm.get(k) ?? 0) + share);
     })
   );
   const cats = [...cm].sort((a, b) => b[1] - a[1]).slice(0, 10);
@@ -8131,6 +8150,7 @@ function Dashboard({
         : 0;
       return {
         d,
+        pos: [...a].sort((x, y) => y.iso.localeCompare(x.iso)),
         n: a.length,
         t: a.reduce((x, p) => x + nomOf(p), 0),
         na: act.length,
@@ -8502,36 +8522,120 @@ function Dashboard({
               <tbody>
                 {dRows.map((r, i) => {
                   const pc = r.pct;
+                  const open = openD === r.d;
+                  const can = r.pos.length > 0;
                   return (
-                    <tr key={r.d}>
-                      <td>
-                        <span className="dpn">
-                          <span className="dpi">
-                            <Ic n="users" s={14} />
+                    <Fragment key={r.d}>
+                      <tr
+                        className={can ? 'drill' : ''}
+                        style={{ cursor: can ? 'pointer' : 'default' }}
+                        aria-expanded={can ? open : undefined}
+                        tabIndex={can ? 0 : undefined}
+                        onClick={() => can && setOpenD(open ? null : r.d)}
+                        onKeyDown={(e) => {
+                          if (can && (e.key === 'Enter' || e.key === ' ')) {
+                            e.preventDefault();
+                            setOpenD(open ? null : r.d);
+                          }
+                        }}
+                      >
+                        <td>
+                          <span className="dpn">
+                            <span className="dpi">
+                              <Ic n="users" s={14} />
+                            </span>
+                            {r.d}
+                            {can && <small className="mute">{open ? ' ▲' : ' ▼'}</small>}
                           </span>
-                          {r.d}
-                        </span>
-                      </td>
-                      <td>{r.n}</td>
-                      <td className="num">{rp(r.t)}</td>
-                      <td>
-                        <div className="pc">
-                          <span className="cb">
-                            <i
-                              style={{
-                                width: `${pc}%`,
-                                background:
-                                  'linear-gradient(90deg,#1596d6,#40a8ef)',
-                                animationDelay: `${i * 70}ms`,
-                              }}
-                            />
-                          </span>
-                          <span title={`Rata-rata ${r.avgDone.toFixed(1)} dari ${TSTEPS.length} tahap`}>
-                            {pc}%
-                          </span>
-                        </div>
-                      </td>
-                    </tr>
+                        </td>
+                        <td>{r.n}</td>
+                        <td className="num">{rp(r.t)}</td>
+                        <td>
+                          <div className="pc">
+                            <span className="cb">
+                              <i
+                                style={{
+                                  width: `${pc}%`,
+                                  background:
+                                    'linear-gradient(90deg,#1596d6,#40a8ef)',
+                                  animationDelay: `${i * 70}ms`,
+                                }}
+                              />
+                            </span>
+                            <span title={`Rata-rata ${r.avgDone.toFixed(1)} dari ${TSTEPS.length} tahap`}>
+                              {pc}%
+                            </span>
+                          </div>
+                        </td>
+                      </tr>
+                      {open && (
+                        <tr className="drillrow">
+                          <td colSpan={4}>
+                            <table className="dtbl">
+                              <thead>
+                                <tr>
+                                  <th>No. PO</th>
+                                  <th>Supplier</th>
+                                  <th>Total</th>
+                                  <th>Tahap saat ini</th>
+                                  <th>Progres</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {r.pos.map((p) => {
+                                  const t = trackOf(p);
+                                  const ppc = p.rej
+                                    ? 0
+                                    : Math.round((t.done / TSTEPS.length) * 100);
+                                  return (
+                                    <tr key={p.no}>
+                                      <td>
+                                        <button
+                                          type="button"
+                                          className="lnk"
+                                          title="Buka di Tracking PO"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            onTrack(p.no);
+                                          }}
+                                        >
+                                          {p.no}
+                                        </button>
+                                      </td>
+                                      <td>{p.v.nama}</td>
+                                      <td className="num">{rp(nomOf(p))}</td>
+                                      <td>
+                                        {p.rej
+                                          ? 'Rejected'
+                                          : t.all
+                                          ? 'Semua tahap selesai'
+                                          : TSTEPS[t.cur].l}
+                                      </td>
+                                      <td>
+                                        <div className="pc">
+                                          <span className="cb">
+                                            <i
+                                              style={{
+                                                width: `${ppc}%`,
+                                                background:
+                                                  'linear-gradient(90deg,#1596d6,#40a8ef)',
+                                              }}
+                                            />
+                                          </span>
+                                          <span>
+                                            {ppc}% ({p.rej ? 0 : t.done}/{TSTEPS.length})
+                                          </span>
+                                        </div>
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
                   );
                 })}
               </tbody>
@@ -11352,6 +11456,7 @@ export default function App() {
   const [viewNo, setViewNo] = useState('');
   const [prevPg, setPrevPg] = useState(''); // halaman sebelum membuka Dokumen PO (untuk tombol Kembali)
   const [, setBackTo] = useState(''); // halaman asal dokumen PO (mis. "tracking"); kosong = dibuka langsung, tanpa tombol kembali
+  const [trkFocus, setTrkFocus] = useState(''); // nomor PO yang dibuka dari drilldown dashboard
   const [mdOpen, setMdOpen] = useState(true);
   /* Mode HP/tablet: sidebar menjadi drawer geser (dibuka lewat tombol hamburger) */
   const [navOpen, setNavOpen] = useState(false);
@@ -12231,6 +12336,13 @@ export default function App() {
     setSeen((l) => [
       ...new Set([...l, ...mine.map((p) => notifKey(me.id, p))]),
     ]);
+  const openTracking = (no: string) => {
+    setTrkFocus(no);
+    go('tracking');
+  };
+  useEffect(() => {
+    if (cur !== 'tracking') setTrkFocus('');
+  }, [cur]);
   const viewAll = (f: string) => {
     if (admin) {
       setFStat(f);
@@ -12817,6 +12929,7 @@ export default function App() {
             {cur === 'tracking' && (
               <TrackingPage
                 list={scope}
+                focusNo={trkFocus}
                 me={me}
                 onPrint={openDocFromTracking}
                 onSet={setTrk}
@@ -12926,6 +13039,7 @@ export default function App() {
                 per={per}
                 onPrint={openDoc}
                 onAll={viewAll}
+                onTrack={openTracking}
                 onPer={setPer}
                 deptList={deptNames}
                 cats={cats}
@@ -15236,6 +15350,7 @@ button,.nv,.bell,.mebtn{touch-action:manipulation}
 .dtbl td.stg b{display:block;font-size:13px}
 .dtbl td.stg small{display:block;font-size:10.5px;color:#5b6b7a;font-weight:600}
 .dtbl td.stg.z{color:#a0a9b8}
+.dtbl tr.drill:hover{background:rgba(21,150,214,.07)}.dtbl tr.drillrow>td{padding:6px 10px 12px;background:rgba(21,150,214,.04)}.dtbl tr.drillrow .dtbl{margin:0}
 .auth .scene{zoom:.8}
 @media(max-width:700px){.auth .scene{zoom:.92}}
 `;
