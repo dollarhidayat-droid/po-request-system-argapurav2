@@ -2254,8 +2254,8 @@ const BODY_H = 221.78,
   LINE_H = 10.44;
 const COLS = [29.4, 354.91, 398.59, 443.26, 510.46];
 
-// Unduh/cetak PO langsung dari tabel (tanpa membuka viewer): dialog cetak muncul, pilih "Simpan sebagai PDF" untuk mengunduh
-function downloadPoPdf(po: PO) {
+// Cadangan: dialog cetak browser (pilih "Simpan sebagai PDF"), dipakai bila pembuatan PDF langsung gagal
+function printPoDialog(po: PO) {
   const ifr = document.createElement('iframe');
   ifr.style.cssText =
     'position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden';
@@ -2273,6 +2273,107 @@ function downloadPoPdf(po: PO) {
     }, 2000);
   };
   document.body.appendChild(ifr);
+}
+
+// Pustaka PDF dimuat dari cdnjs hanya saat tombol Download PO ditekan pertama kali
+let pdfLibs: Promise<void> | null = null;
+function loadPdfLibs(): Promise<void> {
+  const w = window as unknown as Record<string, unknown>;
+  if (w.jspdf && w.html2canvas) return Promise.resolve();
+  if (!pdfLibs) {
+    const add = (src: string) =>
+      new Promise<void>((res, rej) => {
+        const el = document.createElement('script');
+        el.src = src;
+        el.async = true;
+        el.onload = () => res();
+        el.onerror = () => rej(new Error('Gagal memuat ' + src));
+        document.head.appendChild(el);
+      });
+    pdfLibs = Promise.all([
+      add('https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js'),
+      add('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js'),
+    ])
+      .then(() => undefined)
+      .catch((e) => {
+        pdfLibs = null;
+        throw e;
+      });
+  }
+  return pdfLibs;
+}
+
+// Unduh PO sebagai file PDF A4 portrait (satu halaman PO = satu halaman PDF). Bila gagal, jatuh ke dialog cetak.
+async function downloadPoPdf(po: PO): Promise<void> {
+  const ifr = document.createElement('iframe');
+  try {
+    ifr.style.cssText =
+      'position:fixed;left:-10000px;top:0;width:794px;height:1123px;border:0;opacity:0;pointer-events:none';
+    await new Promise<void>((res) => {
+      ifr.onload = () => res();
+      ifr.srcdoc = poHtml(po);
+      document.body.appendChild(ifr);
+    });
+    const d = ifr.contentDocument;
+    if (!d) throw new Error('Dokumen PO tidak terbaca');
+    await d.fonts?.ready;
+    await Promise.all(
+      Array.from(d.images).map((im) =>
+        im.complete
+          ? Promise.resolve()
+          : new Promise<void>((r) => {
+              im.onload = im.onerror = () => r();
+            })
+      )
+    );
+    const sheets = Array.from(d.querySelectorAll<HTMLElement>('.sheet'));
+    if (!sheets.length) throw new Error('Halaman PO kosong');
+    await loadPdfLibs();
+    const w = window as unknown as {
+      html2canvas: (
+        el: HTMLElement,
+        o: Record<string, unknown>
+      ) => Promise<HTMLCanvasElement>;
+      jspdf: {
+        jsPDF: new (o: Record<string, unknown>) => {
+          internal: { pageSize: { getWidth(): number; getHeight(): number } };
+          addPage(f: string, o: string): void;
+          addImage(
+            d: string,
+            t: string,
+            x: number,
+            y: number,
+            w: number,
+            h: number
+          ): void;
+          save(n: string): void;
+        };
+      };
+    };
+    const pdf = new w.jspdf.jsPDF({
+      unit: 'pt',
+      format: 'a4',
+      orientation: 'portrait',
+      compress: true,
+    });
+    const pw = pdf.internal.pageSize.getWidth();
+    const ph = pdf.internal.pageSize.getHeight();
+    for (let i = 0; i < sheets.length; i++) {
+      const cv = await w.html2canvas(sheets[i], {
+        scale: 2,
+        useCORS: true,
+        backgroundColor: '#ffffff',
+        logging: false,
+      });
+      if (i) pdf.addPage('a4', 'portrait');
+      pdf.addImage(cv.toDataURL('image/jpeg', 0.95), 'JPEG', 0, 0, pw, ph);
+    }
+    pdf.save('PO ' + po.no.split('/').join('-') + '.pdf');
+  } catch {
+    printPoDialog(po);
+  } finally {
+    ifr.remove();
+  }
 }
 
 function poHtml(po: PO): string {
@@ -3849,6 +3950,7 @@ function PoTable({
   aksiLabel?: string; // label kolom terakhir (default 'Aksi')
 }) {
   const [open, setOpen] = useState('');
+  const [dl, setDl] = useState(''); // nomor PO yang sedang disiapkan PDF-nya
   if (!list.length)
     return <div className="empty">Belum ada data pengajuan.</div>;
   const rows = [...list].sort((a, b) => b.iso.localeCompare(a.iso)); // terbaru di atas
@@ -4022,14 +4124,36 @@ function PoTable({
                           </button>
                         </span>
                       )}
-                      {done && (
+                      {done ? (
                         <button
-                          className="ghost"
-                          title="Unduh PO sebagai PDF (atau cetak langsung)"
-                          onClick={() => downloadPoPdf(p)}
+                          type="button"
+                          className="ghost prgreen"
+                          title="Unduh PO sebagai file PDF (A4 portrait)"
+                          disabled={dl === p.no}
+                          onClick={async () => {
+                            setDl(p.no);
+                            try {
+                              await downloadPoPdf(p);
+                            } finally {
+                              setDl('');
+                            }
+                          }}
                         >
-                          ⬇ Download PDF
+                          {dl === p.no ? 'Menyiapkan…' : '⬇ Download PO'}
                         </button>
+                      ) : (
+                        !onDone && (
+                          <span className="tipw" data-tip={waitTip(p)}>
+                            <button
+                              type="button"
+                              className="ghost off"
+                              aria-disabled="true"
+                              onClick={(e) => e.preventDefault()}
+                            >
+                              ⬇ Download PO
+                            </button>
+                          </span>
+                        )
                       )}
                       <button
                         className="ghost"
