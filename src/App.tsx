@@ -2651,8 +2651,6 @@ function PoViewer({
 }) {
   const html = useMemo(() => poHtml(po), [po]);
   const pn = po.printN ?? 0;
-  const blocked = false; // batas cetak 1× dihapus: PO yang sudah di-approve boleh dicetak/diunduh berulang kali
-  const blockTip = `Sudah dicetak ${pn}× — hanya admin yang bisa mengizinkan cetak ulang`;
   const frame = useRef<HTMLIFrameElement>(null);
   const box = useRef<HTMLDivElement>(null);
   const [h, setH] = useState(1140);
@@ -2721,13 +2719,7 @@ function PoViewer({
               <Ic n="left" s={14} /> {backLabel ?? 'Kembali'}
             </button>
           )}
-          {canPrint && blocked ? (
-            <span className="tipw" data-tip={blockTip}>
-              <button type="button" className="prred" aria-disabled="true">
-                🖨 Sudah dicetak {pn}×
-              </button>
-            </span>
-          ) : canPrint ? (
+          {canPrint ? (
             <button className="pri prgreen" onClick={print}>
               🖨 Cetak / Download PDF
             </button>
@@ -2738,13 +2730,7 @@ function PoViewer({
               </button>
             </span>
           )}
-          {canPrint && blocked ? (
-            <span className="tipw" data-tip={blockTip}>
-              <button type="button" className="off" aria-disabled="true">
-                Buka di tab baru
-              </button>
-            </span>
-          ) : canPrint ? (
+          {canPrint ? (
             <button onClick={newTab}>Buka di tab baru</button>
           ) : (
             <span className="tipw" data-tip={waitTip(po)}>
@@ -3868,7 +3854,6 @@ function PoTable({
             const done = p.status === 'Done';
             const lk = lockedOf?.(p) ?? false;
             const pn = p.printN ?? 0;
-            const printLocked = false; // batas cetak 1× dihapus
             return (
               <Fragment key={p.no}>
                 <tr>
@@ -3998,38 +3983,11 @@ function PoTable({
                           Buka Lagi
                         </button>
                       )}
-                      {onAllowReprint && done && printLocked && (
-                        <button
-                          className="ghost"
-                          title="Izinkan user mencetak PO ini sekali lagi (tercatat di riwayat)"
-                          onClick={() => onAllowReprint(p.no)}
-                        >
-                          Izinkan Cetak Ulang
-                        </button>
-                      )}
-                      {done && !onDone && printLocked ? (
-                        <span
-                          className="tipw"
-                          data-tip={`Sudah dicetak ${pn}× — hanya admin yang bisa mengizinkan cetak ulang`}
-                        >
-                          <button
-                            type="button"
-                            className="ghost prred"
-                            aria-disabled="true"
-                          >
-                            Cetak PO
-                          </button>
-                        </span>
-                      ) : done || onDone ? (
+                      {done || onDone ? (
                         <button
                           className={
                             'ghost ' +
-                            (done ? (printLocked ? 'prred adm' : 'prgreen') : '')
-                          }
-                          title={
-                            done && printLocked
-                              ? `Sudah dicetak ${pn}× (admin tetap bisa mencetak ulang)`
-                              : undefined
+                            (done ? 'prgreen' : '')
                           }
                           onClick={() => onPrint(p.no)}
                         >
@@ -14955,7 +14913,7 @@ button,.nv,.bell,.mebtn{touch-action:manipulation}
 .ghost.prgreen:hover,button.prgreen:hover{filter:brightness(1.07)}
 .ghost.prred,button.prred{background:linear-gradient(180deg,#f0566a,#c1243a)!important;color:#fff!important;border:1px solid #9a1a2c!important;box-shadow:0 3px 10px rgba(193,36,58,.4)!important;font-weight:700;cursor:not-allowed}
 .ghost.prred.adm{cursor:pointer}
-.prnote{display:inline-block;margin-top:2px;font-size:11.5px;font-weight:600;color:#9a1a2c}
+.prnote{display:inline-block;margin-top:2px;font-size:11.5px;font-weight:600;color:#5b6b7a}
 /* ===== Sidebar rapi & stabil (tidak berubah saat hover) ===== */
 @media(min-width:901px){
   .shell>.side .navlist,.shell>.side:not(.hov) .navlist{padding:0 7px}
