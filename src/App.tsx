@@ -58,6 +58,7 @@ type PO = {
   pay?: Pay;
   ong?: number;
   note?: string;
+  metode?: string; // metode pembayaran (tampil di Catatan PO cetak)
   trk?: Partial<Record<TKey, string>>;
   suppLink?: string;
   rej?: string;
@@ -88,6 +89,7 @@ type Draft = {
   ong?: string;
   rate?: string;
   note?: string;
+  metode?: string;
   iso?: string;
   prev?: string; // nomor PO reject final yang digantikan (riwayat)
 };
@@ -160,6 +162,9 @@ const UNITS = [
   'Meter',
   'Jasa',
 ];
+/** Master satuan (diatur admin di Pengaturan). Dipakai pada dropdown Satuan di form PO. */
+type Unit = { nama: string };
+const DEF_UNITS: Unit[] = UNITS.map((nama) => ({ nama }));
 const STATUSES: Status[] = ['Open', 'Done'];
 /* Tahapan tracker PO (urut). by = siapa yang boleh mengisi tanggal: auto (otomatis), admin, creator (hanya user pembuat PO), atau both (pembuat PO dan admin).
    Ubah kolom "by" di sini bila pembagian tugasnya berbeda. */
@@ -2127,6 +2132,14 @@ function tb(n: number): string {
     tb(Math.floor(n / 1e12)) + ' triliun' + (n % 1e12 ? ' ' + tb(n % 1e12) : '')
   );
 }
+/** Pilihan metode pembayaran (Informasi Tambahan) -> teks yang tampil di Catatan PO cetak */
+const METODE_BAYAR = [
+  { v: 'tempo', l: 'Tukar Faktur / Tempo', p: 'Tempo / Tukar Faktur' },
+  { v: 'termin', l: 'Termin / Bertahap', p: 'Termin / Bertahap' },
+  { v: 'dp', l: 'DP / Uang muka (Performa Invoice)', p: 'DP / Uang Muka (Performa Invoice)' },
+];
+const metodeCetak = (m?: string) => METODE_BAYAR.find((x) => x.v === m)?.p ?? '';
+
 const terbilang = (n: number) => {
   const w = Math.round(n) === 0 ? 'nol' : tb(Math.round(n));
   return w.charAt(0).toUpperCase() + w.slice(1) + ' rupiah';
@@ -2684,12 +2697,16 @@ function poHtml(po: PO): string {
         }pt;width:214.7pt;height:82.5pt" viewBox="0 0 214.7 82.5"><rect x=".26" y=".26" width="214.18" height="81.98" rx="13.7" ry="13.7" fill="none" stroke="#000" stroke-width=".51"/></svg>`
       );
       o.push(TL(27.5, 604.5 + dy, 'Catatan:', { b: true, s: 8.1 }));
-      if (po.note)
+      if (po.metode || po.note) {
+        const mt = metodeCetak(po.metode);
         o.push(
           `<div class="t wrap" style="left:27.5pt;top:${
             616 + dy
-          }pt;width:196pt;height:62pt">${esc(po.note)}</div>`
+          }pt;width:196pt;height:62pt">${
+            mt ? `<b>Informasi pembayaran: ${esc(mt)}</b>` : ''
+          }${mt && po.note ? '\n' : ''}${po.note ? esc(po.note) : ''}</div>`
         );
+      }
       // tanda tangan
       const sx = [309.67, 370.56, 432.92, 494.24, 556.45];
       [603.21, 611.8, 664.9, 673.69].forEach((yy) =>
@@ -3208,6 +3225,88 @@ function CatGuide({
   );
 }
 
+/* ================= SARAN DESKRIPSI: daftar barang/jasa yang pernah dibeli dari supplier terpilih ================= */
+type DescOpt = { d: string; n: number; s: string; p: number };
+function DescSuggest({
+  value,
+  onChange,
+  options,
+  supplier,
+  placeholder,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  options: DescOpt[];
+  supplier: string;
+  placeholder?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [hi, setHi] = useState(-1);
+  const q = value.trim().toLowerCase();
+  const list = options
+    .filter((o) => !q || o.d.toLowerCase().includes(q))
+    .filter((o) => o.d.toLowerCase() !== q)
+    .slice(0, 30);
+  const show = open && !!supplier && list.length > 0;
+  const pick = (o: DescOpt) => {
+    onChange(o.d);
+    setOpen(false);
+    setHi(-1);
+  };
+  return (
+    <div className="dsug">
+      <input
+        value={value}
+        autoComplete="off"
+        onChange={(e) => {
+          onChange(e.target.value);
+          setOpen(true);
+          setHi(-1);
+        }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setOpen(false)}
+        onKeyDown={(e) => {
+          if (!show) return;
+          if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            setHi((h) => (h + 1) % list.length);
+          } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            setHi((h) => (h <= 0 ? list.length - 1 : h - 1));
+          } else if (e.key === 'Enter' && hi >= 0) {
+            e.preventDefault();
+            pick(list[hi]);
+          } else if (e.key === 'Escape') setOpen(false);
+        }}
+        placeholder={placeholder}
+      />
+      {show && (
+        <div className="dlist" role="listbox">
+          <div className="dhead">Pernah dibeli dari {supplier}</div>
+          {list.map((o, k) => (
+            <button
+              type="button"
+              key={o.d}
+              role="option"
+              aria-selected={k === hi}
+              className={k === hi ? 'on' : ''}
+              onMouseDown={(e) => {
+                e.preventDefault(); // cegah input kehilangan fokus sebelum klik terbaca
+                pick(o);
+              }}
+            >
+              <span>{o.d}</span>
+              <small>
+                {o.n}× · {o.s} · {rp(o.p)}
+              </small>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ================= FORM PO ================= */
 function Form({
   me,
@@ -3218,6 +3317,7 @@ function Form({
   msup,
   cfg,
   taxes,
+  units,
   onSubmit,
   notify,
   fixedNo,
@@ -3225,6 +3325,7 @@ function Form({
   onBack,
 }: {
   taxes: Tax[];
+  units: Unit[];
   me: User;
   pos: PO[];
   draft: Draft | null;
@@ -3249,6 +3350,7 @@ function Form({
   const [disc, setDisc] = useState(draft?.disc ?? '');
   const [ong, setOng] = useState(draft?.ong ?? '');
   const [note, setNote] = useState(draft?.note ?? '');
+  const [metode, setMetode] = useState(draft?.metode ?? '');
   const [infoOpen, setInfoOpen] = useState(true);
 
   const sub = useMemo(
@@ -3320,6 +3422,26 @@ function Form({
     );
   };
 
+  // Daftar deskripsi yang pernah dipakai untuk supplier terpilih (dari seluruh PO), terbaru dulu
+  const descOpts = useMemo(() => {
+    const sk = supKey(v.nama);
+    if (!sk) return [];
+    const m = new Map<string, DescOpt>();
+    [...pos]
+      .filter((p) => supKey(p.v.nama) === sk)
+      .sort((a, b) => b.iso.localeCompare(a.iso))
+      .forEach((p) =>
+        p.items.forEach((it) => {
+          const d = it.d.trim().replace(/\s+/g, ' ');
+          if (!d) return;
+          const k = d.toLowerCase();
+          const o = m.get(k);
+          if (o) o.n += 1;
+          else m.set(k, { d, n: 1, s: it.s, p: it.p });
+        })
+      );
+    return [...m.values()];
+  }, [pos, v.nama]);
   const activeCats = cats.filter((c) => !c.off);
   // pilih kategori sekali untuk seluruh PO; untuk tipe Jasa satuan item yang kosong otomatis "Jasa"
   const pickCat = (name: string) => {
@@ -3342,6 +3464,10 @@ function Form({
       !tax
     )
       return notify('Lengkapi semua isian bertanda *');
+    if (!metode) {
+      setInfoOpen(true); // buka bagian Informasi Tambahan agar dropdown terlihat
+      return notify('Pilih metode pembayaran pada Informasi Tambahan');
+    }
     if (
       items.some(
         (i) => !i.d.trim() || !(Number(i.q) > 0) || !i.s || !(Number(i.p) > 0)
@@ -3374,6 +3500,7 @@ function Form({
       disc: dv,
       ong: ov,
       note: note.trim(),
+      metode,
       total: grand,
       status: 'Open',
       ...(!fixedNo && draft?.prev ? { prevNo: draft.prev } : {}),
@@ -3760,9 +3887,11 @@ function Form({
                 })()}
                 <div className="r1">
                   <Field label="1. Description Barang / Jasa" req>
-                    <input
+                    <DescSuggest
                       value={i.d}
-                      onChange={(e) => si(i.id, 'd', e.target.value)}
+                      onChange={(x) => si(i.id, 'd', x)}
+                      options={descOpts}
+                      supplier={v.nama.trim()}
                       placeholder="Masukkan deskripsi barang/jasa"
                     />
                   </Field>
@@ -3781,9 +3910,12 @@ function Form({
                       onChange={(e) => si(i.id, 's', e.target.value)}
                     >
                       <option value="">Pilih</option>
-                      {UNITS.map((u) => (
-                        <option key={u}>{u}</option>
+                      {units.map((u) => (
+                        <option key={u.nama}>{u.nama}</option>
                       ))}
+                      {i.s && !units.some((u) => u.nama === i.s) && (
+                        <option key={i.s}>{i.s}</option>
+                      )}
                     </select>
                   </Field>
                 </div>
@@ -3881,6 +4013,19 @@ function Form({
           </button>
           {infoOpen && (
             <div className="body">
+              <Field label="Metode Pembayaran" req>
+                <select
+                  value={metode}
+                  onChange={(e) => setMetode(e.target.value)}
+                >
+                  <option value="">Pilih metode pembayaran</option>
+                  {METODE_BAYAR.map((m, i) => (
+                    <option key={m.v} value={m.v}>
+                      {i + 1}. {m.l}
+                    </option>
+                  ))}
+                </select>
+              </Field>
               <textarea
                 rows={3}
                 maxLength={250}
@@ -3905,6 +4050,7 @@ function Form({
               setDisc('');
               setOng('');
               setNote('');
+              setMetode('');
             }}
           >
             Reset Form
@@ -6460,6 +6606,131 @@ function DeptSettings({
   );
 }
 
+/* ================= SATUAN (admin): pilihan Satuan di form PO. Ubah nama ikut memperbarui item PO yang sudah ada ================= */
+function UnitSettings({
+  units,
+  setUnits,
+  pos,
+  setPos,
+  notify,
+}: {
+  units: Unit[];
+  setUnits: (f: (u: Unit[]) => Unit[]) => void;
+  pos: PO[];
+  setPos: (f: (p: PO[]) => PO[]) => void;
+  notify: (m: string) => void;
+}) {
+  const [nama, setNama] = useState('');
+  const [eid, setEid] = useState(''); // nama lama satuan yang sedang diubah
+  const uCount = (n: string) =>
+    pos.reduce((a, p) => a + p.items.filter((i) => i.s === n).length, 0);
+  const reset = () => {
+    setNama('');
+    setEid('');
+  };
+  const save = () => {
+    const n = nama.trim().replace(/\s+/g, ' ');
+    if (!n) return notify('Isi nama satuan.');
+    if (units.some((u) => u.nama !== eid && u.nama.toLowerCase() === n.toLowerCase()))
+      return notify('Satuan sudah ada.');
+    if (eid) {
+      setUnits((l) => l.map((u) => (u.nama === eid ? { nama: n } : u)));
+      if (n !== eid)
+        setPos((l) =>
+          l.map((p) =>
+            p.items.some((i) => i.s === eid)
+              ? { ...p, items: p.items.map((i) => (i.s === eid ? { ...i, s: n } : i)) }
+              : p
+          )
+        );
+      notify('Satuan diperbarui.');
+    } else {
+      setUnits((l) => [...l, { nama: n }]);
+      notify('Satuan ditambahkan.');
+    }
+    reset();
+  };
+  const del = (u: Unit) => {
+    if (units.length <= 1) return notify('Minimal harus ada 1 satuan.');
+    const c = uCount(u.nama);
+    if (
+      window.confirm(
+        c
+          ? `Hapus satuan "${u.nama}"? Sudah dipakai ${c} item PO (PO lama tidak berubah, hanya hilang dari pilihan).`
+          : `Hapus satuan "${u.nama}"?`
+      )
+    )
+      setUnits((l) => l.filter((x) => x.nama !== u.nama));
+  };
+  return (
+    <Card ic="file" title="Satuan">
+      <div className="body">
+        <p className="mute small">
+          Daftar ini dipakai pada dropdown "Satuan" di form PO. Mengubah nama
+          satuan ikut memperbarui item PO yang sudah ada. Menghapus satuan tidak
+          mengubah PO lama.
+        </p>
+        <div className="bpbox">
+          <b>{eid ? 'Ubah Satuan' : 'Tambah Satuan'}</b>
+          <div className="dpf">
+            <Field label="Nama Satuan" req>
+              <input
+                value={nama}
+                onChange={(e) => setNama(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && save()}
+                placeholder="Contoh: Pcs, Lembar, Roll"
+              />
+            </Field>
+            <div className="acts">
+              <button className="pri" onClick={save}>
+                <Ic n={eid ? 'check' : 'plus'} s={16} /> {eid ? 'Simpan' : 'Tambah'}
+              </button>
+              {(eid || nama) && <button onClick={reset}>Batal</button>}
+            </div>
+          </div>
+        </div>
+        <div className="tbl">
+          <table>
+            <thead>
+              <tr>
+                <th>Satuan</th>
+                <th>Dipakai (item PO)</th>
+                <th>Aksi</th>
+              </tr>
+            </thead>
+            <tbody>
+              {units.map((u) => (
+                <tr key={u.nama}>
+                  <td>
+                    <b>{u.nama}</b>
+                  </td>
+                  <td>{uCount(u.nama)}</td>
+                  <td>
+                    <div className="acts">
+                      <button
+                        className="ghost"
+                        onClick={() => {
+                          setEid(u.nama);
+                          setNama(u.nama);
+                        }}
+                      >
+                        Ubah
+                      </button>
+                      <button className="ghost" onClick={() => del(u)}>
+                        Hapus
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 /* ================= PAJAK (admin): daftar pilihan pajak di form PO. PPN menambah total, PPh mengurangi total ================= */
 function TaxSettings({
   taxes,
@@ -6820,7 +7091,11 @@ function SettingsPage({
   users,
   taxes,
   setTaxes,
+  units,
+  setUnits,
 }: {
+  units: Unit[];
+  setUnits: (f: (u: Unit[]) => Unit[]) => void;
   taxes: Tax[];
   setTaxes: (f: (t: Tax[]) => Tax[]) => void;
   changePw: (o: string, n: string) => Promise<string>;
@@ -6915,6 +7190,15 @@ function SettingsPage({
           setDepts={setDepts}
           users={users}
           setUsers={setUsers}
+          pos={pos}
+          setPos={setPos}
+          notify={notify}
+        />
+      )}
+      {admin && (
+        <UnitSettings
+          units={units}
+          setUnits={setUnits}
           pos={pos}
           setPos={setPos}
           notify={notify}
@@ -10710,6 +10994,7 @@ type SyncData = {
   users: User[];
   depts: Dept[];
   taxes: Tax[];
+  units: Unit[];
   cats: Cat[];
   bps: BP[];
   msup: MSup[];
@@ -10827,6 +11112,7 @@ function toTables(d: SyncData): STables {
       status: p.status,
       doneAt: p.doneAt ?? '',
       note: p.note ?? '',
+      metode: p.metode ?? '',
       rej: p.rej ?? '',
       rejWhy: p.rejWhy ?? '',
       rejFinal: p.rejFinal ? '1' : '',
@@ -10865,6 +11151,7 @@ function toTables(d: SyncData): STables {
       status: u.status,
     })),
     Departemen: d.depts.map((x) => ({ nama: x.nama })),
+    Satuan: d.units.map((x) => ({ nama: x.nama })),
     Pajak: d.taxes.map((t) => ({
       id: t.id,
       nama: t.nama,
@@ -10944,6 +11231,9 @@ function fromTables(t: STables, cur: SyncData): SyncData {
     }));
   const depts: Dept[] = g('Departemen')
     .filter((r) => r.nama.trim())
+    .map((r) => ({ nama: r.nama.trim() }));
+  const units: Unit[] = g('Satuan')
+    .filter((r) => (r.nama ?? '').trim())
     .map((r) => ({ nama: r.nama.trim() }));
   const taxes: Tax[] = g('Pajak')
     .filter((r) => (r.nama ?? '').trim() && sn_(r.persen) > 0)
@@ -11032,6 +11322,7 @@ function fromTables(t: STables, cur: SyncData): SyncData {
         status: r.status.trim().toLowerCase() === 'done' ? 'Done' : 'Open',
         doneAt: so_(r.doneAt),
         note: r.note || undefined,
+        metode: r.metode || undefined,
         rej: so_(r.rej),
         rejWhy: so_(r.rejWhy),
         rejFinal: r.rejFinal === '1' || r.rejFinal === 'true' ? true : undefined,
@@ -11078,6 +11369,7 @@ function fromTables(t: STables, cur: SyncData): SyncData {
     users: users.length ? users : cur.users,
     depts: depts.length ? depts : cur.depts,
     taxes: taxes.length ? taxes : cur.taxes,
+    units: units.length ? units : cur.units,
     cats,
     bps,
     msup,
@@ -11100,6 +11392,7 @@ type SRow = Record<string, string>;
 const SYNC_KEYS: Record<string, (r: SRow) => string> = {
   Users: (r) => r.id || 'e:' + (r.email ?? '').toLowerCase(),
   Departemen: (r) => (r.nama ?? '').toLowerCase(),
+  Satuan: (r) => (r.nama ?? '').toLowerCase(),
   Pajak: (r) => r.id || (r.nama ?? '') + '|' + (r.persen ?? '') + '|' + (r.tipe ?? ''),
   Kategori: (r) => (r.name ?? '').toLowerCase(),
   Supplier_BP: (r) => r.id || r.kode || '',
@@ -11236,6 +11529,7 @@ function useSheetSync(
     users: (v: User[]) => void;
     depts: (v: Dept[]) => void;
     taxes: (v: Tax[]) => void;
+    units: (v: Unit[]) => void;
     cats: (v: Cat[]) => void;
     bps: (v: BP[]) => void;
     msup: (v: MSup[]) => void;
@@ -11264,7 +11558,7 @@ function useSheetSync(
   setters.current = set;
   const tables = useMemo(
     () => toTables(d),
-    [d.users, d.depts, d.taxes, d.cats, d.bps, d.msup, d.pos, d.hist, d.numCfg, d.theme, d.seen, d.brand]
+    [d.users, d.depts, d.taxes, d.units, d.cats, d.bps, d.msup, d.pos, d.hist, d.numCfg, d.theme, d.seen, d.brand]
   ); // eslint-disable-line react-hooks/exhaustive-deps
 
   tablesRef.current = tables;
@@ -11273,6 +11567,7 @@ function useSheetSync(
     s.users(st.users);
     s.depts(st.depts);
     s.taxes(st.taxes);
+    s.units(st.units);
     s.cats(st.cats);
     s.bps(st.bps);
     s.msup(st.msup);
@@ -11556,6 +11851,7 @@ export default function App() {
   const [numCfg, setNumCfg] = useLS<NumCfg>('po_numcfg', {});
   const [depts, setDepts] = useLS<Dept[]>('po_depts', DEF_DEPTS);
   const [taxes, setTaxes] = useLS<Tax[]>('po_taxes', DEF_TAXES);
+  const [units, setUnits] = useLS<Unit[]>('po_units', DEF_UNITS);
   const deptNames = deptSort(depts);
   const [seen, setSeen] = useLS<string[]>('po_seen', []);
   const [hist, setHist] = useLS<Hist[]>('po_hist', []);
@@ -11655,11 +11951,12 @@ export default function App() {
   });
   const [themeG, setThemeG] = useLS<number>('po_theme', 0); // tema bawaan sistem: diatur admin, tersimpan
   const syncSt = useSheetSync(
-    { users, depts, taxes, cats, bps, msup, pos, hist, numCfg, theme: themeG, seen, brand },
+    { users, depts, taxes, units, cats, bps, msup, pos, hist, numCfg, theme: themeG, seen, brand },
     {
       users: setUsers,
       depts: setDepts,
       taxes: setTaxes,
+      units: setUnits,
       cats: setCatsRaw,
       bps: setBps,
       msup: setMsup,
@@ -12044,6 +12341,7 @@ export default function App() {
     ong: String(p.ong ?? ''),
     rate: String(p.rate),
     note: p.note ?? '',
+    metode: p.metode ?? '',
     iso: p.iso,
   });
   // User: perbaiki PO yang ditolak — form terbuka terisi data PO lama, nomor tetap sama.
@@ -12914,6 +13212,7 @@ export default function App() {
                 msup={msup}
                 cfg={numCfg}
                 taxes={taxes}
+                units={units}
                 notify={notify}
                 fixedNo={fixedNo}
                 readOnly={formRO}
@@ -13132,6 +13431,8 @@ export default function App() {
                   users={users}
                   taxes={taxes}
                   setTaxes={setTaxes}
+                  units={units}
+                  setUnits={setUnits}
                 />
                 {admin && (
                   <IntegrityCard
@@ -14301,6 +14602,11 @@ input[type=range]{padding:0}
 .ctbl td:first-child,.ctbl th:first-child{width:44px;text-align:center}.ctbl td:nth-child(2){min-width:170px}.ctbl td:nth-child(4),.ctbl td:nth-child(5){min-width:170px}
 .ctbl td:last-child,.ctbl th:last-child{width:1%;white-space:nowrap}.ctbl .tag{white-space:nowrap}
 .trhint{font-size:11.5px;color:var(--mute);margin-top:4px}.trhint b{color:var(--brand)}.trref{display:flex;flex-wrap:wrap;gap:14px;margin-top:6px;font-size:11.5px;color:var(--mute)}.trref i{display:inline-block;width:18px;border-top:2px dashed;margin-right:6px;vertical-align:middle}.trref b{color:#12315f}
+.dsug{position:relative}.dsug .dlist{position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:40;max-height:240px;overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:0 10px 28px rgba(13,42,87,.18);padding:4px}
+.dsug .dhead{font-size:11px;font-weight:700;color:var(--mute);padding:6px 10px 4px}
+.dsug .dlist button{display:flex;width:100%;justify-content:space-between;align-items:center;gap:12px;text-align:left;border:0;background:transparent;box-shadow:none;border-radius:8px;padding:7px 10px;font-size:13px;color:var(--ink);font-weight:500}
+.dsug .dlist button small{color:var(--mute);font-size:11px;white-space:nowrap}
+.dsug .dlist button:hover,.dsug .dlist button.on{background:var(--soft)}
 .exs{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 10px}.exs small{color:var(--mute)}.exs button{padding:1px 10px;font-size:12px;line-height:1.45;border-radius:12px;color:var(--brand);border-color:var(--brand2);background:rgba(255,255,255,.6)}
 .slink{margin-top:6px;display:flex;flex-direction:column;gap:6px}.slink .tedit{flex-wrap:wrap;margin-top:0}.slink a{font-size:13px;color:var(--brand);font-weight:600;word-break:break-all}
 .r1{display:grid;grid-template-columns:minmax(0,1fr) 90px 130px;gap:10px;margin-bottom:10px}
