@@ -6620,35 +6620,39 @@ function UnitSettings({
   setPos: (f: (p: PO[]) => PO[]) => void;
   notify: (m: string) => void;
 }) {
-  const [nama, setNama] = useState('');
-  const [eid, setEid] = useState(''); // nama lama satuan yang sedang diubah
+  const [nama, setNama] = useState(''); // isian tambah satuan baru
+  const [eid, setEid] = useState(''); // nama lama satuan yang sedang diubah (di barisnya)
+  const [en, setEn] = useState(''); // isian nama baru saat mengubah
+  const clean = (x: string) => x.trim().replace(/\s+/g, ' ');
   const uCount = (n: string) =>
     pos.reduce((a, p) => a + p.items.filter((i) => i.s === n).length, 0);
-  const reset = () => {
-    setNama('');
-    setEid('');
-  };
-  const save = () => {
-    const n = nama.trim().replace(/\s+/g, ' ');
+  const dup = (n: string, except = '') =>
+    units.some((u) => u.nama !== except && u.nama.toLowerCase() === n.toLowerCase());
+  const add = () => {
+    const n = clean(nama);
     if (!n) return notify('Isi nama satuan.');
-    if (units.some((u) => u.nama !== eid && u.nama.toLowerCase() === n.toLowerCase()))
-      return notify('Satuan sudah ada.');
-    if (eid) {
+    if (dup(n)) return notify('Satuan sudah ada.');
+    setUnits((l) => [...l, { nama: n }]);
+    setNama('');
+    notify('Satuan ditambahkan.');
+  };
+  const saveEdit = () => {
+    const n = clean(en);
+    if (!n) return notify('Isi nama satuan.');
+    if (dup(n, eid)) return notify('Satuan sudah ada.');
+    if (n !== eid) {
       setUnits((l) => l.map((u) => (u.nama === eid ? { nama: n } : u)));
-      if (n !== eid)
-        setPos((l) =>
-          l.map((p) =>
-            p.items.some((i) => i.s === eid)
-              ? { ...p, items: p.items.map((i) => (i.s === eid ? { ...i, s: n } : i)) }
-              : p
-          )
-        );
-      notify('Satuan diperbarui.');
-    } else {
-      setUnits((l) => [...l, { nama: n }]);
-      notify('Satuan ditambahkan.');
+      setPos((l) =>
+        l.map((p) =>
+          p.items.some((i) => i.s === eid)
+            ? { ...p, items: p.items.map((i) => (i.s === eid ? { ...i, s: n } : i)) }
+            : p
+        )
+      );
     }
-    reset();
+    notify('Satuan diperbarui.');
+    setEid('');
+    setEn('');
   };
   const del = (u: Unit) => {
     if (units.length <= 1) return notify('Minimal harus ada 1 satuan.');
@@ -6659,8 +6663,10 @@ function UnitSettings({
           ? `Hapus satuan "${u.nama}"? Sudah dipakai ${c} item PO (PO lama tidak berubah, hanya hilang dari pilihan).`
           : `Hapus satuan "${u.nama}"?`
       )
-    )
+    ) {
       setUnits((l) => l.filter((x) => x.nama !== u.nama));
+      if (eid === u.nama) setEid('');
+    }
   };
   return (
     <Card ic="file" title="Satuan">
@@ -6671,54 +6677,83 @@ function UnitSettings({
           mengubah PO lama.
         </p>
         <div className="bpbox">
-          <b>{eid ? 'Ubah Satuan' : 'Tambah Satuan'}</b>
+          <b>Tambah Satuan</b>
           <div className="dpf">
             <Field label="Nama Satuan" req>
               <input
                 value={nama}
                 onChange={(e) => setNama(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && save()}
+                onKeyDown={(e) => e.key === 'Enter' && add()}
                 placeholder="Contoh: Pcs, Lembar, Roll"
               />
             </Field>
             <div className="acts">
-              <button className="pri" onClick={save}>
-                <Ic n={eid ? 'check' : 'plus'} s={16} /> {eid ? 'Simpan' : 'Tambah'}
+              <button className="pri" onClick={add}>
+                <Ic n="plus" s={16} /> Tambah
               </button>
-              {(eid || nama) && <button onClick={reset}>Batal</button>}
             </div>
           </div>
         </div>
+        <b style={{ display: 'block', margin: '4px 0 8px', color: '#0d2a57' }}>
+          Daftar Satuan ({units.length})
+        </b>
         <div className="tbl">
           <table>
             <thead>
               <tr>
+                <th style={{ width: 44 }}>No</th>
                 <th>Satuan</th>
                 <th>Dipakai (item PO)</th>
                 <th>Aksi</th>
               </tr>
             </thead>
             <tbody>
-              {units.map((u) => (
+              {units.map((u, k) => (
                 <tr key={u.nama}>
+                  <td>{k + 1}</td>
                   <td>
-                    <b>{u.nama}</b>
+                    {eid === u.nama ? (
+                      <input
+                        autoFocus
+                        value={en}
+                        onChange={(e) => setEn(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') saveEdit();
+                          if (e.key === 'Escape') setEid('');
+                        }}
+                      />
+                    ) : (
+                      <b>{u.nama}</b>
+                    )}
                   </td>
                   <td>{uCount(u.nama)}</td>
                   <td>
                     <div className="acts">
-                      <button
-                        className="ghost"
-                        onClick={() => {
-                          setEid(u.nama);
-                          setNama(u.nama);
-                        }}
-                      >
-                        Ubah
-                      </button>
-                      <button className="ghost" onClick={() => del(u)}>
-                        Hapus
-                      </button>
+                      {eid === u.nama ? (
+                        <>
+                          <button className="pri" onClick={saveEdit}>
+                            Simpan
+                          </button>
+                          <button className="ghost" onClick={() => setEid('')}>
+                            Batal
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            className="ghost"
+                            onClick={() => {
+                              setEid(u.nama);
+                              setEn(u.nama);
+                            }}
+                          >
+                            Ubah
+                          </button>
+                          <button className="ghost" onClick={() => del(u)}>
+                            Hapus
+                          </button>
+                        </>
+                      )}
                     </div>
                   </td>
                 </tr>
