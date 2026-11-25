@@ -6694,9 +6694,22 @@ function UnitSettings({
             </div>
           </div>
         </div>
-        <b style={{ display: 'block', margin: '4px 0 8px', color: '#0d2a57' }}>
-          Daftar Satuan ({units.length})
-        </b>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', margin: '4px 0 8px' }}>
+          <b style={{ color: '#0d2a57' }}>Daftar Satuan ({units.length})</b>
+          {DEF_UNITS.some((d) => !dup(d.nama)) && (
+            <button
+              type="button"
+              className="ghost"
+              onClick={() => {
+                const miss = DEF_UNITS.filter((d) => !dup(d.nama));
+                setUnits((l) => [...miss, ...l.filter((u) => !miss.some((m) => m.nama === u.nama))]);
+                notify(`${miss.length} satuan bawaan dikembalikan.`);
+              }}
+            >
+              Kembalikan satuan bawaan
+            </button>
+          )}
+        </div>
         <div className="tbl">
           <table>
             <thead>
@@ -11703,6 +11716,9 @@ function useSheetSync(
             seed.Supplier_BP = localT.Supplier_BP ?? [];
           if (!(remote.Master_Supplier ?? []).length && cur.current.msup.length)
             seed.Master_Supplier = localT.Master_Supplier ?? [];
+          // sheet Satuan masih kosong/belum ada: isi dengan daftar satuan aplikasi (bawaan) agar tidak hilang saat satuan ditambah
+          if (!(remote.Satuan ?? []).length && cur.current.units.length)
+            seed.Satuan = localT.Satuan ?? [];
           seeded = seed;
         }
         const merged =
